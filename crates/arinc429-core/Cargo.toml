@@ -1,0 +1,16 @@
+[package]
+name = "arinc429-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["ARINC 429 pico-429 developers"]
+description = "Core ARINC 429 protocol, data models, parity, label filtering, and telemetry codecs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+defmt = { version = "0.3", optional = true }
+heapless = "0.8"
+
+[features]
+default = []
+defmt = ["dep:defmt"]
+std = []

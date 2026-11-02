@@ -1,0 +1,12 @@
+[package]
+name = "arinc429-host-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["ARINC 429 pico-429 developers"]
+description = "PC host CLI monitor and test injector for Pico 2 W ARINC 429"
+
+[dependencies]
+arinc429-core = { path = "../arinc429-core" }
+clap = { version = "4.5", features = ["derive"] }
+serialport = "4.10"
+colored = "3.1"
