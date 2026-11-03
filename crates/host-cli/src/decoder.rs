@@ -57,12 +57,6 @@ impl FrameStreamDecoder {
 
         frames
     }
-
-    /// 清空缓冲区
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        self.valid_len = 0;
-    }
 }
 
 #[cfg(test)]
@@ -92,7 +86,7 @@ mod tests {
         let res1 = decoder.feed(&encoded[..6]);
         assert_eq!(res1.len(), 0);
 
-        // 后 8 字节到达
+        // 后 10 字节到达
         let res2 = decoder.feed(&encoded[6..]);
         assert_eq!(res2.len(), 1);
         assert_eq!(res2[0], frame);

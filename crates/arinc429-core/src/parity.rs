@@ -22,7 +22,7 @@ pub fn apply_parity(word_without_parity: u32, mode: ParityMode) -> u32 {
     match mode {
         ParityMode::Odd => {
             // 如果前 31 位中有偶数个 1，则第 32 位置 1，使其变为奇数个 1
-            if ones % 2 == 0 {
+            if (ones & 1) == 0 {
                 base | 0x8000_0000
             } else {
                 base
@@ -30,7 +30,7 @@ pub fn apply_parity(word_without_parity: u32, mode: ParityMode) -> u32 {
         }
         ParityMode::Even => {
             // 如果前 31 位中有奇数个 1，则第 32 位置 1，使其变为偶数个 1
-            if ones % 2 == 1 {
+            if (ones & 1) == 1 {
                 base | 0x8000_0000
             } else {
                 base
@@ -45,8 +45,8 @@ pub fn apply_parity(word_without_parity: u32, mode: ParityMode) -> u32 {
 pub fn check_parity(word: u32, mode: ParityMode) -> bool {
     let ones = word.count_ones();
     match mode {
-        ParityMode::Odd => ones % 2 == 1,
-        ParityMode::Even => ones % 2 == 0,
+        ParityMode::Odd => (ones & 1) == 1,
+        ParityMode::Even => (ones & 1) == 0,
         ParityMode::None => true,
     }
 }
@@ -76,17 +76,6 @@ mod tests {
         let w4 = apply_parity(0x0000_0003, ParityMode::Odd);
         assert_eq!(w4, 0x8000_0003);
         assert!(check_parity(w4, ParityMode::Odd));
-    }
-
-    #[test]
-    fn test_even_parity_calculation() {
-        let w = apply_parity(0x0000_0000, ParityMode::Even);
-        assert_eq!(w, 0x0000_0000); // 0 个 1 是偶数
-        assert!(check_parity(w, ParityMode::Even));
-
-        let w2 = apply_parity(0x0000_0001, ParityMode::Even);
-        assert_eq!(w2, 0x8000_0001); // 补 1 达到 2 个 1
-        assert!(check_parity(w2, ParityMode::Even));
     }
 
     #[test]

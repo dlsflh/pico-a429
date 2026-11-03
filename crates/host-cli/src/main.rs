@@ -255,7 +255,7 @@ fn send_word(
 
 /// 切换波特率
 fn set_speed(port_name: &str, channel: u8, speed: &str) {
-    let cmd = format!("SPEED {} {}", channel, speed.to_uppercase());
+    let cmd = format!("CHCFG {} SPEED {}", channel, speed.to_uppercase());
     println!("{} 配置速率: {}", "[CONFIG]".yellow().bold(), cmd);
 
     match send_command_and_wait(port_name, &cmd, 1500) {
@@ -276,21 +276,21 @@ fn configure_filter(
     clear: bool,
 ) {
     if clear {
-        let cmd = format!("FILTER {} CLEAR", channel);
+        let cmd = format!("CHCFG {} FILTER CLEAR", channel);
         match send_command_and_wait(port_name, &cmd, 1500) {
             Ok(resp) => println!("{} 过滤器清空: {}", "[OK]".green().bold(), resp),
             Err(e) => eprintln!("{} 清空失败: {}", "[ERROR]".red().bold(), e),
         }
     }
     if let Some(lbl) = allow {
-        let cmd = format!("FILTER {} ALLOW {}", channel, lbl);
+        let cmd = format!("CHCFG {} FILTER ALLOW {}", channel, lbl);
         match send_command_and_wait(port_name, &cmd, 1500) {
             Ok(resp) => println!("{} 白名单添加 Label: {}", "[OK]".green().bold(), resp),
             Err(e) => eprintln!("{} 添加失败: {}", "[ERROR]".red().bold(), e),
         }
     }
     if let Some(lbl) = block {
-        let cmd = format!("FILTER {} BLOCK {}", channel, lbl);
+        let cmd = format!("CHCFG {} FILTER BLOCK {}", channel, lbl);
         match send_command_and_wait(port_name, &cmd, 1500) {
             Ok(resp) => println!("{} 黑名单屏蔽 Label: {}", "[OK]".green().bold(), resp),
             Err(e) => eprintln!("{} 屏蔽失败: {}", "[ERROR]".red().bold(), e),

@@ -9,29 +9,19 @@ use embassy_rp::dma::Channel;
 use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{Common, Direction, Instance, PioPin, ShiftConfig, ShiftDirection, StateMachine};
 use embassy_rp::Peri;
-use fixed::FixedU32;
 
-use arinc429_core::baud::{calculate_clkdiv_fixed, ArincSpeed};
+use arinc429_core::baud::ArincSpeed;
 use arinc429_core::filter::LabelFilter;
-use arinc429_core::word::ArincWord;
+
+use super::calculate_pio_clkdiv;
 
 use crate::pio_programs;
-
-/// 接收统计计数器
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RxStats {
-    pub total_received: u32,
-    pub passed_filter: u32,
-    pub dropped_by_filter: u32,
-    pub parity_errors: u32,
-}
 
 pub struct Arinc429Rx<'d, T: Instance, const SM: usize> {
     sm: StateMachine<'d, T, SM>,
     dma: Channel<'d>,
     speed: ArincSpeed,
     filter: LabelFilter,
-    stats: RxStats,
 }
 
 impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
@@ -81,7 +71,6 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
             dma,
             speed: initial_speed,
             filter,
-            stats: RxStats::default(),
         }
     }
 
@@ -113,61 +102,10 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         &mut self.filter
     }
 
-    /// 获取统计信息
-    pub fn stats(&self) -> RxStats {
-        self.stats
-    }
-
-    /// 清空统计计数器
-    pub fn reset_stats(&mut self) {
-        self.stats = RxStats::default();
-    }
-
     /// 异步通过 DMA 从 PIO RX FIFO 读取一个 32 位原始字
     pub async fn recv_raw(&mut self) -> u32 {
         let mut buf = [0u32; 1];
         self.sm.rx().dma_pull(&mut self.dma, &mut buf, false).await;
         buf[0]
     }
-
-    /// 异步通过 DMA 批量拉取 RX FIFO 数据
-    pub async fn recv_batch(&mut self, buf: &mut [u32]) -> usize {
-        if buf.is_empty() {
-            return 0;
-        }
-        self.sm.rx().dma_pull(&mut self.dma, buf, false).await;
-        buf.len()
-    }
-
-    /// 异步接收并进行自动奇偶校验与 Label 过滤
-    ///
-    /// 若数据被过滤器丢弃，则返回 None；若通过过滤则返回 Some((word, is_parity_valid))
-    pub async fn recv_filtered(&mut self) -> Option<(ArincWord, bool)> {
-        let raw = self.recv_raw().await;
-        self.stats.total_received += 1;
-
-        let word = ArincWord::from_raw(raw);
-        let parity_ok = word.is_parity_valid();
-        if !parity_ok {
-            self.stats.parity_errors += 1;
-        }
-
-        let label = word.label();
-        let sdi = word.sdi();
-
-        if self.filter.matches(label, sdi, parity_ok) {
-            self.stats.passed_filter += 1;
-            Some((word, parity_ok))
-        } else {
-            self.stats.dropped_by_filter += 1;
-            None
-        }
-    }
-}
-
-/// 计算 PIO 状态机时钟分频比 (基于 arinc429-core::baud 纯算法)
-fn calculate_pio_clkdiv(sys_clk: u32, speed: ArincSpeed) -> FixedU32<fixed::types::extra::U8> {
-    let (int_part, frac_part) = calculate_clkdiv_fixed(sys_clk, speed);
-    let raw_bits = ((int_part as u32) << 8) | (frac_part as u32);
-    FixedU32::from_bits(raw_bits)
 }

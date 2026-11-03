@@ -11,3 +11,8 @@
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Firmware and binary build outputs
+*.uf2
+firmware/*.uf2
+

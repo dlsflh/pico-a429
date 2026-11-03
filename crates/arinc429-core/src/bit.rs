@@ -6,6 +6,7 @@
 //! 3. 奇偶校验翻转错误注入 (Negative Test) 与异常捕获率验证
 //! 4. 回路往返时延 (RTT) 窗口评估
 
+use crate::label::Label;
 use crate::parity::{apply_parity, ParityMode};
 use crate::word::ArincWord;
 
@@ -87,9 +88,9 @@ pub fn generate_bit_vectors<const N: usize>() -> heapless::Vec<BitVector, N> {
 
     // 3. 标准工程航电参数 (Label 0310 俯仰角，Label 0203 气压高，Label 0377 设备标识)
     let words = [
-        ArincWord::builder().octal_label(0o310).sdi(1).data(0x12345).ssm(3).build(),
-        ArincWord::builder().octal_label(0o203).sdi(2).data(0x0ABCD).ssm(0).build(),
-        ArincWord::builder().octal_label(0o377).sdi(0).data(0x7FFFF).ssm(3).build(),
+        ArincWord::from_fields(Label::from_octal(0o310), 1, 0x12345, 3, ParityMode::Odd).unwrap(),
+        ArincWord::from_fields(Label::from_octal(0o203), 2, 0x0ABCD, 0, ParityMode::Odd).unwrap(),
+        ArincWord::from_fields(Label::from_octal(0o377), 0, 0x7FFFF, 3, ParityMode::Odd).unwrap(),
     ];
     for w in words {
         let _ = list.push(BitVector {

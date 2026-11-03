@@ -8,11 +8,10 @@ use embassy_rp::dma::Channel;
 use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{Common, Direction, Instance, PioPin, ShiftConfig, ShiftDirection, StateMachine};
 use embassy_rp::Peri;
-use fixed::FixedU32;
 
-pub use arinc429_core::baud::{calculate_clkdiv_fixed, ArincSpeed};
-use arinc429_core::parity::{apply_parity, ParityMode};
-use arinc429_core::word::ArincWord;
+use arinc429_core::baud::ArincSpeed;
+
+use super::calculate_pio_clkdiv;
 
 use crate::pio_programs;
 
@@ -89,29 +88,4 @@ impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
         let buf = [raw_word];
         self.sm.tx().dma_push(&mut self.dma, &buf, false).await;
     }
-
-    /// 发送一组 32 位 ARINC 字切片 (DMA 高速连发)
-    pub async fn send_words(&mut self, words: &[u32]) {
-        if !words.is_empty() {
-            self.sm.tx().dma_push(&mut self.dma, words, false).await;
-        }
-    }
-
-    /// 发送一个标准 ArincWord 结构体 (带自动奇校验保证)
-    pub async fn send_word(&mut self, word: ArincWord, parity_mode: ParityMode) {
-        let final_raw = apply_parity(word.to_raw(), parity_mode);
-        self.send_raw(final_raw).await;
-    }
-
-    /// 同步阻塞尝试推入 FIFO (若 FIFO 未满则成功)
-    pub fn try_send_raw(&mut self, raw_word: u32) -> bool {
-        self.sm.tx().try_push(raw_word)
-    }
-}
-
-/// 计算 PIO 状态机的分频比 (基于 arinc429-core::baud 纯算法)
-fn calculate_pio_clkdiv(sys_clk: u32, speed: ArincSpeed) -> FixedU32<fixed::types::extra::U8> {
-    let (int_part, frac_part) = calculate_clkdiv_fixed(sys_clk, speed);
-    let raw_bits = ((int_part as u32) << 8) | (frac_part as u32);
-    FixedU32::from_bits(raw_bits)
 }

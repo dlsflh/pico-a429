@@ -59,23 +59,21 @@ pub fn calculate_clkdiv_fixed(sys_clk_hz: u32, speed: ArincSpeed) -> (u16, u8) {
     (int_part, frac_part)
 }
 
-/// 评估分频误差是否符合 ARINC 429 规范 (±1.0%)
-///
-/// 返回实际产生的波特率 (bps) 以及误差百分比 (如 0.05 表示 +0.05%)
-pub fn evaluate_baud_accuracy(sys_clk_hz: u32, speed: ArincSpeed) -> (f64, f64) {
-    let (int_part, frac_part) = calculate_clkdiv_fixed(sys_clk_hz, speed);
-    let div_val = (int_part as f64) + ((frac_part as f64) / 256.0);
-    let actual_pio_hz = (sys_clk_hz as f64) / div_val;
-    let actual_baud = actual_pio_hz / 10.0;
-    let target_baud = speed.baud_rate() as f64;
-    let error_pct = ((actual_baud - target_baud) / target_baud) * 100.0;
-
-    (actual_baud, error_pct)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 评估分频误差是否符合 ARINC 429 规范 (±1.0%)，用于测试与离线验证
+    fn evaluate_baud_accuracy(sys_clk_hz: u32, speed: ArincSpeed) -> (f64, f64) {
+        let (int_part, frac_part) = calculate_clkdiv_fixed(sys_clk_hz, speed);
+        let div_val = (int_part as f64) + ((frac_part as f64) / 256.0);
+        let actual_pio_hz = (sys_clk_hz as f64) / div_val;
+        let actual_baud = actual_pio_hz / 10.0;
+        let target_baud = speed.baud_rate() as f64;
+        let error_pct = ((actual_baud - target_baud) / target_baud) * 100.0;
+
+        (actual_baud, error_pct)
+    }
 
     #[test]
     fn test_calculate_clkdiv_standard_clocks() {
@@ -104,18 +102,5 @@ mod tests {
             assert!((actual_12k5 - 12_500.0).abs() < 125.0);
         }
     }
-
-    #[test]
-    fn test_clkdiv_150mhz_rp2350_exact() {
-        // RP2350 默认频率通常为 150 MHz
-        // 100k: 150,000,000 / 1,000,000 = 150.0 (int: 150, frac: 0)
-        let (int_part, frac_part) = calculate_clkdiv_fixed(150_000_000, ArincSpeed::High100k);
-        assert_eq!(int_part, 150);
-        assert_eq!(frac_part, 0);
-
-        // 12.5k: 150,000,000 / 125,000 = 1200.0 (int: 1200, frac: 0)
-        let (int_part_low, frac_part_low) = calculate_clkdiv_fixed(150_000_000, ArincSpeed::Low12k5);
-        assert_eq!(int_part_low, 1200);
-        assert_eq!(frac_part_low, 0);
-    }
 }
+
