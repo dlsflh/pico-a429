@@ -1,44 +1,36 @@
-//! ARINC 429 发送驱动 (PIO-based)
+//! ARINC 429 发送驱动 (PIO + DMA)
 //!
-//! 利用 RP2350 PIO 状态机输出高精度的差分双极性归零码 (BPRZ) 控制信号：
-//! - Pin A: TX_A (正脉冲对应逻辑 1)
-//! - Pin B: TX_B (正脉冲对应逻辑 0)
-//! - 两者全 0 时对应 Null (0V)
-//!
-//! 具备 100 kbps (高速) 与 12.5 kbps (低速) 动态一键无缝切换能力。
+//! 利用 RP2350 PIO 状态机输出高精度的差分双极性归零码 (BPRZ) 控制信号，
+//! 并使用硬件 DMA 引擎执行非阻塞异步推送，消除 CPU 逐字中断等待。
 
 use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::dma::Channel;
 use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{Common, Direction, Instance, PioPin, ShiftConfig, ShiftDirection, StateMachine};
 use embassy_rp::Peri;
 use fixed::FixedU32;
 
+pub use arinc429_core::baud::{calculate_clkdiv_fixed, ArincSpeed};
 use arinc429_core::parity::{apply_parity, ParityMode};
 use arinc429_core::word::ArincWord;
 
 use crate::pio_programs;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArincSpeed {
-    /// 高速 100 kbps (1 bit = 10 us, PIO 目标频率 1 MHz)
-    High100k,
-    /// 低速 12.5 kbps (1 bit = 80 us, PIO 目标频率 125 kHz)
-    Low12k5,
-}
-
 pub struct Arinc429Tx<'d, T: Instance, const SM: usize> {
     sm: StateMachine<'d, T, SM>,
+    dma: Channel<'d>,
     speed: ArincSpeed,
 }
 
 impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
-    /// 初始化 ARINC 429 TX 驱动
+    /// 初始化 ARINC 429 TX 驱动 (PIO + DMA)
     ///
     /// `pin_a`: TX_A 引脚 (base pin)
     /// `pin_b`: TX_B 引脚 (base pin + 1，必须在物理引脚编号上相邻)
     pub fn new(
         common: &mut Common<'d, T>,
         mut sm: StateMachine<'d, T, SM>,
+        dma: Channel<'d>,
         pin_a: Peri<'d, impl PioPin>,
         pin_b: Peri<'d, impl PioPin>,
         initial_speed: ArincSpeed,
@@ -66,7 +58,7 @@ impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
         };
 
         let sys_clk = clk_sys_freq();
-        let clkdiv = calculate_clkdiv(sys_clk, initial_speed);
+        let clkdiv = calculate_pio_clkdiv(sys_clk, initial_speed);
         cfg.clock_divider = clkdiv;
 
         sm.set_config(&cfg);
@@ -74,6 +66,7 @@ impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
 
         Self {
             sm,
+            dma,
             speed: initial_speed,
         }
     }
@@ -87,13 +80,21 @@ impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
     pub fn set_speed(&mut self, speed: ArincSpeed) {
         self.speed = speed;
         let sys_clk = clk_sys_freq();
-        let clkdiv = calculate_clkdiv(sys_clk, speed);
+        let clkdiv = calculate_pio_clkdiv(sys_clk, speed);
         self.sm.set_clock_divider(clkdiv);
     }
 
-    /// 发送一个原始 32 位 ARINC 字 (异步等待 TX FIFO 就绪)
+    /// 发送一个原始 32 位 ARINC 字 (通过 DMA 异步推送到 PIO TX FIFO)
     pub async fn send_raw(&mut self, raw_word: u32) {
-        self.sm.tx().wait_push(raw_word).await;
+        let buf = [raw_word];
+        self.sm.tx().dma_push(&mut self.dma, &buf, false).await;
+    }
+
+    /// 发送一组 32 位 ARINC 字切片 (DMA 高速连发)
+    pub async fn send_words(&mut self, words: &[u32]) {
+        if !words.is_empty() {
+            self.sm.tx().dma_push(&mut self.dma, words, false).await;
+        }
     }
 
     /// 发送一个标准 ArincWord 结构体 (带自动奇校验保证)
@@ -108,13 +109,9 @@ impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
     }
 }
 
-/// 计算 PIO 状态机的分频比 (1 bit = 10 PIO cycles)
-fn calculate_clkdiv(sys_clk: u32, speed: ArincSpeed) -> FixedU32<fixed::types::extra::U8> {
-    let target_hz = match speed {
-        ArincSpeed::High100k => 1_000_000, // 100 kHz * 10
-        ArincSpeed::Low12k5 => 125_000,    // 12.5 kHz * 10
-    };
-    // clkdiv = sys_clk / target_hz
-    let div_float = sys_clk as f64 / target_hz as f64;
-    FixedU32::from_num(div_float)
+/// 计算 PIO 状态机的分频比 (基于 arinc429-core::baud 纯算法)
+fn calculate_pio_clkdiv(sys_clk: u32, speed: ArincSpeed) -> FixedU32<fixed::types::extra::U8> {
+    let (int_part, frac_part) = calculate_clkdiv_fixed(sys_clk, speed);
+    let raw_bits = ((int_part as u32) << 8) | (frac_part as u32);
+    FixedU32::from_bits(raw_bits)
 }

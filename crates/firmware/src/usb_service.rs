@@ -3,31 +3,27 @@
 //! 提供免驱动的全速 USB 串口通信：
 //! - 极低延迟与高吞吐量 (12 Mbps 带宽，满载 ARINC 429 流量仅占用不到 2%)
 //! - 自动支持二进制模式 (BinaryFrame) 与终端交互 ASCII 模式动态切换
-//! - 支持上位机控制命令解析与参数下发
+//! - 统一路由支持 12 通道下发与 BIT 自测试发起
 
 use core::fmt::Write as FmtWrite;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_futures::select::{select, Either};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
 use embassy_usb::class::cdc_acm::CdcAcmClass;
 use heapless::String;
 
+use arinc429_core::bit::BitStatus;
 use arinc429_core::protocol::{HostCommand, BINARY_FRAME_LEN};
 use arinc429_core::word::ArincWord;
 
 use crate::channel::{
-    ChannelControlCmd, InboundArincFrame, OutboundArincFrame, CHANNEL0_CTRL_QUEUE,
-    CHANNEL0_TX_QUEUE, GLOBAL_RX_PUBSUB,
+    send_to_channel_ctrl, send_to_channel_tx, BitRequest, ChannelControlCmd, InboundArincFrame,
+    OutboundArincFrame, BIT_REQ_CHANNEL, BIT_RESP_SIGNAL, GLOBAL_RX_PUBSUB, MAX_CHANNELS,
 };
 
 /// 推送模式：true 表示二进制高速帧，false 表示 ASCII 文本
 pub static BINARY_OUTPUT_MODE: AtomicBool = AtomicBool::new(true);
-
-/// 信号：通知 TX 任务波特率变动
-pub static CHANNEL0_TX_SPEED_SIGNAL: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 
 #[embassy_executor::task]
 pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, Driver<'static, USB>>) {
@@ -146,30 +142,29 @@ async fn handle_cli_command(
             let _ = cdc_write_all(class, resp.as_bytes()).await;
         }
         Ok(HostCommand::SetSpeed { channel, high_speed }) => {
-            if channel == 0 {
-                CHANNEL0_CTRL_QUEUE.send(ChannelControlCmd::SetSpeed { high_speed }).await;
-                CHANNEL0_TX_SPEED_SIGNAL.signal(high_speed);
+            if (channel as usize) < MAX_CHANNELS {
+                let cmd = ChannelControlCmd::SetSpeed { high_speed };
+                let _ = send_to_channel_ctrl(channel, cmd).await;
                 let mut resp = String::<64>::new();
                 let speed_str = if high_speed { "100K" } else { "12.5K" };
                 core::write!(resp, "OK: Channel {} set to {}\r\n", channel, speed_str).ok();
                 let _ = cdc_write_all(class, resp.as_bytes()).await;
             } else {
-                let _ = cdc_write_all(class, b"ERR: Unsupported channel\r\n").await;
+                let _ = cdc_write_all(class, b"ERR: Channel out of range (0..11)\r\n").await;
             }
         }
         Ok(HostCommand::SendRaw { channel, raw_word }) => {
-            if channel == 0 {
-                CHANNEL0_TX_QUEUE
-                    .send(OutboundArincFrame {
-                        channel_id: channel,
-                        raw_word,
-                    })
-                    .await;
+            if (channel as usize) < MAX_CHANNELS {
+                let outbound = OutboundArincFrame {
+                    channel_id: channel,
+                    raw_word,
+                };
+                let _ = send_to_channel_tx(channel, outbound).await;
                 let mut resp = String::<64>::new();
                 core::write!(resp, "OK: Queued raw word 0x{:08X} for CH{}\r\n", raw_word, channel).ok();
                 let _ = cdc_write_all(class, resp.as_bytes()).await;
             } else {
-                let _ = cdc_write_all(class, b"ERR: Unsupported channel\r\n").await;
+                let _ = cdc_write_all(class, b"ERR: Channel out of range (0..11)\r\n").await;
             }
         }
         Ok(HostCommand::SendConstructed {
@@ -180,7 +175,7 @@ async fn handle_cli_command(
             ssm,
             parity,
         }) => {
-            if channel == 0 {
+            if (channel as usize) < MAX_CHANNELS {
                 let word = ArincWord::builder()
                     .label(label)
                     .sdi(sdi)
@@ -188,12 +183,11 @@ async fn handle_cli_command(
                     .ssm(ssm)
                     .parity_mode(parity)
                     .build();
-                CHANNEL0_TX_QUEUE
-                    .send(OutboundArincFrame {
-                        channel_id: channel,
-                        raw_word: word.to_raw(),
-                    })
-                    .await;
+                let outbound = OutboundArincFrame {
+                    channel_id: channel,
+                    raw_word: word.to_raw(),
+                };
+                let _ = send_to_channel_tx(channel, outbound).await;
                 let mut resp = String::<64>::new();
                 core::write!(
                     resp,
@@ -206,42 +200,82 @@ async fn handle_cli_command(
                 .ok();
                 let _ = cdc_write_all(class, resp.as_bytes()).await;
             } else {
-                let _ = cdc_write_all(class, b"ERR: Unsupported channel\r\n").await;
+                let _ = cdc_write_all(class, b"ERR: Channel out of range (0..11)\r\n").await;
             }
         }
         Ok(HostCommand::FilterAllow { channel, label }) => {
-            if channel == 0 {
-                CHANNEL0_CTRL_QUEUE.send(ChannelControlCmd::FilterAllow(label)).await;
+            if (channel as usize) < MAX_CHANNELS {
+                let cmd = ChannelControlCmd::FilterAllow(label);
+                let _ = send_to_channel_ctrl(channel, cmd).await;
                 let mut resp = String::<64>::new();
-                core::write!(resp, "OK: Allowed Label {:03o} on CH0\r\n", label.to_octal()).ok();
+                core::write!(resp, "OK: Allowed Label {:03o} on CH{}\r\n", label.to_octal(), channel).ok();
                 let _ = cdc_write_all(class, resp.as_bytes()).await;
             } else {
-                let _ = cdc_write_all(class, b"ERR: Unsupported channel\r\n").await;
+                let _ = cdc_write_all(class, b"ERR: Channel out of range (0..11)\r\n").await;
             }
         }
         Ok(HostCommand::FilterBlock { channel, label }) => {
-            if channel == 0 {
-                CHANNEL0_CTRL_QUEUE.send(ChannelControlCmd::FilterBlock(label)).await;
+            if (channel as usize) < MAX_CHANNELS {
+                let cmd = ChannelControlCmd::FilterBlock(label);
+                let _ = send_to_channel_ctrl(channel, cmd).await;
                 let mut resp = String::<64>::new();
-                core::write!(resp, "OK: Blocked Label {:03o} on CH0\r\n", label.to_octal()).ok();
+                core::write!(resp, "OK: Blocked Label {:03o} on CH{}\r\n", label.to_octal(), channel).ok();
                 let _ = cdc_write_all(class, resp.as_bytes()).await;
             } else {
-                let _ = cdc_write_all(class, b"ERR: Unsupported channel\r\n").await;
+                let _ = cdc_write_all(class, b"ERR: Channel out of range (0..11)\r\n").await;
             }
         }
         Ok(HostCommand::FilterClear { channel }) => {
-            if channel == 0 {
-                CHANNEL0_CTRL_QUEUE.send(ChannelControlCmd::FilterClear).await;
-                let _ = cdc_write_all(class, b"OK: Filter cleared on CH0\r\n").await;
+            if (channel as usize) < MAX_CHANNELS {
+                let cmd = ChannelControlCmd::FilterClear;
+                let _ = send_to_channel_ctrl(channel, cmd).await;
+                let mut resp = String::<64>::new();
+                core::write!(resp, "OK: Filter cleared on CH{}\r\n", channel).ok();
+                let _ = cdc_write_all(class, resp.as_bytes()).await;
             } else {
-                let _ = cdc_write_all(class, b"ERR: Unsupported channel\r\n").await;
+                let _ = cdc_write_all(class, b"ERR: Channel out of range (0..11)\r\n").await;
+            }
+        }
+        Ok(HostCommand::RunBit { tx_channel, rx_channel }) => {
+            if (tx_channel as usize) < MAX_CHANNELS && (rx_channel as usize) < MAX_CHANNELS {
+                BIT_REQ_CHANNEL.send(BitRequest { tx_channel, rx_channel }).await;
+                let report = BIT_RESP_SIGNAL.wait().await;
+                let mut resp = String::<128>::new();
+                if report.status == BitStatus::Passed {
+                    core::write!(
+                        resp,
+                        "OK: BIT CH{}->CH{} PASSED [SENT:{} RECV:{} ERR_INJECT:{}/{} RTT_AVG:{}us]\r\n",
+                        report.tx_channel,
+                        report.rx_channel,
+                        report.words_sent,
+                        report.words_received,
+                        report.parity_errors_caught,
+                        report.parity_injections_tested,
+                        report.avg_latency_us
+                    )
+                    .ok();
+                } else {
+                    core::write!(
+                        resp,
+                        "ERR: BIT CH{}->CH{} FAILED [CODE:{:?} SENT:{} RECV:{}]\r\n",
+                        report.tx_channel,
+                        report.rx_channel,
+                        report.error_code,
+                        report.words_sent,
+                        report.words_received
+                    )
+                    .ok();
+                }
+                let _ = cdc_write_all(class, resp.as_bytes()).await;
+            } else {
+                let _ = cdc_write_all(class, b"ERR: Invalid channel for BIT (0..11)\r\n").await;
             }
         }
         Ok(HostCommand::QueryStatus) => {
             let mut resp = String::<128>::new();
             core::write!(
                 resp,
-                "STATUS: Pico-429 Online. Mode: {}\r\n",
+                "STATUS: Pico-429 Online (Max 12 Channels, DMA Enabled). Mode: {}\r\n",
                 if BINARY_OUTPUT_MODE.load(Ordering::Relaxed) { "BIN" } else { "ASCII" }
             )
             .ok();

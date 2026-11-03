@@ -1,18 +1,20 @@
-//! ARINC 429 接收驱动 (PIO-based)
+//! ARINC 429 接收驱动 (PIO + DMA)
 //!
 //! 利用 RP2350 PIO 状态机捕获来自差分收发芯片的 RX_A 和 RX_B 脉冲。
-//! 具备硬件级字间隙 (Gap) 检测与自同步抗滑移机制，并无缝集成 256 位高性能 Label 过滤器。
+//! 具备硬件级字间隙 (Gap) 检测、脉冲中心采样、字内空闲超时抗滑移机制，
+//! 并使用 DMA 进行非阻塞帧拉取，集成 256 位高性能 Label 过滤器。
 
 use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::dma::Channel;
 use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{Common, Direction, Instance, PioPin, ShiftConfig, ShiftDirection, StateMachine};
 use embassy_rp::Peri;
 use fixed::FixedU32;
 
+use arinc429_core::baud::{calculate_clkdiv_fixed, ArincSpeed};
 use arinc429_core::filter::LabelFilter;
 use arinc429_core::word::ArincWord;
 
-use crate::driver::tx::ArincSpeed;
 use crate::pio_programs;
 
 /// 接收统计计数器
@@ -26,19 +28,21 @@ pub struct RxStats {
 
 pub struct Arinc429Rx<'d, T: Instance, const SM: usize> {
     sm: StateMachine<'d, T, SM>,
+    dma: Channel<'d>,
     speed: ArincSpeed,
     filter: LabelFilter,
     stats: RxStats,
 }
 
 impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
-    /// 初始化 ARINC 429 RX 驱动
+    /// 初始化 ARINC 429 RX 驱动 (PIO + DMA)
     ///
     /// `pin_a`: RX_A 引脚 (base pin)
     /// `pin_b`: RX_B 引脚 (base pin + 1，必须在物理引脚编号上相邻)
     pub fn new(
         common: &mut Common<'d, T>,
         mut sm: StateMachine<'d, T, SM>,
+        dma: Channel<'d>,
         pin_a: Peri<'d, impl PioPin>,
         pin_b: Peri<'d, impl PioPin>,
         initial_speed: ArincSpeed,
@@ -66,7 +70,7 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         };
 
         let sys_clk = clk_sys_freq();
-        let clkdiv = calculate_clkdiv(sys_clk, initial_speed);
+        let clkdiv = calculate_pio_clkdiv(sys_clk, initial_speed);
         cfg.clock_divider = clkdiv;
 
         sm.set_config(&cfg);
@@ -74,6 +78,7 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
 
         Self {
             sm,
+            dma,
             speed: initial_speed,
             filter,
             stats: RxStats::default(),
@@ -84,7 +89,7 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
     pub fn set_speed(&mut self, speed: ArincSpeed) {
         self.speed = speed;
         let sys_clk = clk_sys_freq();
-        let clkdiv = calculate_clkdiv(sys_clk, speed);
+        let clkdiv = calculate_pio_clkdiv(sys_clk, speed);
         self.sm.set_clock_divider(clkdiv);
     }
 
@@ -118,9 +123,20 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         self.stats = RxStats::default();
     }
 
-    /// 异步阻塞接收一个原始 32 位 ARINC 字 (从 PIO RX FIFO 拉取)
+    /// 异步通过 DMA 从 PIO RX FIFO 读取一个 32 位原始字
     pub async fn recv_raw(&mut self) -> u32 {
-        self.sm.rx().wait_pull().await
+        let mut buf = [0u32; 1];
+        self.sm.rx().dma_pull(&mut self.dma, &mut buf, false).await;
+        buf[0]
+    }
+
+    /// 异步通过 DMA 批量拉取 RX FIFO 数据
+    pub async fn recv_batch(&mut self, buf: &mut [u32]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        self.sm.rx().dma_pull(&mut self.dma, buf, false).await;
+        buf.len()
     }
 
     /// 异步接收并进行自动奇偶校验与 Label 过滤
@@ -149,12 +165,9 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
     }
 }
 
-/// 计算 PIO 状态机时钟分频比
-fn calculate_clkdiv(sys_clk: u32, speed: ArincSpeed) -> FixedU32<fixed::types::extra::U8> {
-    let target_hz = match speed {
-        ArincSpeed::High100k => 1_000_000,
-        ArincSpeed::Low12k5 => 125_000,
-    };
-    let div_float = sys_clk as f64 / target_hz as f64;
-    FixedU32::from_num(div_float)
+/// 计算 PIO 状态机时钟分频比 (基于 arinc429-core::baud 纯算法)
+fn calculate_pio_clkdiv(sys_clk: u32, speed: ArincSpeed) -> FixedU32<fixed::types::extra::U8> {
+    let (int_part, frac_part) = calculate_clkdiv_fixed(sys_clk, speed);
+    let raw_bits = ((int_part as u32) << 8) | (frac_part as u32);
+    FixedU32::from_bits(raw_bits)
 }

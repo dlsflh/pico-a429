@@ -142,6 +142,11 @@ pub enum HostCommand {
     SetMode {
         binary_mode: bool,
     },
+    /// 执行内建自测试: BIT <tx_ch> <rx_ch>
+    RunBit {
+        tx_channel: u8,
+        rx_channel: u8,
+    },
     /// 查询状态: STATUS
     QueryStatus,
 }
@@ -164,6 +169,14 @@ impl HostCommand {
 
         if cmd.eq_ignore_ascii_case("STATUS") {
             return Ok(Self::QueryStatus);
+        }
+
+        if cmd.eq_ignore_ascii_case("BIT") {
+            let tx_str = parts.next().ok_or("Usage: BIT <tx_ch> <rx_ch>")?;
+            let rx_str = parts.next().ok_or("Usage: BIT <tx_ch> <rx_ch>")?;
+            let tx_channel = tx_str.parse::<u8>().map_err(|_| "Invalid tx_channel")?;
+            let rx_channel = rx_str.parse::<u8>().map_err(|_| "Invalid rx_channel")?;
+            return Ok(Self::RunBit { tx_channel, rx_channel });
         }
 
         if cmd.eq_ignore_ascii_case("MODE") {
@@ -280,6 +293,9 @@ mod tests {
 
         let cmd3 = HostCommand::parse("FILTER 0 ALLOW 310").unwrap();
         assert_eq!(cmd3, HostCommand::FilterAllow { channel: 0, label: Label::from_octal(0o310) });
+
+        let cmd4 = HostCommand::parse("BIT 0 1").unwrap();
+        assert_eq!(cmd4, HostCommand::RunBit { tx_channel: 0, rx_channel: 1 });
     }
 
     #[test]

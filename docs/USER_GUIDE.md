@@ -1,6 +1,8 @@
 # ARINC 429 Pico 2 W 软件使用与上位机通信手册
 
-本手册详细说明如何烧录 Pico 2 W 固件，以及如何通过 USB 虚拟串口和 Wi-Fi 局域网与上位机进行双向通信、报文解析、过滤设置与故障排查。
+本手册详细说明如何烧录 Pico 2 固件，以及如何通过 USB 虚拟串口与上位机进行双向通信、报文解析、BIT 自测试验、过滤设置与故障排查。
+
+> 💡 **Wi-Fi 路线图**：Wi-Fi 无线遥测相关演进规划请参阅 `plan/todo/WIFI_ROADMAP.md`。
 
 ---
 
@@ -57,12 +59,12 @@ CH0    1.044520     100k   310      1     0x00012345   3     FAIL     0x012345C8
 
 ---
 
-### 2. 通过 Wi-Fi 局域网无线抓包
-当 Pico 2 W 接入 Wi-Fi（或处于局域网广播模式）时，上位机笔记本无需插线，直接监听 UDP 端口 4290：
+### 2. 执行自收自发 BIT (内建自测试)
+当两组 ARINC 429 通道在硬件上短接形成回路（如 CH0 TX 与 CH1 RX，或免芯片环回自测 GP0-GP2, GP1-GP3）时，可通过上位机发起全自动硬件自检：
 ```bash
-cargo run --package arinc429-host-cli -- listen-wifi --port 4290
+cargo run --package arinc429-host-cli -- bit --port COM3 --tx 0 --rx 1
 ```
-- 便携性极高，适用于现场机舱内免接线测试。
+固件将自动执行 100k/12.5k 速率切换、Walking 1s/0s 位走查、奇校验错误注入与回路往返时延（RTT）基准评估，并在终端打印结构化诊断报告。
 
 ---
 
@@ -127,6 +129,7 @@ MODE ASCII\r\n
 | `FILTER <ch> ALLOW <oct>` | 白名单放行指定 Label | `FILTER 0 ALLOW 310` | `OK: Filter rule updated` |
 | `FILTER <ch> BLOCK <oct>` | 黑名单屏蔽指定 Label | `FILTER 0 BLOCK 377` | `OK: Filter rule updated` |
 | `FILTER <ch> CLEAR` | 清空过滤规则 | `FILTER 0 CLEAR` | `OK: Filter rule updated` |
+| `BIT <tx_ch> <rx_ch>` | 触发两通道硬件闭环 BIT 诊断 | `BIT 0 1` | `OK: BIT CH0->CH1 PASSED [SENT:67 RECV:67 ...]` |
 
 ---
 

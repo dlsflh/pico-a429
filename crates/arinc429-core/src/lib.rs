@@ -5,6 +5,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod baud;
+pub mod bit;
 pub mod bnr_bcd;
 pub mod filter;
 pub mod label;
@@ -13,6 +15,10 @@ pub mod protocol;
 pub mod word;
 
 // 常用类型直接顶层重导出
+pub use baud::{calculate_clkdiv_fixed, evaluate_baud_accuracy, ArincSpeed};
+pub use bit::{
+    evaluate_bit_results, generate_bit_vectors, BitErrorCode, BitReport, BitStatus, BitVector,
+};
 pub use bnr_bcd::{decode_bcd_digits, decode_bnr_to_int, encode_bnr_from_int};
 pub use filter::{FilterMode, LabelFilter};
 pub use label::Label;

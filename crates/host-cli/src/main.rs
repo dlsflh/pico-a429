@@ -1,16 +1,18 @@
 use std::io::{Read, Write};
-use std::net::UdpSocket;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use colored::*;
 
-use arinc429_core::protocol::{flags, BinaryFrame, BINARY_FRAME_LEN};
+use arinc429_core::protocol::{flags, BinaryFrame};
 use arinc429_core::word::ArincWord;
+
+mod decoder;
+use decoder::FrameStreamDecoder;
 
 #[derive(Parser)]
 #[command(name = "arinc429-cli")]
-#[command(about = "ARINC 429 Pico 2 W 上位机分析仪与注入控制工具", long_about = None)]
+#[command(about = "ARINC 429 Pico 2 上位机分析仪与注入控制工具", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -29,20 +31,13 @@ enum Commands {
         baud: u32,
     },
 
-    /// 监听来自 Wi-Fi 的 UDP 广播 ARINC 429 数据包
-    ListenWifi {
-        /// 监听的 UDP 本地端口
-        #[arg(short, long, default_value_t = 4290)]
-        port: u16,
-    },
-
     /// 向 ARINC 429 总线下发一个构造的 32 位字
     Send {
         /// 目标串口
         #[arg(short, long)]
         port: String,
 
-        /// 通道号 (默认 0)
+        /// 通道号 (0~11)
         #[arg(short, long, default_value_t = 0)]
         channel: u8,
 
@@ -63,13 +58,13 @@ enum Commands {
         ssm: u8,
     },
 
-    /// 切换 Pico 2 W 的通道速率 (100k 高速 或 12.5k 低速)
+    /// 切换通道速率 (100k 高速 或 12.5k 低速)
     Speed {
         /// 目标串口
         #[arg(short, long)]
         port: String,
 
-        /// 通道号 (默认 0)
+        /// 通道号 (0~11)
         #[arg(short, long, default_value_t = 0)]
         channel: u8,
 
@@ -84,7 +79,7 @@ enum Commands {
         #[arg(short, long)]
         port: String,
 
-        /// 通道号 (默认 0)
+        /// 通道号 (0~11)
         #[arg(short, long, default_value_t = 0)]
         channel: u8,
 
@@ -100,6 +95,21 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         clear: bool,
     },
+
+    /// 执行自收自发 BIT (内建自测试)
+    Bit {
+        /// 目标串口
+        #[arg(short, long)]
+        port: String,
+
+        /// 发送通道号 (默认 0)
+        #[arg(short, long, default_value_t = 0)]
+        tx: u8,
+
+        /// 接收通道号 (默认 1，若自环回亦可为 0)
+        #[arg(short, long, default_value_t = 1)]
+        rx: u8,
+    },
 }
 
 fn main() {
@@ -108,9 +118,6 @@ fn main() {
     match cli.command {
         Commands::Listen { port, baud } => {
             listen_serial(&port, baud);
-        }
-        Commands::ListenWifi { port } => {
-            listen_wifi(port);
         }
         Commands::Send {
             port,
@@ -138,10 +145,54 @@ fn main() {
         } => {
             configure_filter(&port, channel, allow, block, clear);
         }
+        Commands::Bit { port, tx, rx } => {
+            run_bit(&port, tx, rx);
+        }
     }
 }
 
-/// 监听串口并解码二进制帧
+/// 发送指令并同步等待固件返回 OK/ERR 响应 (消除 Fire-and-forget 盲发)
+fn send_command_and_wait(port_name: &str, cmd: &str, timeout_ms: u64) -> Result<String, String> {
+    let mut port = serialport::new(port_name, 115200)
+        .timeout(Duration::from_millis(200))
+        .open()
+        .map_err(|e| format!("无法打开串口: {}", e))?;
+
+    let full_cmd = format!("{}\r\n", cmd.trim());
+    port.write_all(full_cmd.as_bytes())
+        .map_err(|e| format!("写入指令失败: {}", e))?;
+
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut line_buf = String::new();
+    let mut temp = [0u8; 1];
+
+    while start.elapsed() < timeout {
+        match port.read(&mut temp) {
+            Ok(1) => {
+                let ch = temp[0] as char;
+                if ch == '\n' {
+                    let trimmed = line_buf.trim();
+                    if trimmed.starts_with("OK:") {
+                        return Ok(trimmed.to_string());
+                    } else if trimmed.starts_with("ERR:") {
+                        return Err(trimmed.to_string());
+                    }
+                    line_buf.clear();
+                } else if ch != '\r' {
+                    line_buf.push(ch);
+                }
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("读取响应失败: {}", e)),
+        }
+    }
+
+    Err("超时未收到固件应答".to_string())
+}
+
+/// 监听串口并解码二进制帧 (基于 FrameStreamDecoder 流式解算)
 fn listen_serial(port_name: &str, baud_rate: u32) {
     println!(
         "{} 打开串口 {} ({} bps)...",
@@ -160,78 +211,21 @@ fn listen_serial(port_name: &str, baud_rate: u32) {
 
     print_table_header();
 
-    let mut ring_buf = [0u8; 1024];
-    let mut valid_len = 0;
-
+    let mut decoder = FrameStreamDecoder::new();
     let mut temp = [0u8; 128];
+
     loop {
         match port.read(&mut temp) {
             Ok(n) if n > 0 => {
-                // 拼接进入滑动环形缓冲
-                if valid_len + n > ring_buf.len() {
-                    valid_len = 0; // 缓冲区溢出保护
-                }
-                ring_buf[valid_len..valid_len + n].copy_from_slice(&temp[..n]);
-                valid_len += n;
-
-                // 尝试解析定长 14 字节帧
-                let mut cursor = 0;
-                while cursor + BINARY_FRAME_LEN <= valid_len {
-                    if ring_buf[cursor] == arinc429_core::protocol::BINARY_MAGIC[0]
-                        && ring_buf[cursor + 1] == arinc429_core::protocol::BINARY_MAGIC[1]
-                    {
-                        if let Ok(frame) = BinaryFrame::decode(&ring_buf[cursor..cursor + BINARY_FRAME_LEN]) {
-                            print_decoded_frame(&frame);
-                            cursor += BINARY_FRAME_LEN;
-                            continue;
-                        }
-                    }
-                    cursor += 1;
-                }
-
-                if cursor > 0 {
-                    ring_buf.copy_within(cursor..valid_len, 0);
-                    valid_len -= cursor;
+                let frames = decoder.feed(&temp[..n]);
+                for frame in frames {
+                    print_decoded_frame(&frame);
                 }
             }
             Ok(_) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => {
                 eprintln!("{} 读取串口失败: {}", "[ERROR]".red().bold(), e);
-                break;
-            }
-        }
-    }
-}
-
-/// 监听 Wi-Fi UDP 广播包
-fn listen_wifi(port_num: u16) {
-    let addr = format!("0.0.0.0:{}", port_num);
-    let socket = UdpSocket::bind(&addr).unwrap_or_else(|e| {
-        eprintln!("{} 绑定 UDP 端口 {} 失败: {}", "[ERROR]".red().bold(), port_num, e);
-        std::process::exit(1);
-    });
-
-    println!(
-        "{} 正在监听 Wi-Fi UDP 遥测广播 (端口 {})...",
-        "[INFO]".green().bold(),
-        port_num.to_string().cyan()
-    );
-
-    print_table_header();
-
-    let mut buf = [0u8; 512];
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((len, _src)) => {
-                if len >= BINARY_FRAME_LEN {
-                    if let Ok(frame) = BinaryFrame::decode(&buf[..BINARY_FRAME_LEN]) {
-                        print_decoded_frame(&frame);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("{} UDP 接收错误: {}", "[ERROR]".red().bold(), e);
                 break;
             }
         }
@@ -247,18 +241,30 @@ fn send_word(
     data_hex: &str,
     ssm: u8,
 ) {
-    let mut port = open_port(port_name);
-    let cmd = format!("TX {} {} {} {} {}\r\n", channel, label_octal, sdi, data_hex, ssm);
-    port.write_all(cmd.as_bytes()).unwrap();
-    println!("{} 发送指令: {}", "[TX]".cyan().bold(), cmd.trim());
+    let cmd = format!("TX {} {} {} {} {}", channel, label_octal, sdi, data_hex, ssm);
+    println!("{} 发送指令: {}", "[TX]".cyan().bold(), cmd);
+
+    match send_command_and_wait(port_name, &cmd, 1500) {
+        Ok(resp) => println!("{} 固件确认: {}", "[OK]".green().bold(), resp),
+        Err(e) => {
+            eprintln!("{} 发送失败: {}", "[ERROR]".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// 切换波特率
 fn set_speed(port_name: &str, channel: u8, speed: &str) {
-    let mut port = open_port(port_name);
-    let cmd = format!("SPEED {} {}\r\n", channel, speed.to_uppercase());
-    port.write_all(cmd.as_bytes()).unwrap();
-    println!("{} 配置速率: {}", "[CONFIG]".yellow().bold(), cmd.trim());
+    let cmd = format!("SPEED {} {}", channel, speed.to_uppercase());
+    println!("{} 配置速率: {}", "[CONFIG]".yellow().bold(), cmd);
+
+    match send_command_and_wait(port_name, &cmd, 1500) {
+        Ok(resp) => println!("{} 固件确认: {}", "[OK]".green().bold(), resp),
+        Err(e) => {
+            eprintln!("{} 配置失败: {}", "[ERROR]".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// 配置过滤器
@@ -269,32 +275,47 @@ fn configure_filter(
     block: Option<String>,
     clear: bool,
 ) {
-    let mut port = open_port(port_name);
     if clear {
-        let cmd = format!("FILTER {} CLEAR\r\n", channel);
-        port.write_all(cmd.as_bytes()).unwrap();
-        println!("{} 过滤器清空", "[CONFIG]".yellow().bold());
+        let cmd = format!("FILTER {} CLEAR", channel);
+        match send_command_and_wait(port_name, &cmd, 1500) {
+            Ok(resp) => println!("{} 过滤器清空: {}", "[OK]".green().bold(), resp),
+            Err(e) => eprintln!("{} 清空失败: {}", "[ERROR]".red().bold(), e),
+        }
     }
     if let Some(lbl) = allow {
-        let cmd = format!("FILTER {} ALLOW {}\r\n", channel, lbl);
-        port.write_all(cmd.as_bytes()).unwrap();
-        println!("{} 白名单添加 Label: {}", "[CONFIG]".yellow().bold(), lbl);
+        let cmd = format!("FILTER {} ALLOW {}", channel, lbl);
+        match send_command_and_wait(port_name, &cmd, 1500) {
+            Ok(resp) => println!("{} 白名单添加 Label: {}", "[OK]".green().bold(), resp),
+            Err(e) => eprintln!("{} 添加失败: {}", "[ERROR]".red().bold(), e),
+        }
     }
     if let Some(lbl) = block {
-        let cmd = format!("FILTER {} BLOCK {}\r\n", channel, lbl);
-        port.write_all(cmd.as_bytes()).unwrap();
-        println!("{} 黑名单屏蔽 Label: {}", "[CONFIG]".yellow().bold(), lbl);
+        let cmd = format!("FILTER {} BLOCK {}", channel, lbl);
+        match send_command_and_wait(port_name, &cmd, 1500) {
+            Ok(resp) => println!("{} 黑名单屏蔽 Label: {}", "[OK]".green().bold(), resp),
+            Err(e) => eprintln!("{} 屏蔽失败: {}", "[ERROR]".red().bold(), e),
+        }
     }
 }
 
-fn open_port(port_name: &str) -> Box<dyn serialport::SerialPort> {
-    serialport::new(port_name, 115200)
-        .timeout(Duration::from_millis(1000))
-        .open()
-        .unwrap_or_else(|e| {
-            eprintln!("{} 无法打开串口: {}", "[ERROR]".red().bold(), e);
+/// 执行自收自发 BIT 自测试
+fn run_bit(port_name: &str, tx_ch: u8, rx_ch: u8) {
+    let cmd = format!("BIT {} {}", tx_ch, rx_ch);
+    println!(
+        "{} 正在发起硬件自收自发 BIT (CH{} -> CH{})...",
+        "[BIT]".magenta().bold(),
+        tx_ch,
+        rx_ch
+    );
+
+    // BIT 自检跑完 70+ 个向量约需 1~2 秒，给予 5000ms 超时窗口
+    match send_command_and_wait(port_name, &cmd, 5000) {
+        Ok(resp) => println!("{} {}", "[BIT SUCCESS]".green().bold(), resp),
+        Err(e) => {
+            eprintln!("{} 自检失败或超时: {}", "[BIT FAILURE]".red().bold(), e);
             std::process::exit(1);
-        })
+        }
+    }
 }
 
 fn print_table_header() {
