@@ -5,8 +5,7 @@
 use arinc429_core::protocol::{BinaryFrame, BINARY_FRAME_LEN, BINARY_MAGIC};
 
 pub struct FrameStreamDecoder {
-    buffer: [u8; 2048],
-    valid_len: usize,
+    buffer: Vec<u8>,
 }
 
 impl Default for FrameStreamDecoder {
@@ -18,25 +17,17 @@ impl Default for FrameStreamDecoder {
 impl FrameStreamDecoder {
     pub const fn new() -> Self {
         Self {
-            buffer: [0u8; 2048],
-            valid_len: 0,
+            buffer: Vec::new(),
         }
     }
 
     /// 喂入新的字节切片并返回当前已完整解码的帧列表
     pub fn feed(&mut self, data: &[u8]) -> Vec<BinaryFrame> {
+        self.buffer.extend_from_slice(data);
         let mut frames = Vec::new();
-
-        // 溢出防护：若即将溢出，先压缩已有游标，仍溢出则重置
-        if self.valid_len + data.len() > self.buffer.len() {
-            self.valid_len = 0;
-        }
-
-        self.buffer[self.valid_len..self.valid_len + data.len()].copy_from_slice(data);
-        self.valid_len += data.len();
-
         let mut cursor = 0;
-        while cursor + BINARY_FRAME_LEN <= self.valid_len {
+
+        while cursor + BINARY_FRAME_LEN <= self.buffer.len() {
             // 搜索 Magic 头部 0x41, 0x29 ("A)")
             if self.buffer[cursor] == BINARY_MAGIC[0] && self.buffer[cursor + 1] == BINARY_MAGIC[1] {
                 let candidate = &self.buffer[cursor..cursor + BINARY_FRAME_LEN];
@@ -49,10 +40,15 @@ impl FrameStreamDecoder {
             cursor += 1;
         }
 
-        // 压缩未处理的尾部残留数据
+        // 移除已处理的数据
         if cursor > 0 {
-            self.buffer.copy_within(cursor..self.valid_len, 0);
-            self.valid_len -= cursor;
+            self.buffer.drain(..cursor);
+        }
+
+        // 限制未匹配残存缓冲区的最大长度，防止在持续纯噪声下内存无界增长
+        if self.buffer.len() > 4096 {
+            let discard_len = self.buffer.len() - BINARY_FRAME_LEN;
+            self.buffer.drain(..discard_len);
         }
 
         frames
@@ -129,5 +125,22 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0], frame1);
         assert_eq!(decoded[1], frame2);
+    }
+
+    #[test]
+    fn test_decoder_large_slice_no_panic() {
+        let mut decoder = FrameStreamDecoder::new();
+        let frame = BinaryFrame::new(0, 0, 5000, 0x1234_5678);
+        let mut encoded = [0u8; BINARY_FRAME_LEN];
+        frame.encode(&mut encoded);
+
+        // 构造大于 2048 字节的混合切片 (前置 3000 字节静默数据 + 1 个有效帧 + 1000 字节后置数据)
+        let mut large_chunk = vec![0x00; 3000];
+        large_chunk.extend_from_slice(&encoded);
+        large_chunk.extend_from_slice(&[0x00; 1000]);
+
+        let decoded = decoder.feed(&large_chunk);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0], frame);
     }
 }

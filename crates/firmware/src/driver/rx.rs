@@ -22,6 +22,7 @@ pub struct Arinc429Rx<'d, T: Instance, const SM: usize> {
     dma: Channel<'d>,
     speed: ArincSpeed,
     filter: LabelFilter,
+    dma_buf: [u32; 1],
 }
 
 impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
@@ -52,9 +53,14 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         cfg.use_program(&loaded, &[]);
         cfg.set_in_pins(&[&pin_a, &pin_b]);
 
-        // LSB 优先移入 (Bit 1 最先到达，存入最低位 bit 0)，满 32 位硬件自动推入 FIFO 并清空 ISR
+        // LSB 优先移入 (Bit 1 最先到达，存入最低位 bit 0)，由 PIO 程序显式校验满 32 位后执行 push noblock
         cfg.shift_in = ShiftConfig {
-            auto_fill: true,
+            auto_fill: false,
+            direction: ShiftDirection::Right,
+            threshold: 32,
+        };
+        cfg.shift_out = ShiftConfig {
+            auto_fill: false,
             direction: ShiftDirection::Right,
             threshold: 32,
         };
@@ -71,6 +77,7 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
             dma,
             speed: initial_speed,
             filter,
+            dma_buf: [0u32; 1],
         }
     }
 
@@ -102,10 +109,9 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         &mut self.filter
     }
 
-    /// 异步通过 DMA 从 PIO RX FIFO 读取一个 32 位原始字
+    /// 异步通过 DMA 从 PIO RX FIFO 读取一个 32 位原始字 (使用持久生命周期缓冲区，规避栈悬垂)
     pub async fn recv_raw(&mut self) -> u32 {
-        let mut buf = [0u32; 1];
-        self.sm.rx().dma_pull(&mut self.dma, &mut buf, false).await;
-        buf[0]
+        self.sm.rx().dma_pull(&mut self.dma, &mut self.dma_buf, false).await;
+        self.dma_buf[0]
     }
 }

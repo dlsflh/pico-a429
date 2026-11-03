@@ -36,16 +36,13 @@ pub fn arinc429_tx_program() -> pio::Program<32> {
     .program
 }
 
-/// ARINC 429 差分双引脚极性硬件滤波与严苛间隙检测接收状态机程序 (占用 28 条指令)
+/// ARINC 429 差分双引脚极性采样与严苛 4-bit 间隙校验接收状态机程序 (占用 18 条指令)
 ///
 /// 特性：
-/// 1. 物理 PIO1 独占：拥有完整 32 字指令内存空间，不再受限于单块 21 指令的压缩妥协；
-/// 2. 严苛 4-bit 间隙校验：8 轮循环 * 5 周期 = 严格 40 个 PIO 周期（4.0 bit 时间）连续确认 Null 电平，
-///    彻底杜绝机载中途接入或断续信号产生的残帧 (Runt Frame) 误触发；
-/// 3. 脉冲中心瞬态尖峰抑制 (Glitch Filter)：捕获边沿后延时 2 个周期抵达脉冲中心，若电平已回落至 0b00（即持续时间 < 2us 的 ESD/电磁干扰尖峰），
-///    立即判定为非法毛刺并丢弃，绝不污染移位寄存器；
-/// 4. 差分判定：在确认有效的脉冲中心捕获差分信号 (0b01 -> 1, 0b10 -> 0)；
-/// 5. 硬件抗死锁与字结束超时自同步：具备双重超时计数器，总线持续高电平或字内空闲超时自动脱困复位。
+/// 1. 物理 PIO1 独占：拥有完整 32 字指令内存空间；
+/// 2. 严苛 4-bit 间隙校验：8 轮循环 * (1 + 1 + 1 + 2) = 严格 40 个 PIO 周期（4.0 bit 时间）连续确认 Null 电平；
+/// 3. 脉冲有效居中采样：边沿到达后立即在 5 周期高/低有效脉冲窗口内（第 2~3 周期）捕获差分信号 (0b01 -> 1, 0b10 -> 0)；
+/// 4. 显式 32 位字循环与非阻塞 Push：由硬件计数器严格接收满 32 bit 后显式 push 到 FIFO 并复位 shift counter，彻底杜绝残帧 desync。
 pub fn arinc429_rx_program() -> pio::Program<32> {
     pio::pio_asm!(
         ".wrap_target",
@@ -58,15 +55,12 @@ pub fn arinc429_rx_program() -> pio::Program<32> {
         "    jmp !y, gap_tick",
         "    jmp wait_gap",
         "gap_tick:",
-        "    jmp x--, gap_loop [4]",
+        "    jmp x--, gap_loop [1]",
+
+        "start_word:",
+        "    set x, 31",
 
         "wait_edge:",
-        "    mov osr, pins",
-        "    out y, 2",
-        "    jmp !y, wait_edge",
-
-        "filter_glitch:",
-        "    nop [1]",
         "    mov osr, pins",
         "    out y, 2",
         "    jmp !y, wait_edge",
@@ -75,24 +69,14 @@ pub fn arinc429_rx_program() -> pio::Program<32> {
         "    in y, 1",
 
         "wait_null:",
-        "    set x, 14",
-        "null_loop:",
         "    mov osr, pins",
         "    out y, 2",
-        "    jmp !y, wait_next",
-        "    jmp x--, null_loop",
-        "    jmp wait_gap",
+        "    jmp !y, bit_done",
+        "    jmp wait_null",
 
-        "wait_next:",
-        "    set x, 24",
-        "next_loop:",
-        "    mov osr, pins",
-        "    out y, 2",
-        "    jmp !y, next_tick",
-        "    jmp filter_glitch",
-        "next_tick:",
-        "    jmp x--, next_loop",
-        "    jmp wait_gap",
+        "bit_done:",
+        "    jmp x--, wait_edge",
+        "    push noblock",
         ".wrap"
     )
     .program

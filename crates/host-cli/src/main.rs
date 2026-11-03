@@ -4,7 +4,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use colored::*;
 
-use arinc429_core::protocol::{flags, BinaryFrame};
+use arinc429_core::protocol::{flags, frame_types, BinaryFrame, BINARY_FRAME_LEN, BINARY_MAGIC};
 use arinc429_core::word::ArincWord;
 
 mod decoder;
@@ -151,7 +151,7 @@ fn main() {
     }
 }
 
-/// 发送指令并同步等待固件返回 OK/ERR 响应 (消除 Fire-and-forget 盲发)
+/// 发送指令并同步等待固件返回 OK/ERR 响应 (支持 ASCII 文本应答与 BINARY 帧格式兼容解析)
 fn send_command_and_wait(port_name: &str, cmd: &str, timeout_ms: u64) -> Result<String, String> {
     let mut port = serialport::new(port_name, 115200)
         .timeout(Duration::from_millis(200))
@@ -165,22 +165,57 @@ fn send_command_and_wait(port_name: &str, cmd: &str, timeout_ms: u64) -> Result<
     let start = std::time::Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let mut line_buf = String::new();
-    let mut temp = [0u8; 1];
+    let mut raw_buf = Vec::new();
+    let mut temp = [0u8; 64];
 
     while start.elapsed() < timeout {
         match port.read(&mut temp) {
-            Ok(1) => {
-                let ch = temp[0] as char;
-                if ch == '\n' {
-                    let trimmed = line_buf.trim();
-                    if trimmed.starts_with("OK:") {
-                        return Ok(trimmed.to_string());
-                    } else if trimmed.starts_with("ERR:") {
-                        return Err(trimmed.to_string());
+            Ok(n) if n > 0 => {
+                // 1. 尝试作为二进制帧解析 (兼容固件默认 BINARY 模式下的 CMD_ACK / BIT_REPORT / ASYNC_EVENT)
+                raw_buf.extend_from_slice(&temp[..n]);
+                while raw_buf.len() >= BINARY_FRAME_LEN {
+                    if raw_buf[0] == BINARY_MAGIC[0] && raw_buf[1] == BINARY_MAGIC[1] {
+                        if let Ok(frame) = BinaryFrame::decode(&raw_buf[..BINARY_FRAME_LEN]) {
+                            match frame.frame_type {
+                                frame_types::CMD_ACK => {
+                                    return Ok(format!("OK: Command acknowledged (binary mode, seq {})", frame.seq_num));
+                                }
+                                frame_types::BIT_REPORT => {
+                                    let status_val = (frame.raw_word >> 16) & 0xFFFF;
+                                    let err_code = frame.raw_word & 0xFFFF;
+                                    return if status_val == 0 {
+                                        Ok(format!("OK: BIT CH{} PASSED [RECV:{} RTT_AVG:{}us]", frame.channel, frame.seq_num, frame.timestamp_us))
+                                    } else {
+                                        Err(format!("ERR: BIT CH{} FAILED [ERR_CODE:{} RECV:{} RTT_AVG:{}us]", frame.channel, err_code, frame.seq_num, frame.timestamp_us))
+                                    };
+                                }
+                                frame_types::ASYNC_EVENT => {
+                                    return Err("ERR: Device error / bus fault event".to_string());
+                                }
+                                _ => {
+                                    raw_buf.drain(..BINARY_FRAME_LEN);
+                                    continue;
+                                }
+                            }
+                        }
                     }
-                    line_buf.clear();
-                } else if ch != '\r' {
-                    line_buf.push(ch);
+                    break;
+                }
+
+                // 2. 尝试作为 ASCII 行解析 (兼容固件 ASCII 模式或文本报错)
+                for &b in &temp[..n] {
+                    let ch = b as char;
+                    if ch == '\n' {
+                        let trimmed = line_buf.trim();
+                        if trimmed.starts_with("OK:") {
+                            return Ok(trimmed.to_string());
+                        } else if trimmed.starts_with("ERR:") {
+                            return Err(trimmed.to_string());
+                        }
+                        line_buf.clear();
+                    } else if ch != '\r' {
+                        line_buf.push(ch);
+                    }
                 }
             }
             Ok(_) => {}

@@ -49,6 +49,7 @@ pub async fn usb_cdc_service(mut class: CdcAcmClass<'static, Driver<'static, USB
         // 等待 USB 连接就绪
         class.wait_connection().await;
         rx_line.clear();
+        let mut overflow_discard = false;
 
         loop {
             // 并发处理：既监听上位机发来的串口指令，又将收到的 429 数据推送到串口
@@ -60,12 +61,18 @@ pub async fn usb_cdc_service(mut class: CdcAcmClass<'static, Driver<'static, USB
                         Ok(n) => {
                             for &b in &rx_buf[..n] {
                                 if b == b'\r' || b == b'\n' {
-                                    if !rx_line.is_empty() {
+                                    if overflow_discard {
+                                        overflow_discard = false;
+                                        rx_line.clear();
+                                    } else if !rx_line.is_empty() {
                                         dispatch_command_line(&rx_line, &mut class).await;
                                         rx_line.clear();
                                     }
+                                } else if overflow_discard {
+                                    // 处于超长丢弃状态，跳过后续字符直至换行
                                 } else if rx_line.len() >= 120 {
-                                    // 发生超长指令溢出，拒绝静默截断，执行 Fail-Fast 报错
+                                    // 发生超长指令溢出，拒绝静默截断，进入丢弃状态并报错
+                                    overflow_discard = true;
                                     rx_line.clear();
                                     let _ = cdc_write_all(
                                         &mut class,
@@ -105,7 +112,7 @@ pub async fn usb_cdc_service(mut class: CdcAcmClass<'static, Driver<'static, USB
                             }
                         }
 
-                        if class.write_packet(&bin_batch_buf[..offset]).await.is_err() {
+                        if cdc_write_all(&mut class, &bin_batch_buf[..offset]).await.is_err() {
                             break;
                         }
                     } else {

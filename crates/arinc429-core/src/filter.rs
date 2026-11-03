@@ -140,12 +140,10 @@ impl LabelFilter {
     }
 
     /// 高性能判断一个到达的 (label, parity_valid) 帧是否应被接收
+    ///
+    /// 注意：Label 过滤器专注于八进制标号路由，物理奇偶校验错误字在全放行与白名单命中时均允许透传至上位机分析仪以供监控告警
     #[inline(always)]
-    pub fn matches(&self, label: Label, parity_valid: bool) -> bool {
-        if !parity_valid {
-            return false;
-        }
-
+    pub fn matches(&self, label: Label, _parity_valid: bool) -> bool {
         match self.mode {
             FilterMode::AcceptAll => true,
             FilterMode::Whitelist => {
@@ -173,8 +171,8 @@ mod tests {
         let filter = LabelFilter::new_accept_all();
         assert!(filter.matches(Label::from_octal(0o310), true));
         assert!(filter.matches(Label::from_octal(0o203), true));
-        // 校验错误被拦截
-        assert!(!filter.matches(Label::from_octal(0o310), false));
+        // 全放行模式下允许透传校验错误帧，供上位机监控捕获并警报
+        assert!(filter.matches(Label::from_octal(0o310), false));
     }
 
     #[test]
