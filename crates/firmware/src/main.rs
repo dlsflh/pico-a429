@@ -22,9 +22,11 @@ use embassy_usb::Builder;
 
 use arinc429_core::filter::LabelFilter;
 
-use crate::channel::{InboundArincFrame, GLOBAL_RX_CHANNEL, GLOBAL_TX_CHANNEL};
+use crate::channel::{
+    ChannelControlCmd, InboundArincFrame, CHANNEL0_CTRL_QUEUE, CHANNEL0_TX_QUEUE, GLOBAL_RX_PUBSUB,
+};
 use crate::driver::{Arinc429Rx, Arinc429Tx, ArincSpeed};
-use crate::usb_service::{usb_cdc_service, usb_task, SPEED_CONFIG_SIGNAL};
+use crate::usb_service::{usb_cdc_service, usb_task, CHANNEL0_TX_SPEED_SIGNAL};
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
@@ -86,32 +88,25 @@ async fn main(spawner: Spawner) {
     let tx = Arinc429Tx::new(&mut common, sm0, p.PIN_0, p.PIN_1, default_speed);
     let rx = Arinc429Rx::new(&mut common, sm1, p.PIN_2, p.PIN_3, default_speed, filter);
 
-    // 派发 Channel 0 的独立异步任务
-    spawner.spawn(arinc_channel0_task(tx, rx).unwrap());
+    // 派发 Channel 0 的独立全双工收发异步任务
+    spawner.spawn(arinc_channel0_rx_task(rx).unwrap());
+    spawner.spawn(arinc_channel0_tx_task(tx).unwrap());
 }
 
-/// ARINC 429 Channel 0 主调度任务
+/// ARINC 429 Channel 0 接收与过滤调度任务
 ///
-/// 独立管理状态机收发与波特率切换
+/// 独立运行，全速处理总线接收与 Label 过滤，并通过 PubSub 广播发布，绝不阻塞
 #[embassy_executor::task]
-async fn arinc_channel0_task(
-    mut tx: Arinc429Tx<'static, PIO0, 0>,
-    mut rx: Arinc429Rx<'static, PIO0, 1>,
-) {
+async fn arinc_channel0_rx_task(mut rx: Arinc429Rx<'static, PIO0, 1>) {
     let start_time = Instant::now();
+    let publisher = GLOBAL_RX_PUBSUB.immediate_publisher();
 
     loop {
-        // 三路并发选择：
-        // 1. 接收来自总线的 429 帧并推送到上报队列；
-        // 2. 接收来自上位机的待发数据包并送入 PIO TX FIFO；
-        // 3. 监听波特率热切换命令。
-        match select(
-            rx.recv_filtered(),
-            select(GLOBAL_TX_CHANNEL.receive(), SPEED_CONFIG_SIGNAL.wait()),
-        )
-        .await
-        {
-            // 分支 1：总线收到新帧
+        // 双路并发选择：
+        // 1. 接收来自总线的 429 帧并推送到广播总线；
+        // 2. 监听动态配置命令 (速率切换、Label 允许/封锁、清空规则)。
+        match select(rx.recv_filtered(), CHANNEL0_CTRL_QUEUE.receive()).await {
+            // 分支 1：总线收到新帧 (通过了 LabelFilter 过滤)
             Either::First(Some((word, parity_ok))) => {
                 let now_us = (Instant::now() - start_time).as_micros() as u32;
                 let frame = InboundArincFrame {
@@ -121,29 +116,55 @@ async fn arinc_channel0_task(
                     parity_ok,
                     high_speed: rx.speed() == ArincSpeed::High100k,
                 };
-                // 放入上报通道
-                GLOBAL_RX_CHANNEL.send(frame).await;
+                // 广播发布 (满载时自动丢弃最旧帧，绝对不阻塞物理层总线接收)
+                publisher.publish_immediate(frame);
             }
             Either::First(None) => {
                 // 被过滤器拦截或校验错误丢弃
             }
-            // 分支 2：上位机请求发送
-            Either::Second(Either::First(outbound)) => {
-                if outbound.channel_id == 0 {
-                    tx.send_raw(outbound.raw_word).await;
-                }
-            }
-            // 分支 3：波特率热切换指令
-            Either::Second(Either::Second((ch, high_speed))) => {
-                if ch == 0 {
+            // 分支 2：收到控制与过滤配置指令
+            Either::Second(cmd) => match cmd {
+                ChannelControlCmd::SetSpeed { high_speed } => {
                     let speed = if high_speed {
                         ArincSpeed::High100k
                     } else {
                         ArincSpeed::Low12k5
                     };
-                    tx.set_speed(speed);
                     rx.set_speed(speed);
                 }
+                ChannelControlCmd::FilterAllow(label) => {
+                    rx.filter_mut().allow_label(label);
+                }
+                ChannelControlCmd::FilterBlock(label) => {
+                    rx.filter_mut().block_label(label);
+                }
+                ChannelControlCmd::FilterClear => {
+                    rx.filter_mut().clear();
+                }
+            },
+        }
+    }
+}
+
+/// ARINC 429 Channel 0 发送调度任务
+///
+/// 独立管理 TX FIFO 注入与发送速率，彻底解耦 TX 与 RX
+#[embassy_executor::task]
+async fn arinc_channel0_tx_task(mut tx: Arinc429Tx<'static, PIO0, 0>) {
+    loop {
+        match select(CHANNEL0_TX_QUEUE.receive(), CHANNEL0_TX_SPEED_SIGNAL.wait()).await {
+            Either::First(outbound) => {
+                if outbound.channel_id == 0 {
+                    tx.send_raw(outbound.raw_word).await;
+                }
+            }
+            Either::Second(high_speed) => {
+                let speed = if high_speed {
+                    ArincSpeed::High100k
+                } else {
+                    ArincSpeed::Low12k5
+                };
+                tx.set_speed(speed);
             }
         }
     }

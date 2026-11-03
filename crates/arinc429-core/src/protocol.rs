@@ -146,59 +146,58 @@ pub enum HostCommand {
     QueryStatus,
 }
 
+fn strip_hex_prefix(s: &str) -> &str {
+    if let Some(stripped) = s.strip_prefix("0x") {
+        stripped
+    } else if let Some(stripped) = s.strip_prefix("0X") {
+        stripped
+    } else {
+        s
+    }
+}
+
 impl HostCommand {
     /// 解析单行文本指令 (忽略前后空白，不区分大小写)
     pub fn parse(line: &str) -> Result<Self, &'static str> {
-        let parts: heapless::Vec<&str, 8> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            return Err("Empty command");
-        }
+        let mut parts = line.split_whitespace();
+        let cmd = parts.next().ok_or("Empty command")?;
 
-        let cmd = parts[0];
         if cmd.eq_ignore_ascii_case("STATUS") {
             return Ok(Self::QueryStatus);
         }
 
         if cmd.eq_ignore_ascii_case("MODE") {
-            if parts.len() < 2 {
-                return Err("Usage: MODE <BIN|ASCII>");
-            }
-            let is_bin = parts[1].eq_ignore_ascii_case("BIN");
+            let mode_str = parts.next().ok_or("Usage: MODE <BIN|ASCII>")?;
+            let is_bin = mode_str.eq_ignore_ascii_case("BIN");
             return Ok(Self::SetMode { binary_mode: is_bin });
         }
 
         if cmd.eq_ignore_ascii_case("SPEED") {
-            if parts.len() < 3 {
-                return Err("Usage: SPEED <ch> <100K|12K5>");
-            }
-            let channel = parts[1].parse::<u8>().map_err(|_| "Invalid channel")?;
-            let high_speed = parts[2].eq_ignore_ascii_case("100K");
+            let ch_str = parts.next().ok_or("Usage: SPEED <ch> <100K|12K5>")?;
+            let speed_str = parts.next().ok_or("Usage: SPEED <ch> <100K|12K5>")?;
+            let channel = ch_str.parse::<u8>().map_err(|_| "Invalid channel")?;
+            let high_speed = speed_str.eq_ignore_ascii_case("100K");
             return Ok(Self::SetSpeed { channel, high_speed });
         }
 
         if cmd.eq_ignore_ascii_case("TXRAW") {
-            if parts.len() < 3 {
-                return Err("Usage: TXRAW <ch> <hex_word>");
-            }
-            let channel = parts[1].parse::<u8>().map_err(|_| "Invalid channel")?;
-            let hex_str = parts[2].strip_prefix("0x").unwrap_or(parts[2]);
+            let ch_str = parts.next().ok_or("Usage: TXRAW <ch> <hex_word>")?;
+            let hex_token = parts.next().ok_or("Usage: TXRAW <ch> <hex_word>")?;
+            let channel = ch_str.parse::<u8>().map_err(|_| "Invalid channel")?;
+            let hex_str = strip_hex_prefix(hex_token);
             let raw_word = u32::from_str_radix(hex_str, 16).map_err(|_| "Invalid hex word")?;
             return Ok(Self::SendRaw { channel, raw_word });
         }
 
         if cmd.eq_ignore_ascii_case("FILTER") {
-            if parts.len() < 3 {
-                return Err("Usage: FILTER <ch> <ALLOW|BLOCK|CLEAR> [octal]");
-            }
-            let channel = parts[1].parse::<u8>().map_err(|_| "Invalid channel")?;
-            let action = parts[2];
+            let ch_str = parts.next().ok_or("Usage: FILTER <ch> <ALLOW|BLOCK|CLEAR> [octal]")?;
+            let action = parts.next().ok_or("Usage: FILTER <ch> <ALLOW|BLOCK|CLEAR> [octal]")?;
+            let channel = ch_str.parse::<u8>().map_err(|_| "Invalid channel")?;
             if action.eq_ignore_ascii_case("CLEAR") {
                 return Ok(Self::FilterClear { channel });
             }
-            if parts.len() < 4 {
-                return Err("Missing octal label for ALLOW/BLOCK");
-            }
-            let label = Label::parse_str(parts[3])?;
+            let label_str = parts.next().ok_or("Missing octal label for ALLOW/BLOCK")?;
+            let label = Label::parse_str(label_str)?;
             if action.eq_ignore_ascii_case("ALLOW") {
                 return Ok(Self::FilterAllow { channel, label });
             } else if action.eq_ignore_ascii_case("BLOCK") {
@@ -210,15 +209,27 @@ impl HostCommand {
 
         if cmd.eq_ignore_ascii_case("TX") {
             // TX <ch> <octal_label> <sdi> <data_hex> <ssm>
-            if parts.len() < 6 {
-                return Err("Usage: TX <ch> <octal_label> <sdi> <data_hex> <ssm>");
+            let ch_str = parts.next().ok_or("Usage: TX <ch> <octal_label> <sdi> <data_hex> <ssm>")?;
+            let label_str = parts.next().ok_or("Usage: TX <ch> <octal_label> <sdi> <data_hex> <ssm>")?;
+            let sdi_str = parts.next().ok_or("Usage: TX <ch> <octal_label> <sdi> <data_hex> <ssm>")?;
+            let data_str = parts.next().ok_or("Usage: TX <ch> <octal_label> <sdi> <data_hex> <ssm>")?;
+            let ssm_str = parts.next().ok_or("Usage: TX <ch> <octal_label> <sdi> <data_hex> <ssm>")?;
+
+            let channel = ch_str.parse::<u8>().map_err(|_| "Invalid channel")?;
+            let label = Label::parse_str(label_str)?;
+            let sdi = sdi_str.parse::<u8>().map_err(|_| "Invalid sdi")?;
+            if sdi > 3 {
+                return Err("SDI out of range (0-3)");
             }
-            let channel = parts[1].parse::<u8>().map_err(|_| "Invalid channel")?;
-            let label = Label::parse_str(parts[2])?;
-            let sdi = parts[3].parse::<u8>().map_err(|_| "Invalid sdi")?;
-            let hex_str = parts[4].strip_prefix("0x").unwrap_or(parts[4]);
+            let hex_str = strip_hex_prefix(data_str);
             let data = u32::from_str_radix(hex_str, 16).map_err(|_| "Invalid data hex")?;
-            let ssm = parts[5].parse::<u8>().map_err(|_| "Invalid ssm")?;
+            if data > 0x0007_FFFF {
+                return Err("Data out of range (max 19 bits: 0x7FFFF)");
+            }
+            let ssm = ssm_str.parse::<u8>().map_err(|_| "Invalid ssm")?;
+            if ssm > 3 {
+                return Err("SSM out of range (0-3)");
+            }
 
             return Ok(Self::SendConstructed {
                 channel,
@@ -269,5 +280,32 @@ mod tests {
 
         let cmd3 = HostCommand::parse("FILTER 0 ALLOW 310").unwrap();
         assert_eq!(cmd3, HostCommand::FilterAllow { channel: 0, label: Label::from_octal(0o310) });
+    }
+
+    #[test]
+    fn test_parse_commands_robustness() {
+        // >= 9 tokens: should not panic
+        let res = HostCommand::parse("STATUS extra1 extra2 extra3 extra4 extra5 extra6 extra7 extra8 extra9");
+        assert_eq!(res, Ok(HostCommand::QueryStatus));
+
+        // 0X hex prefix in TXRAW and TX
+        let cmd_txraw = HostCommand::parse("TXRAW 0 0X12345678").unwrap();
+        assert_eq!(cmd_txraw, HostCommand::SendRaw { channel: 0, raw_word: 0x12345678 });
+
+        let cmd_tx = HostCommand::parse("TX 0 310 1 0XABCD 2").unwrap();
+        assert_eq!(cmd_tx, HostCommand::SendConstructed {
+            channel: 0,
+            label: Label::from_octal(0o310),
+            sdi: 1,
+            data: 0xABCD,
+            ssm: 2,
+            parity: ParityMode::Odd,
+        });
+
+        // SDI/SSM bounds validation (0..=3)
+        assert!(HostCommand::parse("TX 0 310 4 0x12 2").is_err());
+        assert!(HostCommand::parse("TX 0 310 1 0x12 4").is_err());
+        assert!(HostCommand::parse("TX 0 310 0 0x12 0").is_ok());
+        assert!(HostCommand::parse("TX 0 310 3 0x12 3").is_ok());
     }
 }

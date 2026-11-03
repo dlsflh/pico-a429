@@ -87,29 +87,34 @@ impl LabelFilter {
         self.drop_parity_errors
     }
 
-    /// 允许指定八进制 Label (用于白名单模式添加允许项，或黑名单模式移除封锁)
+    /// 允许指定八进制 Label (若当前不为白名单模式，则自动切换为 Whitelist 并清空原有规则)
     pub fn allow_label(&mut self, label: Label) {
+        if self.mode != FilterMode::Whitelist {
+            self.bitmap = [0; 8];
+            self.mode = FilterMode::Whitelist;
+        }
         let octal = label.to_octal();
         let word_idx = (octal / 32) as usize;
         let bit_idx = octal % 32;
         self.bitmap[word_idx] |= 1 << bit_idx;
     }
 
-    /// 封锁指定八进制 Label (用于黑名单模式添加屏蔽项，或白名单模式移除允许项)
+    /// 封锁指定八进制 Label (若当前不为黑名单模式，则自动切换为 Blacklist 并清空原有规则)
     pub fn block_label(&mut self, label: Label) {
+        if self.mode != FilterMode::Blacklist {
+            self.bitmap = [0; 8];
+            self.mode = FilterMode::Blacklist;
+        }
         let octal = label.to_octal();
         let word_idx = (octal / 32) as usize;
         let bit_idx = octal % 32;
-        if self.mode == FilterMode::Blacklist {
-            self.bitmap[word_idx] |= 1 << bit_idx;
-        } else {
-            self.bitmap[word_idx] &= !(1 << bit_idx);
-        }
+        self.bitmap[word_idx] |= 1 << bit_idx;
     }
 
-    /// 清空所有位图配置
+    /// 清空所有位图配置并重置为全放行模式 (AcceptAll)
     pub fn clear(&mut self) {
         self.bitmap = [0; 8];
+        self.mode = FilterMode::AcceptAll;
     }
 
     /// 配置 SDI 过滤掩码 (例如 0b0001 仅允许 SDI 0，0b0011 允许 SDI 0 和 1)
@@ -195,5 +200,34 @@ mod tests {
         assert!(!filter.matches(Label::from_octal(0o310), 0, true));
         assert!(filter.matches(Label::from_octal(0o310), 1, true));
         assert!(!filter.matches(Label::from_octal(0o310), 2, true));
+    }
+
+    #[test]
+    fn test_mode_transitions() {
+        let mut filter = LabelFilter::new_accept_all();
+        assert_eq!(filter.mode(), FilterMode::AcceptAll);
+
+        // allow_label transitions mode to Whitelist
+        filter.allow_label(Label::from_octal(0o310));
+        assert_eq!(filter.mode(), FilterMode::Whitelist);
+        assert!(filter.matches(Label::from_octal(0o310), 0, true));
+        assert!(!filter.matches(Label::from_octal(0o203), 0, true));
+
+        // clear resets to AcceptAll
+        filter.clear();
+        assert_eq!(filter.mode(), FilterMode::AcceptAll);
+        assert!(filter.matches(Label::from_octal(0o310), 0, true));
+        assert!(filter.matches(Label::from_octal(0o203), 0, true));
+
+        // block_label transitions mode to Blacklist
+        filter.block_label(Label::from_octal(0o203));
+        assert_eq!(filter.mode(), FilterMode::Blacklist);
+        assert!(filter.matches(Label::from_octal(0o310), 0, true));
+        assert!(!filter.matches(Label::from_octal(0o203), 0, true));
+
+        // clear resets to AcceptAll again
+        filter.clear();
+        assert_eq!(filter.mode(), FilterMode::AcceptAll);
+        assert!(filter.matches(Label::from_octal(0o203), 0, true));
     }
 }

@@ -58,9 +58,9 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         cfg.use_program(&loaded, &[]);
         cfg.set_in_pins(&[&pin_a, &pin_b]);
 
-        // LSB 优先移入 (Bit 1 最先到达，存入最低位 bit 0)
+        // LSB 优先移入 (Bit 1 最先到达，存入最低位 bit 0)，满 32 位硬件自动推入 FIFO 并清空 ISR
         cfg.shift_in = ShiftConfig {
-            auto_fill: false,
+            auto_fill: true,
             direction: ShiftDirection::Right,
             threshold: 32,
         };
@@ -101,6 +101,11 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
     /// 获取当前过滤器的引用
     pub fn filter(&self) -> &LabelFilter {
         &self.filter
+    }
+
+    /// 获取当前过滤器的可变引用
+    pub fn filter_mut(&mut self) -> &mut LabelFilter {
+        &mut self.filter
     }
 
     /// 获取统计信息

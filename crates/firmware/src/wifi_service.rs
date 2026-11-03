@@ -10,7 +10,7 @@ use embassy_time::Timer;
 
 use arinc429_core::protocol::BINARY_FRAME_LEN;
 
-use crate::channel::GLOBAL_RX_CHANNEL;
+use crate::channel::GLOBAL_RX_PUBSUB;
 
 pub const ARINC_UDP_PORT: u16 = 4290;
 
@@ -53,9 +53,13 @@ pub async fn wifi_telemetry_task(stack: Stack<'static>) -> ! {
         ARINC_UDP_PORT,
     );
 
+    let mut subscriber = GLOBAL_RX_PUBSUB
+        .subscriber()
+        .expect("Failed to acquire WiFi subscriber on GLOBAL_RX_PUBSUB");
+
     loop {
-        // 从全局 ARINC 接收通道取出数据
-        let frame = GLOBAL_RX_CHANNEL.receive().await;
+        // 从全局 ARINC 接收广播通道订阅数据 (多订阅者并行消费，绝不互斥丢帧)
+        let frame = subscriber.next_message_pure().await;
 
         let bin = frame.to_binary_frame();
         bin.encode(&mut buf);
