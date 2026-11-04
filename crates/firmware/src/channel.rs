@@ -2,14 +2,13 @@
 //!
 //! 支持从单通道平滑扩展至 12 路任意物理通道。
 //! 每个通道独立拥有独立的下行发送队列与专用控制队列，杜绝跨任务竞争偷帧。
-//! 生产数据采用广播式 PubSub (GLOBAL_RX_PUBSUB)，自测试数据采用通道隔离专用点对点通道 (BIT_DIAGNOSTIC_CHANNEL)。
+//! 生产数据采用广播式 PubSub (GLOBAL_RX_PUBSUB)。
 
+use core::sync::atomic::{AtomicU8, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::pubsub::PubSubChannel;
-use embassy_sync::signal::Signal;
 
-use arinc429_core::bit::BitReport;
 use arinc429_core::protocol::{flags, BinaryFrame, FilterAction};
 use arinc429_core::word::ArincWord;
 
@@ -49,11 +48,35 @@ pub const BOARD_CHANNELS: [ChannelHwDescriptor; ACTIVE_CHANNEL_COUNT] = [
     },
 ];
 
-/// 查询板载通道的物理固定方向
+// 运行时通道方向状态：0: Disabled, 1: Tx, 2: Rx
+static RUNTIME_CHANNEL_DIRECTIONS: [AtomicU8; ACTIVE_CHANNEL_COUNT] = [
+    AtomicU8::new(1), // CH0 默认为 Tx
+    AtomicU8::new(2), // CH1 默认为 Rx
+];
+
+/// 动态更新通道方向
+#[inline]
+pub fn set_channel_direction(channel_id: u8, dir: ChannelDirection) {
+    if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
+        let code = match dir {
+            ChannelDirection::Disabled => 0,
+            ChannelDirection::Tx => 1,
+            ChannelDirection::Rx => 2,
+        };
+        RUNTIME_CHANNEL_DIRECTIONS[channel_id as usize].store(code, Ordering::Relaxed);
+    }
+}
+
+/// 查询板载通道的当前配置方向
 #[inline]
 pub fn channel_direction(channel_id: u8) -> Option<ChannelDirection> {
     if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
-        Some(BOARD_CHANNELS[channel_id as usize].direction)
+        match RUNTIME_CHANNEL_DIRECTIONS[channel_id as usize].load(Ordering::Relaxed) {
+            0 => Some(ChannelDirection::Disabled),
+            1 => Some(ChannelDirection::Tx),
+            2 => Some(ChannelDirection::Rx),
+            _ => None,
+        }
     } else {
         None
     }
@@ -100,15 +123,6 @@ pub enum ChannelControlCmd {
     },
     /// 过滤规则动作
     Filter(FilterAction),
-    /// 进入/退出 BIT 诊断回环测试模式 (隔离外部广播总线)
-    SetBitDiagnosticMode(bool),
-}
-
-/// BIT 自测试触发请求
-#[derive(Debug, Clone, Copy)]
-pub struct BitRequest {
-    pub tx_channel: u8,
-    pub rx_channel: u8,
 }
 
 // 静态队列构造原型
@@ -127,20 +141,10 @@ pub static CHANNEL_CTRL_QUEUES: [Channel<CriticalSectionRawMutex, ChannelControl
 
 /// 集中式多路接收遥测广播总线
 ///
-/// 具备 128 帧深度的环形缓冲，支持 4 个独立订阅端 (USB, 诊断监听器等)，对应当前激活通道发布者。
+/// 具备 128 帧深度的环形缓冲，支持 4 个独立订阅端 (USB 等)，对应当前激活通道发布者。
 /// 满载自动丢弃最旧帧，绝不反向阻塞物理层总线接收。
 pub static GLOBAL_RX_PUBSUB: PubSubChannel<CriticalSectionRawMutex, InboundArincFrame, 128, 4, ACTIVE_CHANNEL_COUNT> =
     PubSubChannel::new();
-
-/// BIT 自测试专用点对点无污染接收通道 (与生产全局广播 PubSub 物理隔离)
-pub static BIT_DIAGNOSTIC_CHANNEL: Channel<CriticalSectionRawMutex, InboundArincFrame, 16> =
-    Channel::new();
-
-/// BIT 请求投递队列
-pub static BIT_REQ_CHANNEL: Channel<CriticalSectionRawMutex, BitRequest, 1> = Channel::new();
-
-/// BIT 结果报告信号
-pub static BIT_RESP_SIGNAL: Signal<CriticalSectionRawMutex, BitReport> = Signal::new();
 
 /// 向指定通道投递发送数据帧 (Fail-Fast 参数校验)
 pub async fn send_to_channel_tx(channel_id: u8, raw_word: u32) -> Result<(), ChannelError> {

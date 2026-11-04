@@ -11,117 +11,152 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_futures::select::{select, Either};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
-use embassy_usb::class::cdc_acm::CdcAcmClass;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_usb::class::cdc_acm::{Receiver, Sender};
 use heapless::String;
 
-use arinc429_core::bit::{BitReport, BitStatus};
 use arinc429_core::protocol::{
     flags, frame_types, BinaryFrame, FilterAction, HostCommand, BINARY_FRAME_LEN,
 };
 use arinc429_core::word::ArincWord;
 
 use crate::channel::{
-    channel_direction, send_to_channel_ctrl, send_to_channel_tx, BitRequest, ChannelControlCmd,
-    ChannelDirection, InboundArincFrame, ACTIVE_CHANNEL_COUNT, BIT_REQ_CHANNEL,
-    BIT_RESP_SIGNAL, GLOBAL_RX_PUBSUB,
+    channel_direction, send_to_channel_ctrl, send_to_channel_tx, set_channel_direction,
+    ChannelControlCmd, ChannelDirection, InboundArincFrame, ACTIVE_CHANNEL_COUNT,
+    GLOBAL_RX_PUBSUB,
 };
 
-/// 推送模式：true 表示二进制高速帧，false 表示 ASCII 文本
-pub static BINARY_OUTPUT_MODE: AtomicBool = AtomicBool::new(true);
+/// 推送模式：true 表示二进制高速帧，false 表示 ASCII 文本 (默认启动为 ASCII 便于调试验证)
+pub static BINARY_OUTPUT_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 向上位机发送控制命令回执的专用非阻塞队列
+pub static USB_CMD_RESP_QUEUE: Channel<CriticalSectionRawMutex, CommandExecutionResult, 4> =
+    Channel::new();
 
 #[embassy_executor::task]
 pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, Driver<'static, USB>>) {
     usb_device.run().await;
 }
 
+/// 独立的 USB CDC 接收任务：专职读取上位机下发的控制指令
+///
+/// 架构隔离：绝不受下行发送阻塞影响，USB OUT 端点始终处于就绪武装状态，彻底杜绝上位机写入超时 (Win32 Error 121)。
 #[embassy_executor::task]
-pub async fn usb_cdc_service(mut class: CdcAcmClass<'static, Driver<'static, USB>>) {
+pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB>>) {
     let mut rx_buf = [0u8; 128];
     let mut rx_line = String::<128>::new();
-    // 64 字节最大端点聚合缓冲区 (最多容纳 4 帧定长 16 字节二进制遥测数据: 4 * 16 = 64 字节完美整除，零填充浪费)
+    let mut overflow_discard = false;
+
+    receiver.wait_connection().await;
+
+    loop {
+        match receiver.read_packet(&mut rx_buf).await {
+            Ok(0) => {} // 忽略零长包
+            Ok(n) => {
+                for &b in &rx_buf[..n] {
+                    if b == b'\r' || b == b'\n' {
+                        if overflow_discard {
+                            overflow_discard = false;
+                            rx_line.clear();
+                        } else if !rx_line.is_empty() {
+                            let result = match HostCommand::parse(&rx_line) {
+                                Ok(cmd) => execute_host_command(cmd).await,
+                                Err(e) => {
+                                    let mut err_str = String::<64>::new();
+                                    core::write!(err_str, "ERR: Command parse failure: {:?}\r\n", e).ok();
+                                    CommandExecutionResult::ErrorDynamic(err_str)
+                                }
+                            };
+                            USB_CMD_RESP_QUEUE.send(result).await;
+                            rx_line.clear();
+                        }
+                    } else if overflow_discard {
+                        // 处于超长丢弃状态，跳过后续字符直至换行
+                    } else if rx_line.len() >= 120 {
+                        overflow_discard = true;
+                        rx_line.clear();
+                        USB_CMD_RESP_QUEUE
+                            .send(CommandExecutionResult::ErrorStatic(
+                                "ERR: Command line buffer overflow\r\n",
+                            ))
+                            .await;
+                    } else {
+                        let _ = rx_line.push(b as char);
+                    }
+                }
+            }
+            Err(_) => {
+                receiver.wait_connection().await;
+            }
+        }
+    }
+}
+
+/// 独立的 USB CDC 发送任务：统一调度命令回执与业务遥测流
+///
+/// 优先保障上位机命令 ACK / BIT 报告即时输出，在 host 未连接/未读时自动丢弃滞留总线遥测，消灭死锁。
+#[embassy_executor::task]
+pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) {
     let mut bin_batch_buf = [0u8; 64];
 
     let mut subscriber = GLOBAL_RX_PUBSUB
         .subscriber()
         .expect("Failed to acquire USB subscriber on GLOBAL_RX_PUBSUB");
 
+    sender.wait_connection().await;
+
     loop {
-        // 等待 USB 连接就绪
-        class.wait_connection().await;
-        rx_line.clear();
-        let mut overflow_discard = false;
-
-        loop {
-            // 并发处理：既监听上位机发来的串口指令，又将收到的 429 数据推送到串口
-            match select(class.read_packet(&mut rx_buf), subscriber.next_message_pure()).await {
-                // 分支 1：收到上位机发送的数据
-                Either::First(read_res) => {
-                    match read_res {
-                        Ok(0) => {} // 忽略零长心跳包
-                        Ok(n) => {
-                            for &b in &rx_buf[..n] {
-                                if b == b'\r' || b == b'\n' {
-                                    if overflow_discard {
-                                        overflow_discard = false;
-                                        rx_line.clear();
-                                    } else if !rx_line.is_empty() {
-                                        dispatch_command_line(&rx_line, &mut class).await;
-                                        rx_line.clear();
-                                    }
-                                } else if overflow_discard {
-                                    // 处于超长丢弃状态，跳过后续字符直至换行
-                                } else if rx_line.len() >= 120 {
-                                    // 发生超长指令溢出，拒绝静默截断，进入丢弃状态并报错
-                                    overflow_discard = true;
-                                    rx_line.clear();
-                                    let _ = cdc_write_all(
-                                        &mut class,
-                                        b"ERR: Command line buffer overflow\r\n",
-                                    )
-                                    .await;
-                                } else {
-                                    let _ = rx_line.push(b as char);
-                                }
-                            }
-                        }
-                        _ => break, // 连接断开
-                    }
+        match select(
+            USB_CMD_RESP_QUEUE.receive(),
+            subscriber.next_message_pure(),
+        )
+        .await
+        {
+            // 分支 1：命令回执与 BIT 报告 (最高调度优先级)
+            Either::First(result) => {
+                let is_binary = BINARY_OUTPUT_MODE.load(Ordering::Relaxed);
+                if send_execution_result(&mut sender, result, is_binary).await.is_err() {
+                    sender.wait_connection().await;
                 }
-                // 分支 2：收到了 ARINC 429 总线帧，上报上位机
-                Either::Second(first_frame) => {
-                    if BINARY_OUTPUT_MODE.load(Ordering::Relaxed) {
-                        let mut offset = 0;
-                        let mut single_buf = [0u8; BINARY_FRAME_LEN];
+            }
+            // 分支 2：总线接收遥测数据流
+            Either::Second(first_frame) => {
+                // 若 host 未就绪监听 (DTR 假)，静默跳过，避免总线背景流量塞满 IN 端点导致后续命令卡死
+                if !sender.dtr() {
+                    continue;
+                }
 
-                        let bin = first_frame.to_binary_frame();
-                        bin.encode(&mut single_buf);
-                        bin_batch_buf[offset..offset + BINARY_FRAME_LEN]
-                            .copy_from_slice(&single_buf);
-                        offset += BINARY_FRAME_LEN;
+                if BINARY_OUTPUT_MODE.load(Ordering::Relaxed) {
+                    let mut offset = 0;
+                    let mut single_buf = [0u8; BINARY_FRAME_LEN];
 
-                        // 批量拉取当前队列中滞留的后续帧 (最多凑 4 帧 64 字节恰好填满单包端点)
-                        while offset + BINARY_FRAME_LEN <= bin_batch_buf.len() {
-                            if let Some(next_frame) = subscriber.try_next_message_pure() {
-                                let next_bin = next_frame.to_binary_frame();
-                                next_bin.encode(&mut single_buf);
-                                bin_batch_buf[offset..offset + BINARY_FRAME_LEN]
-                                    .copy_from_slice(&single_buf);
-                                offset += BINARY_FRAME_LEN;
-                            } else {
-                                break;
-                            }
-                        }
+                    let bin = first_frame.to_binary_frame();
+                    bin.encode(&mut single_buf);
+                    bin_batch_buf[offset..offset + BINARY_FRAME_LEN].copy_from_slice(&single_buf);
+                    offset += BINARY_FRAME_LEN;
 
-                        if cdc_write_all(&mut class, &bin_batch_buf[..offset]).await.is_err() {
+                    // 批量拉取当前队列中滞留的后续帧 (最多凑 4 帧 64 字节填满单包端点)
+                    while offset + BINARY_FRAME_LEN <= bin_batch_buf.len() {
+                        if let Some(next_frame) = subscriber.try_next_message_pure() {
+                            let next_bin = next_frame.to_binary_frame();
+                            next_bin.encode(&mut single_buf);
+                            bin_batch_buf[offset..offset + BINARY_FRAME_LEN]
+                                .copy_from_slice(&single_buf);
+                            offset += BINARY_FRAME_LEN;
+                        } else {
                             break;
                         }
-                    } else {
-                        // ASCII 文本模式：格式化为可读字符串
-                        let mut line = String::<128>::new();
-                        format_ascii_frame(&first_frame, &mut line);
-                        if cdc_write_all(&mut class, line.as_bytes()).await.is_err() {
-                            break;
-                        }
+                    }
+
+                    if cdc_sender_write_all(&mut sender, &bin_batch_buf[..offset]).await.is_err() {
+                        sender.wait_connection().await;
+                    }
+                } else {
+                    let mut line = String::<128>::new();
+                    format_ascii_frame(&first_frame, &mut line);
+                    if cdc_sender_write_all(&mut sender, line.as_bytes()).await.is_err() {
+                        sender.wait_connection().await;
                     }
                 }
             }
@@ -129,47 +164,29 @@ pub async fn usb_cdc_service(mut class: CdcAcmClass<'static, Driver<'static, USB
     }
 }
 
-/// 安全分片写入 CDC 端点，单包长度严格限制在 64 字节内
-async fn cdc_write_all(
-    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
+/// 安全分片写入 CDC IN 端点，单包长度严格限制在 64 字节内
+async fn cdc_sender_write_all(
+    sender: &mut Sender<'static, Driver<'static, USB>>,
     data: &[u8],
 ) -> Result<(), embassy_usb::driver::EndpointError> {
     if data.is_empty() {
         return Ok(());
     }
     for chunk in data.chunks(64) {
-        class.write_packet(chunk).await?;
+        sender.write_packet(chunk).await?;
     }
     if (data.len() & 63) == 0 {
-        class.write_packet(&[]).await?;
+        sender.write_packet(&[]).await?;
     }
     Ok(())
 }
 
 /// 指令执行结果枚举 (解耦执行器与 USB I/O)
+#[derive(Clone)]
 pub enum CommandExecutionResult {
     SuccessText(String<128>),
     ErrorStatic(&'static str),
     ErrorDynamic(String<64>),
-    BitCompleted(BitReport),
-}
-
-/// 解析并执行命令，将响应结果格式化输出至 CDC
-async fn dispatch_command_line(
-    line: &str,
-    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
-) {
-    let result = match HostCommand::parse(line) {
-        Ok(cmd) => execute_host_command(cmd).await,
-        Err(e) => {
-            let mut err_str = String::<64>::new();
-            core::write!(err_str, "ERR: Command parse failure: {:?}\r\n", e).ok();
-            CommandExecutionResult::ErrorDynamic(err_str)
-        }
-    };
-
-    let is_binary = BINARY_OUTPUT_MODE.load(Ordering::Relaxed);
-    send_execution_result(class, result, is_binary).await;
 }
 
 /// 校验通道编号是否已装配且符合预期方向
@@ -180,14 +197,20 @@ fn validate_channel(channel: u8, expected: Option<ChannelDirection>) -> Result<(
             "ERR: Channel not equipped on hardware (active: 0..1)\r\n",
         ));
     }
-    if let Some(exp) = expected {
-        if channel_direction(channel) != Some(exp) {
-            let msg = if exp == ChannelDirection::Tx {
-                "ERR: Operation only supported on physical TX channels\r\n"
-            } else {
-                "ERR: Operation only supported on physical RX channels\r\n"
-            };
-            return Err(CommandExecutionResult::ErrorStatic(msg));
+    if let Some(expected_dir) = expected {
+        if let Some(actual_dir) = channel_direction(channel) {
+            if actual_dir != expected_dir {
+                let mut resp = String::<64>::new();
+                core::write!(
+                    resp,
+                    "ERR: Channel {} is {:?}, but expected {:?}\r\n",
+                    channel,
+                    actual_dir,
+                    expected_dir
+                )
+                .ok();
+                return Err(CommandExecutionResult::ErrorDynamic(resp));
+            }
         }
     }
     Ok(())
@@ -228,20 +251,18 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             is_tx,
             high_speed,
         } => {
-            let expected_dir = if is_tx { ChannelDirection::Tx } else { ChannelDirection::Rx };
-            if enable {
-                if let Err(err) = validate_channel(channel, Some(expected_dir)) {
-                    return err;
-                }
-            } else if let Err(err) = validate_channel(channel, None) {
+            if let Err(err) = validate_channel(channel, None) {
                 return err;
             }
 
             let dir = if !enable {
                 ChannelDirection::Disabled
+            } else if is_tx {
+                ChannelDirection::Tx
             } else {
-                expected_dir
+                ChannelDirection::Rx
             };
+            set_channel_direction(channel, dir);
             let cmd = ChannelControlCmd::Configure {
                 direction: dir,
                 high_speed,
@@ -329,22 +350,20 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             .ok();
             CommandExecutionResult::SuccessText(resp)
         }
-        HostCommand::RunBit { tx_channel, rx_channel } => {
-            if let Err(err) = validate_channel(tx_channel, Some(ChannelDirection::Tx)) {
-                return err;
-            }
-            if let Err(err) = validate_channel(rx_channel, Some(ChannelDirection::Rx)) {
-                return err;
-            }
-            BIT_REQ_CHANNEL.send(BitRequest { tx_channel, rx_channel }).await;
-            let report = BIT_RESP_SIGNAL.wait().await;
-            CommandExecutionResult::BitCompleted(report)
+        HostCommand::RunBit { .. } => {
+            CommandExecutionResult::ErrorStatic(
+                "ERR: On-device BIT disabled. Perform loopback verification via host\r\n",
+            )
         }
         HostCommand::QueryStatus { channel: _ } => {
             let mut resp = String::<128>::new();
+            let ch0_dir = channel_direction(0).unwrap_or(ChannelDirection::Disabled);
+            let ch1_dir = channel_direction(1).unwrap_or(ChannelDirection::Disabled);
             core::write!(
                 resp,
-                "STATUS: Pico-429 Online (2 Channels equipped: CH0 TX, CH1 RX). Mode: {}\r\n",
+                "STATUS: Pico-429 Online [CH0: {:?}, CH1: {:?}]. Mode: {}\r\n",
+                ch0_dir,
+                ch1_dir,
                 if BINARY_OUTPUT_MODE.load(Ordering::Relaxed) { "BIN" } else { "ASCII" }
             )
             .ok();
@@ -355,10 +374,10 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
 
 /// 响应序列化器：保证在 BINARY 模式下严禁混入裸 ASCII 字符串 (消灭流污染)
 async fn send_execution_result(
-    class: &mut CdcAcmClass<'static, Driver<'static, USB>>,
+    sender: &mut Sender<'static, Driver<'static, USB>>,
     result: CommandExecutionResult,
     is_binary: bool,
-) {
+) -> Result<(), embassy_usb::driver::EndpointError> {
     match result {
         CommandExecutionResult::SuccessText(text) => {
             if is_binary {
@@ -373,9 +392,9 @@ async fn send_execution_result(
                 );
                 let mut buf = [0u8; BINARY_FRAME_LEN];
                 ack_frame.encode(&mut buf);
-                let _ = cdc_write_all(class, &buf).await;
+                cdc_sender_write_all(sender, &buf).await?;
             } else {
-                let _ = cdc_write_all(class, text.as_bytes()).await;
+                cdc_sender_write_all(sender, text.as_bytes()).await?;
             }
         }
         CommandExecutionResult::ErrorStatic(msg) => {
@@ -390,9 +409,9 @@ async fn send_execution_result(
                 );
                 let mut buf = [0u8; BINARY_FRAME_LEN];
                 err_frame.encode(&mut buf);
-                let _ = cdc_write_all(class, &buf).await;
+                cdc_sender_write_all(sender, &buf).await?;
             } else {
-                let _ = cdc_write_all(class, msg.as_bytes()).await;
+                cdc_sender_write_all(sender, msg.as_bytes()).await?;
             }
         }
         CommandExecutionResult::ErrorDynamic(text) => {
@@ -407,58 +426,13 @@ async fn send_execution_result(
                 );
                 let mut buf = [0u8; BINARY_FRAME_LEN];
                 err_frame.encode(&mut buf);
-                let _ = cdc_write_all(class, &buf).await;
+                cdc_sender_write_all(sender, &buf).await?;
             } else {
-                let _ = cdc_write_all(class, text.as_bytes()).await;
-            }
-        }
-        CommandExecutionResult::BitCompleted(report) => {
-            if is_binary {
-                // 二进制模式：封装为 BIT_REPORT 帧 (raw_word 编码 status 与 error_code)
-                let status_val = if report.status == BitStatus::Passed { 0 } else { 1 };
-                let encoded_status = (status_val << 16) | (report.error_code as u32);
-                let report_frame = BinaryFrame::new_full(
-                    frame_types::BIT_REPORT,
-                    report.rx_channel,
-                    0,
-                    report.words_received,
-                    report.avg_latency_us,
-                    encoded_status,
-                );
-                let mut buf = [0u8; BINARY_FRAME_LEN];
-                report_frame.encode(&mut buf);
-                let _ = cdc_write_all(class, &buf).await;
-            } else {
-                let mut resp = String::<128>::new();
-                if report.status == BitStatus::Passed {
-                    core::write!(
-                        resp,
-                        "OK: BIT CH{}->CH{} PASSED [SENT:{} RECV:{} ERR_INJECT:{}/{} RTT_AVG:{}us]\r\n",
-                        report.tx_channel,
-                        report.rx_channel,
-                        report.words_sent,
-                        report.words_received,
-                        report.parity_errors_caught,
-                        report.parity_injections_tested,
-                        report.avg_latency_us
-                    )
-                    .ok();
-                } else {
-                    core::write!(
-                        resp,
-                        "ERR: BIT CH{}->CH{} FAILED [CODE:{:?} SENT:{} RECV:{}]\r\n",
-                        report.tx_channel,
-                        report.rx_channel,
-                        report.error_code,
-                        report.words_sent,
-                        report.words_received
-                    )
-                    .ok();
-                }
-                let _ = cdc_write_all(class, resp.as_bytes()).await;
+                cdc_sender_write_all(sender, text.as_bytes()).await?;
             }
         }
     }
+    Ok(())
 }
 
 /// 格式化为可读的 ASCII 遥测文本

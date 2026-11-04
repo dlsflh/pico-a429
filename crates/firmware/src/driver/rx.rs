@@ -1,11 +1,10 @@
-//! ARINC 429 接收驱动 (PIO + DMA)
+//! ARINC 429 接收驱动 (PIO-based)
 //!
 //! 利用 RP2350 PIO 状态机捕获来自差分收发芯片的 RX_A 和 RX_B 脉冲。
 //! 具备硬件级字间隙 (Gap) 检测、脉冲中心采样、字内空闲超时抗滑移机制，
-//! 并使用 DMA 进行非阻塞帧拉取，集成 256 位高性能 Label 过滤器。
+//! 异步从 RX FIFO 拉取，消除对硬件 DMA 中断与 TrustZone 通道配置的依赖，集成 256 位高性能 Label 过滤器。
 
 use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::dma::Channel;
 use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{Common, Direction, Instance, PioPin, ShiftConfig, ShiftDirection, StateMachine};
 use embassy_rp::Peri;
@@ -19,21 +18,18 @@ use crate::pio_programs;
 
 pub struct Arinc429Rx<'d, T: Instance, const SM: usize> {
     sm: StateMachine<'d, T, SM>,
-    dma: Channel<'d>,
     speed: ArincSpeed,
     filter: LabelFilter,
-    dma_buf: [u32; 1],
 }
 
 impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
-    /// 初始化 ARINC 429 RX 驱动 (PIO + DMA)
+    /// 初始化 ARINC 429 RX 驱动
     ///
     /// `pin_a`: RX_A 引脚 (base pin)
     /// `pin_b`: RX_B 引脚 (base pin + 1，必须在物理引脚编号上相邻)
     pub fn new(
         common: &mut Common<'d, T>,
         mut sm: StateMachine<'d, T, SM>,
-        dma: Channel<'d>,
         pin_a: Peri<'d, impl PioPin>,
         pin_b: Peri<'d, impl PioPin>,
         initial_speed: ArincSpeed,
@@ -74,10 +70,8 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
 
         Self {
             sm,
-            dma,
             speed: initial_speed,
             filter,
-            dma_buf: [0u32; 1],
         }
     }
 
@@ -109,9 +103,8 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         &mut self.filter
     }
 
-    /// 异步通过 DMA 从 PIO RX FIFO 读取一个 32 位原始字 (使用持久生命周期缓冲区，规避栈悬垂)
+    /// 异步阻塞接收一个原始 32 位 ARINC 字 (从 PIO RX FIFO 拉取)
     pub async fn recv_raw(&mut self) -> u32 {
-        self.sm.rx().dma_pull(&mut self.dma, &mut self.dma_buf, false).await;
-        self.dma_buf[0]
+        self.sm.rx().wait_pull().await
     }
 }
