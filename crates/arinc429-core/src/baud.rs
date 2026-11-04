@@ -4,16 +4,17 @@
 //! - 高速 (High Speed): 100 kbps ± 1% (99.0 kHz ~ 101.0 kHz), 1 bit = 10.0 us
 //! - 低速 (Low Speed): 12.5 kbps ± 1% (12.375 kHz ~ 12.625 kHz), 1 bit = 80.0 us
 //!
-//! 在 PIO 状态机微代码中，1 bit 固定占用 10 个 PIO 时钟周期：
-//! - 100 kbps 目标 PIO 时钟: 1,000,000 Hz (1 MHz)
-//! - 12.5 kbps 目标 PIO 时钟: 125,000 Hz (125 kHz)
+//! 在 PIO 状态机微代码中，统一收发为 20 个 PIO 时钟周期 (1 bit = 20 PIO cycles)：
+//! - 100 kbps 目标 PIO 时钟: 2,000,000 Hz (2 MHz)
+//! - 12.5 kbps 目标 PIO 时钟: 250,000 Hz (250 kHz)
+//! - 脉冲宽度: 10 周期 (5.0 us)；归零宽度: 10 周期 (5.0 us)；严格保证 50.0% 占空比
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ArincSpeed {
-    /// 高速 100 kbps (PIO 目标 1 MHz)
+    /// 高速 100 kbps (PIO 目标 2 MHz)
     High100k,
-    /// 低速 12.5 kbps (PIO 目标 125 kHz)
+    /// 低速 12.5 kbps (PIO 目标 250 kHz)
     Low12k5,
 }
 
@@ -26,12 +27,25 @@ impl ArincSpeed {
         }
     }
 
-    /// PIO 状态机目标主频 (Hz) (1 bit = 10 PIO cycles)
+    /// PIO 状态机统一目标主频 (Hz) (1 bit = 20 PIO cycles)
+    #[inline]
     pub const fn pio_target_hz(self) -> u32 {
         match self {
-            Self::High100k => 1_000_000,
-            Self::Low12k5 => 125_000,
+            Self::High100k => 2_000_000,
+            Self::Low12k5 => 250_000,
         }
+    }
+
+    /// 发送端 (TX) 目标主频 (Hz) (统一为 20 周期)
+    #[inline]
+    pub const fn tx_pio_target_hz(self) -> u32 {
+        self.pio_target_hz()
+    }
+
+    /// 接收端 (RX) 目标主频 (Hz) (统一为 20 周期)
+    #[inline]
+    pub const fn rx_pio_target_hz(self) -> u32 {
+        self.pio_target_hz()
     }
 
     /// 单个 bit 持续微秒数
@@ -51,12 +65,24 @@ pub fn calculate_clkdiv_fixed(sys_clk_hz: u32, speed: ArincSpeed) -> (u16, u8) {
     let sys_clk = sys_clk_hz as u64;
 
     // RP2040/RP2350 PIO clkdiv 格式：int (16-bit) + frac (8-bit)
-    // 8 位定点：div = (sys_clk * 256 + target_hz / 2) / target_hz
+    // 8 位定点：div = (sys_clk * 256 + target_hz / 2) / target_hz (带四舍五入舍入优化)
     let div_scaled = (sys_clk * 256 + target_hz / 2) / target_hz;
     let int_part = (div_scaled >> 8) as u16;
     let frac_part = (div_scaled & 0xFF) as u8;
 
     (int_part, frac_part)
+}
+
+/// 兼容别名：计算 TX 状态机分频比 (统一为 20 周期)
+#[inline]
+pub fn calculate_tx_clkdiv_fixed(sys_clk_hz: u32, speed: ArincSpeed) -> (u16, u8) {
+    calculate_clkdiv_fixed(sys_clk_hz, speed)
+}
+
+/// 兼容别名：计算 RX 状态机分频比 (统一为 20 周期)
+#[inline]
+pub fn calculate_rx_clkdiv_fixed(sys_clk_hz: u32, speed: ArincSpeed) -> (u16, u8) {
+    calculate_clkdiv_fixed(sys_clk_hz, speed)
 }
 
 #[cfg(test)]
@@ -68,7 +94,7 @@ mod tests {
         let (int_part, frac_part) = calculate_clkdiv_fixed(sys_clk_hz, speed);
         let div_val = (int_part as f64) + ((frac_part as f64) / 256.0);
         let actual_pio_hz = (sys_clk_hz as f64) / div_val;
-        let actual_baud = actual_pio_hz / 10.0;
+        let actual_baud = actual_pio_hz / 20.0;
         let target_baud = speed.baud_rate() as f64;
         let error_pct = ((actual_baud - target_baud) / target_baud) * 100.0;
 
@@ -81,7 +107,7 @@ mod tests {
         let clks = [125_000_000, 133_000_000, 150_000_000];
 
         for &sys_clk in &clks {
-            // 测试 100k 高速
+            // 测试 100k 高速 (统一 20 周期/bit)
             let (actual_100k, err_100k) = evaluate_baud_accuracy(sys_clk, ArincSpeed::High100k);
             assert!(
                 err_100k.abs() < 1.0,
@@ -91,7 +117,7 @@ mod tests {
             );
             assert!((actual_100k - 100_000.0).abs() < 1000.0);
 
-            // 测试 12.5k 低速
+            // 测试 12.5k 低速 (统一 20 周期/bit)
             let (actual_12k5, err_12k5) = evaluate_baud_accuracy(sys_clk, ArincSpeed::Low12k5);
             assert!(
                 err_12k5.abs() < 1.0,
