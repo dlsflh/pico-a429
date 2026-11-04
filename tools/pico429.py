@@ -163,6 +163,104 @@ def cmd_send(args: argparse.Namespace) -> None:
         ser.close()
 
 
+def cmd_bit(args: argparse.Namespace) -> None:
+    """执行物理对接自收自发 BIT (内建自测试) 验证"""
+    port = find_pico_port(args.port)
+    print(f"[*] 连接 {port}，开始执行 ARINC 429 硬件环回 BIT 自测试 (CH{args.tx} -> CH{args.rx})...")
+    ser = open_serial(port, timeout=1.0)
+
+    bit_vectors = [
+        ("310", 0, 0x01234, 3, "标准巡航高度字"),
+        ("203", 1, 0x00567, 3, "空速气压测量字"),
+        ("001", 2, 0x00001, 3, "最小八进制 Label 测试"),
+        ("377", 3, 0x7FFFF, 3, "全 1 数据极限字"),
+        ("156", 0, 0x00000, 0, "全 0 数据与 SSM=0"),
+        ("114", 1, 0x55555, 3, "交替位模式 0x55555"),
+        ("220", 2, 0x2AAAA, 3, "交替位模式 0x2AAAA"),
+        ("045", 3, 0x13579, 1, "奇偶校验敏感向量"),
+    ]
+
+    print("=" * 102)
+    print(
+        f"{'编号':<4} {'测试项说明':<22} {'发送 Label/Data':<22} {'发送字 (RAW)':<14} {'接收字 (RAW)':<14} {'RTT':<8} {'状态'}"
+    )
+    print("-" * 102)
+
+    passed_count = 0
+    total_count = len(bit_vectors)
+    rtt_list = []
+
+    try:
+        ser.reset_input_buffer()
+        time.sleep(0.05)
+
+        for i, (label, sdi, data, ssm, desc) in enumerate(bit_vectors, start=1):
+            cmd = f"TX {args.tx} {label} {sdi} 0x{data:X} {ssm}\r\n"
+            t0 = time.perf_counter()
+            ser.write(cmd.encode("ascii"))
+            ser.flush()
+
+            sent_raw = None
+            recv_raw = None
+            parity_ok = False
+            start = time.time()
+
+            while time.time() - start < 1.0:
+                line = ser.readline().decode("ascii", errors="replace").strip()
+                if not line:
+                    continue
+                if line.startswith("OK: Sent"):
+                    # 提取发送端字: RAW:0xXXXXXXXX
+                    raw_part = line.split("RAW:")[-1].strip()
+                    sent_raw = raw_part.upper()
+                elif line.startswith(f"[CH{args.rx}]"):
+                    # 提取接收端字: (0xXXXXXXXX)
+                    if "(" in line and line.endswith(")"):
+                        recv_raw = line[line.rfind("(") + 1 : -1].strip().upper()
+                    if "P:OK" in line:
+                        parity_ok = True
+                if sent_raw and recv_raw:
+                    break
+
+            rtt_ms = (time.perf_counter() - t0) * 1000.0
+            rtt_list.append(rtt_ms)
+
+            is_pass = (sent_raw is not None) and (sent_raw == recv_raw) and parity_ok
+            if is_pass:
+                passed_count += 1
+                status_str = "\033[32mPASS\033[0m"
+            else:
+                status_str = "\033[31mFAIL\033[0m"
+
+            tx_info = f"L:{label} 0x{data:05X}"
+            sent_disp = sent_raw or "TIMEOUT"
+            recv_disp = recv_raw or "TIMEOUT"
+            print(
+                f"#{i:<3} {desc:<20} {tx_info:<20} {sent_disp:<14} {recv_disp:<14} {rtt_ms:<6.1f}ms {status_str}"
+            )
+            time.sleep(0.02)
+
+        print("=" * 102)
+        avg_rtt = sum(rtt_list) / len(rtt_list) if rtt_list else 0.0
+        loss_rate = ((total_count - passed_count) / total_count) * 100.0
+
+        if passed_count == total_count:
+            print(
+                f"[\033[32mBIT PASSED\033[0m] {passed_count}/{total_count} 向量全通过 | "
+                f"丢包率: {loss_rate:.1f}% | 平均 RTT: {avg_rtt:.2f} ms | "
+                f"\033[32m硬件物理收发完全正常！\033[0m"
+            )
+        else:
+            print(
+                f"[\033[31mBIT FAILED\033[0m] 通过: {passed_count}/{total_count} | "
+                f"丢包率: {loss_rate:.1f}% | 请检查 GP0(TX_A)->GP2(RX_A) 与 GP1(TX_B)->GP3(RX_B) 物理接线！",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    finally:
+        ser.close()
+
+
 def reverse_label_bits(label_byte: int) -> int:
     """ARINC 429 Label 规范：总线位倒序还原为八进制 Label。"""
     res = 0
@@ -267,6 +365,11 @@ def main() -> None:
     # listen
     subparsers.add_parser("listen", help="监听并流式解码接收到的 ARINC 429 数据")
 
+    # bit
+    p_bit = subparsers.add_parser("bit", help="硬件自收自发 BIT (内建自测试) 环回测试")
+    p_bit.add_argument("--tx", type=int, default=0, help="发送通道号 (默认 0)")
+    p_bit.add_argument("--rx", type=int, default=1, help="接收通道号 (默认 1)")
+
     args = parser.parse_args()
 
     if args.command == "ping":
@@ -277,6 +380,8 @@ def main() -> None:
         cmd_send(args)
     elif args.command == "listen":
         cmd_listen(args)
+    elif args.command == "bit":
+        cmd_bit(args)
 
 
 if __name__ == "__main__":

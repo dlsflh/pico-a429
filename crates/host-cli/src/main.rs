@@ -362,23 +362,140 @@ fn configure_filter(
     }
 }
 
-/// 执行自收自发 BIT 自测试
+/// 执行自收自发 BIT 自测试 (Host-Driven Loopback Test)
 fn run_bit(port_name: &str, tx_ch: u8, rx_ch: u8) {
-    let cmd = format!("BIT {} {}", tx_ch, rx_ch);
     println!(
-        "{} 正在发起硬件自收自发 BIT (CH{} -> CH{})...",
+        "{} 正在发起硬件自收自发 BIT 环回自测试 (CH{} -> CH{})...",
         "[BIT]".magenta().bold(),
         tx_ch,
         rx_ch
     );
 
-    // BIT 自检跑完 70+ 个向量约需 1~2 秒，给予 5000ms 超时窗口
-    match send_command_and_wait(port_name, &cmd, 5000) {
-        Ok(resp) => println!("{} {}", "[BIT SUCCESS]".green().bold(), resp),
-        Err(e) => {
-            eprintln!("{} 自检失败或超时: {}", "[BIT FAILURE]".red().bold(), e);
+    let vectors: &[(&str, u8, u32, u8, &str)] = &[
+        ("310", 0, 0x01234, 3, "标准巡航高度字"),
+        ("203", 1, 0x00567, 3, "空速气压测量字"),
+        ("001", 2, 0x00001, 3, "最小八进制 Label 测试"),
+        ("377", 3, 0x7FFFF, 3, "全 1 数据极限字"),
+        ("156", 0, 0x00000, 0, "全 0 数据与 SSM=0"),
+        ("114", 1, 0x55555, 3, "交替位模式 0x55555"),
+        ("220", 2, 0x2AAAA, 3, "交替位模式 0x2AAAA"),
+        ("045", 3, 0x13579, 1, "奇偶校验敏感向量"),
+    ];
+
+    let mut port = serialport::new(port_name, 115200)
+        .timeout(Duration::from_millis(500))
+        .open()
+        .unwrap_or_else(|e| {
+            eprintln!("{} 无法打开串口: {}", "[ERROR]".red().bold(), e);
             std::process::exit(1);
+        });
+
+    let _ = port.write_data_terminal_ready(true);
+    let _ = port.write_request_to_send(true);
+
+    println!("{}", "=".repeat(100).bright_black());
+    println!(
+        "{:<4} {:<24} {:<20} {:<14} {:<14} {:<8} 状态",
+        "编号", "测试项说明", "发送参数", "发送 (RAW)", "接收 (RAW)", "RTT"
+    );
+    println!("{}", "-".repeat(100).bright_black());
+
+    let mut passed = 0;
+    let mut rtt_sum = 0.0;
+
+    for (i, (label, sdi, data, ssm, desc)) in vectors.iter().enumerate() {
+        let cmd = format!("TX {} {} {} 0x{:X} {}\r\n", tx_ch, label, sdi, data, ssm);
+        let t0 = std::time::Instant::now();
+        if let Err(e) = port.write_all(cmd.as_bytes()) {
+            eprintln!("{} 写入指令失败: {}", "[ERROR]".red().bold(), e);
+            break;
         }
+
+        let mut sent_raw: Option<String> = None;
+        let mut recv_raw: Option<String> = None;
+        let mut parity_ok = false;
+        let read_deadline = std::time::Instant::now() + Duration::from_millis(1000);
+        let mut line_buf = String::new();
+        let mut temp = [0u8; 64];
+
+        while std::time::Instant::now() < read_deadline {
+            if let Ok(n) = port.read(&mut temp) {
+                for &b in &temp[..n] {
+                    let ch = b as char;
+                    if ch == '\n' {
+                        let trimmed = line_buf.trim();
+                        if trimmed.starts_with("OK: Sent") {
+                            if let Some(pos) = trimmed.rfind("RAW:") {
+                                sent_raw = Some(trimmed[pos + 4..].trim().to_uppercase());
+                            }
+                        } else if trimmed.starts_with(&format!("[CH{}]", rx_ch)) {
+                            if let (Some(start), Some(end)) = (trimmed.rfind('('), trimmed.rfind(')')) {
+                                recv_raw = Some(trimmed[start + 1..end].trim().to_uppercase());
+                            }
+                            if trimmed.contains("P:OK") {
+                                parity_ok = true;
+                            }
+                        }
+                        line_buf.clear();
+                    } else if ch != '\r' {
+                        line_buf.push(ch);
+                    }
+                }
+            }
+            if sent_raw.is_some() && recv_raw.is_some() {
+                break;
+            }
+        }
+
+        let rtt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        rtt_sum += rtt_ms;
+
+        let is_pass = sent_raw.is_some() && (sent_raw == recv_raw) && parity_ok;
+        if is_pass {
+            passed += 1;
+        }
+
+        let status = if is_pass { "PASS".green().bold() } else { "FAIL".red().bold() };
+        let tx_info = format!("L:{} 0x{:05X}", label, data);
+        let s_disp = sent_raw.unwrap_or_else(|| "TIMEOUT".to_string());
+        let r_disp = recv_raw.unwrap_or_else(|| "TIMEOUT".to_string());
+
+        println!(
+            "#{:<3} {:<22} {:<20} {:<14} {:<14} {:<6.1}ms {}",
+            i + 1,
+            desc,
+            tx_info,
+            s_disp,
+            r_disp,
+            rtt_ms,
+            status
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    println!("{}", "=".repeat(100).bright_black());
+    let total = vectors.len();
+    let avg_rtt = if total > 0 { rtt_sum / total as f64 } else { 0.0 };
+    let loss_rate = ((total - passed) as f64 / total as f64) * 100.0;
+
+    if passed == total {
+        println!(
+            "{} {}/{} 向量全通过 | 丢包率: {:.1}% | 平均 RTT: {:.2} ms | 硬件物理收发完全正常！",
+            "[BIT PASSED]".green().bold(),
+            passed,
+            total,
+            loss_rate,
+            avg_rtt
+        );
+    } else {
+        eprintln!(
+            "{} 通过: {}/{} | 丢包率: {:.1}% | 请检查 GP0(TX_A)->GP2(RX_A) 与 GP1(TX_B)->GP3(RX_B) 物理接线！",
+            "[BIT FAILED]".red().bold(),
+            passed,
+            total,
+            loss_rate
+        );
+        std::process::exit(1);
     }
 }
 
