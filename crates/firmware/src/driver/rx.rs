@@ -53,9 +53,9 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         cfg.use_program(&loaded, &[]);
         cfg.set_in_pins(&[&pin_a, &pin_b]);
 
-        // LSB 优先移入 (Bit 1 最先到达，存入最低位 bit 0)，由 PIO 程序显式校验满 32 位后执行 push noblock
+        // LSB 优先移入 (Bit 1 最先到达，存入最低位 bit 0)，满 32 位由硬件 Autopush 自动推入 FIFO 并清空 ISR
         cfg.shift_in = ShiftConfig {
-            auto_fill: false,
+            auto_fill: true,
             direction: ShiftDirection::Right,
             threshold: 32,
         };

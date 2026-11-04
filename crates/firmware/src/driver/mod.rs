@@ -8,7 +8,7 @@ pub use tx::Arinc429Tx;
 use arinc429_core::baud::calculate_clkdiv_fixed;
 use fixed::FixedU32;
 
-/// 计算 PIO 状态机时钟分频比 (固定 8 位小数精度，基于 arinc429-core 纯算法)
+/// 计算统一 PIO 状态机时钟分频比 (统一 1 bit = 20 PIO cycles，带 16.8 定点数四舍五入优化)
 pub(crate) fn calculate_pio_clkdiv(
     sys_clk: u32,
     speed: ArincSpeed,
