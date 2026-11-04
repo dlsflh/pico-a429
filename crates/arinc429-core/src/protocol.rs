@@ -205,6 +205,8 @@ pub enum HostCommand {
         tx_channel: u8,
         rx_channel: u8,
     },
+    /// 快速连通性测试心跳: PING
+    Ping,
     /// 查询状态: STATUS [ch]
     QueryStatus {
         channel: Option<u8>,
@@ -251,6 +253,10 @@ impl HostCommand {
     pub fn parse(line: &str) -> Result<Self, CommandParseError> {
         let mut parts = line.split_whitespace();
         let cmd = parts.next().ok_or(CommandParseError::EmptyCommand)?;
+
+        if cmd.eq_ignore_ascii_case("PING") {
+            return Ok(Self::Ping);
+        }
 
         if cmd.eq_ignore_ascii_case("STATUS") {
             let ch_opt = parts.next().and_then(|s| s.parse::<u8>().ok());
@@ -403,6 +409,9 @@ mod tests {
 
     #[test]
     fn test_parse_commands() {
+        let cmd_ping = HostCommand::parse("PING").unwrap();
+        assert_eq!(cmd_ping, HostCommand::Ping);
+
         let cmd1 = HostCommand::parse("CHCFG 0 SPEED 100K").unwrap();
         assert_eq!(cmd1, HostCommand::SetSpeed { channel: 0, high_speed: true });
 

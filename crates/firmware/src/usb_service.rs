@@ -68,7 +68,7 @@ pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB
                                     CommandExecutionResult::ErrorDynamic(err_str)
                                 }
                             };
-                            USB_CMD_RESP_QUEUE.send(result).await;
+                            let _ = USB_CMD_RESP_QUEUE.try_send(result);
                             rx_line.clear();
                         }
                     } else if overflow_discard {
@@ -76,11 +76,9 @@ pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB
                     } else if rx_line.len() >= 120 {
                         overflow_discard = true;
                         rx_line.clear();
-                        USB_CMD_RESP_QUEUE
-                            .send(CommandExecutionResult::ErrorStatic(
-                                "ERR: Command line buffer overflow\r\n",
-                            ))
-                            .await;
+                        let _ = USB_CMD_RESP_QUEUE.try_send(CommandExecutionResult::ErrorStatic(
+                            "ERR: Command line buffer overflow\r\n",
+                        ));
                     } else {
                         let _ = rx_line.push(b as char);
                     }
@@ -164,7 +162,7 @@ pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) 
     }
 }
 
-/// 安全分片写入 CDC IN 端点，单包长度严格限制在 64 字节内
+/// 安全分片写入 CDC IN 端点，单包长度严格限制在 64 字节内，带 100ms 超时保护
 async fn cdc_sender_write_all(
     sender: &mut Sender<'static, Driver<'static, USB>>,
     data: &[u8],
@@ -173,10 +171,27 @@ async fn cdc_sender_write_all(
         return Ok(());
     }
     for chunk in data.chunks(64) {
-        sender.write_packet(chunk).await?;
+        if embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(100),
+            sender.write_packet(chunk),
+        )
+        .await
+        .is_err()
+        {
+            // 上位机未读取 IN 端点，直接超时丢弃避免全系统死锁
+            return Ok(());
+        }
     }
     if (data.len() & 63) == 0 {
-        sender.write_packet(&[]).await?;
+        if embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(100),
+            sender.write_packet(&[]),
+        )
+        .await
+        .is_err()
+        {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -184,6 +199,7 @@ async fn cdc_sender_write_all(
 /// 指令执行结果枚举 (解耦执行器与 USB I/O)
 #[derive(Clone)]
 pub enum CommandExecutionResult {
+    Pong,
     SuccessText(String<128>),
     ErrorStatic(&'static str),
     ErrorDynamic(String<64>),
@@ -235,6 +251,7 @@ async fn handle_channel_filter(channel: u8, action: FilterAction) -> CommandExec
 /// 业务执行器：纯状态机与消息派发逻辑 (可直接用于宿主单元测试)
 pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
     match cmd {
+        HostCommand::Ping => CommandExecutionResult::Pong,
         HostCommand::SetMode { binary_mode } => {
             BINARY_OUTPUT_MODE.store(binary_mode, Ordering::Relaxed);
             let mut s = String::<128>::new();
@@ -379,6 +396,9 @@ async fn send_execution_result(
     is_binary: bool,
 ) -> Result<(), embassy_usb::driver::EndpointError> {
     match result {
+        CommandExecutionResult::Pong => {
+            cdc_sender_write_all(sender, b"PONG\r\n").await?;
+        }
         CommandExecutionResult::SuccessText(text) => {
             if is_binary {
                 // 二进制模式：封装为 CMD_ACK 帧

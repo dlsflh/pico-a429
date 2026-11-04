@@ -110,12 +110,26 @@ enum Commands {
         #[arg(short, long, default_value_t = 1)]
         rx: u8,
     },
+
+    /// 查询固件与通道配置状态
+    Status {
+        /// 目标串口
+        #[arg(short, long)]
+        port: String,
+
+        /// 通道号 (可选)
+        #[arg(short, long)]
+        channel: Option<u8>,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Status { port, channel } => {
+            query_status(&port, channel);
+        }
         Commands::Listen { port, baud } => {
             listen_serial(&port, baud);
         }
@@ -151,12 +165,27 @@ fn main() {
     }
 }
 
+/// 查询固件与通道配置状态
+fn query_status(port_name: &str, channel: Option<u8>) {
+    let cmd = match channel {
+        Some(ch) => format!("STATUS {}", ch),
+        None => "STATUS".to_string(),
+    };
+    match send_command_and_wait(port_name, &cmd, 1000) {
+        Ok(resp) => println!("{} {}", "[STATUS]".green().bold(), resp),
+        Err(e) => eprintln!("{} 查询失败: {}", "[ERROR]".red().bold(), e),
+    }
+}
+
 /// 发送指令并同步等待固件返回 OK/ERR 响应 (支持 ASCII 文本应答与 BINARY 帧格式兼容解析)
 fn send_command_and_wait(port_name: &str, cmd: &str, timeout_ms: u64) -> Result<String, String> {
     let mut port = serialport::new(port_name, 115200)
         .timeout(Duration::from_millis(200))
         .open()
         .map_err(|e| format!("无法打开串口: {}", e))?;
+
+    let _ = port.write_data_terminal_ready(true);
+    let _ = port.write_request_to_send(true);
 
     let full_cmd = format!("{}\r\n", cmd.trim());
     port.write_all(full_cmd.as_bytes())
@@ -207,7 +236,7 @@ fn send_command_and_wait(port_name: &str, cmd: &str, timeout_ms: u64) -> Result<
                     let ch = b as char;
                     if ch == '\n' {
                         let trimmed = line_buf.trim();
-                        if trimmed.starts_with("OK:") {
+                        if trimmed.starts_with("OK:") || trimmed.starts_with("STATUS:") || trimmed == "PONG" {
                             return Ok(trimmed.to_string());
                         } else if trimmed.starts_with("ERR:") {
                             return Err(trimmed.to_string());
