@@ -38,6 +38,7 @@ try:
         ArincWord,
         BinaryFrame,
         FrameFlags,
+        FrameType,
     )
 except ModuleNotFoundError:
     from arinc429_codec import (  # type: ignore[no-redef]
@@ -46,6 +47,7 @@ except ModuleNotFoundError:
         ArincWord,
         BinaryFrame,
         FrameFlags,
+        FrameType,
     )
 
 
@@ -117,6 +119,13 @@ def send_command_wait(ser: serial.Serial, cmd: str, timeout: float = 1.0) -> str
                     line_str = raw_line.decode("ascii", errors="replace").strip()
                     if line_str:
                         return line_str
+            elif len(line_buf) >= BINARY_FRAME_LEN and line_buf[:2] == BINARY_MAGIC:
+                try:
+                    f = BinaryFrame.decode(bytes(line_buf[:BINARY_FRAME_LEN]))
+                    if f.frame_type == FrameType.CMD_ACK:
+                        return f"OK: Command acknowledged (binary mode, seq {f.seq_num})"
+                except ValueError:
+                    pass
 
     raise TimeoutError(f"指令 '{cmd}' 超时 ({timeout}s) 未收到固件回执")
 
@@ -297,6 +306,14 @@ def cmd_bit(args: argparse.Namespace) -> None:
 
     try:
         ser.reset_input_buffer()
+        # 确保固件处于 ASCII 文本遥测模式以解析回显
+        try:
+            ser.write(b"MODE ASCII\r\n")
+            ser.flush()
+            time.sleep(0.01)
+            ser.reset_input_buffer()
+        except (serial.SerialException, OSError):
+            pass
 
         for i, (label, sdi, data, ssm, desc) in enumerate(bit_vectors, start=1):
             cmd = f"TX {args.tx} {label} {sdi} 0x{data:X} {ssm}\r\n"
@@ -471,6 +488,15 @@ def cmd_interactive(args: argparse.Namespace) -> None:
     ser = open_serial(port, timeout=0.5)
 
     try:
+        # 确保固件处于 ASCII 文本交互模式
+        try:
+            ser.write(b"MODE ASCII\r\n")
+            ser.flush()
+            time.sleep(0.01)
+            ser.reset_input_buffer()
+        except (serial.SerialException, OSError):
+            pass
+
         # 先确认连通性
         try:
             resp = send_command_wait(ser, "PING", timeout=1.0)

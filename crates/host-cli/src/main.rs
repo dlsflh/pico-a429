@@ -394,6 +394,9 @@ fn run_bit(port_name: &str, tx_ch: u8, rx_ch: u8) {
     let _ = port.write_data_terminal_ready(true);
     let _ = port.write_request_to_send(true);
 
+    // 确保固件处于 ASCII 文本交互模式以解析回显
+    let _ = port.write_all(b"MODE ASCII\r\n").and_then(|_| port.flush());
+
     println!("{}", "=".repeat(100).bright_black());
     println!(
         "{:<4} {:<24} {:<20} {:<14} {:<14} {:<8} 状态",
