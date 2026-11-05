@@ -192,9 +192,12 @@ impl<'d> FlashProfileManager<'d> {
         let mut buf = [0u8; SECTOR_PAGE_SIZE];
         let _ = self.read_page(&mut buf);
 
+        // offset = 4 * 62 = 248 (严格 4 字节自然对齐边界)
+        // [offset..offset+4]: SECTOR_MAGIC 严格 4 字节对齐
+        // [offset+4]: boot slot 单字节
         let offset = MAX_PROFILE_SLOTS * PROFILE_RECORD_LEN;
-        buf[offset] = slot;
-        buf[offset + 1..offset + 5].copy_from_slice(&SECTOR_MAGIC.to_le_bytes());
+        buf[offset..offset + 4].copy_from_slice(&SECTOR_MAGIC.to_le_bytes());
+        buf[offset + 4] = slot;
 
         self.write_page(&buf)?;
         Ok(())
@@ -208,13 +211,14 @@ impl<'d> FlashProfileManager<'d> {
 
         let offset = MAX_PROFILE_SLOTS * PROFILE_RECORD_LEN;
         let magic = u32::from_le_bytes([
+            buf[offset],
             buf[offset + 1],
             buf[offset + 2],
             buf[offset + 3],
-            buf[offset + 4],
         ]);
-        if magic == SECTOR_MAGIC && (buf[offset] as usize) < MAX_PROFILE_SLOTS {
-            Some(buf[offset])
+        let slot = buf[offset + 4];
+        if magic == SECTOR_MAGIC && (slot as usize) < MAX_PROFILE_SLOTS {
+            Some(slot)
         } else {
             None
         }

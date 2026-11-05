@@ -110,6 +110,6 @@ uv run --with pyserial python tools/pico429.py listen
   * Channel 0: `GP0` (Pin A), `GP1` (Pin B) [出厂默认: TX]
   * Channel 1: `GP2` (Pin A), `GP3` (Pin B) [出厂默认: RX]
   * Channel 2..10: `GP4..GP21`（相邻奇偶引脚对）[出厂默认: RX 被动监听]
-  * Channel 11: `GP26` (Pin 31), `GP27` (Pin 32) [出厂默认: RX 被动监听]
+  * Channel 11: `GP22` (Pin A), `GP23` (Pin B, 禁用 Wi-Fi) [出厂默认: RX 被动监听]
 * **免收发芯片自测环回**：
   使用杜邦线短接 `GP0 -> GP2` 与 `GP1 -> GP3`，运行 `python tools/pico429.py bit` 即可完成完整电气闭环自检。

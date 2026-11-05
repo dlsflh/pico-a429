@@ -168,7 +168,7 @@ RP2350 具备 3 个 PIO 块（PIO0, PIO1, PIO2）共 12 个独立状态机。本
 | **Channel 8** | **GP16 / GP17** | Pin 21 / Pin 22 | **PIO2 / SM0** | PIO FIFO 异步中断 | 低速飞控/导航总线扩展 |
 | **Channel 9** | **GP18 / GP19** | Pin 24 / Pin 25 | **PIO2 / SM1** | PIO FIFO 异步中断 | 低速飞控/导航总线扩展 |
 | **Channel 10**| **GP20 / GP21** | Pin 26 / Pin 27 | **PIO2 / SM2** | PIO FIFO 异步中断 | 发动机参数监测采集 |
-| **Channel 11**| **GP26 / GP27** | Pin 31 / Pin 32 | **PIO2 / SM3** | PIO FIFO 异步中断 | 大气数据机总线采集 |
+| **Channel 11**| **GP22 / GP23** | Pin 29 / 内部 (Wi-Fi 禁用) | **PIO2 / SM3** | PIO FIFO 异步中断 | 大气数据机总线采集 |
 
 > ⚠️ **BIT 环回测试注意事项**：
 > 当指定 Channel A 与 Channel B 进行对插自测试（如 `uv run python tools/pico429.py bit --tx 0 --rx 1`）时，务必在回路中串接 $100\,\Omega \sim 330\,\Omega$ 限流电阻，并在执行前确保两通道地线共地。

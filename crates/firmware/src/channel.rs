@@ -103,8 +103,8 @@ pub const BOARD_CHANNELS: [ChannelHwDescriptor; ACTIVE_CHANNEL_COUNT] = [
     ChannelHwDescriptor {
         channel_id: 11,
         direction: ChannelDirection::Rx,
-        pin_a: 26,
-        pin_b: 27,
+        pin_a: 22,
+        pin_b: 23,
     },
 ];
 
