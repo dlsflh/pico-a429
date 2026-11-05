@@ -55,18 +55,6 @@ impl ArincSpeed {
         }
     }
 
-    /// 发送端 (TX) 目标主频 (Hz) (统一为 20 周期)
-    #[inline]
-    pub const fn tx_pio_target_hz(self) -> u32 {
-        self.pio_target_hz()
-    }
-
-    /// 接收端 (RX) 目标主频 (Hz) (统一为 20 周期)
-    #[inline]
-    pub const fn rx_pio_target_hz(self) -> u32 {
-        self.pio_target_hz()
-    }
-
     /// 单个 bit 持续微秒数
     pub const fn bit_period_us(self) -> u32 {
         match self {
@@ -90,18 +78,6 @@ pub fn calculate_clkdiv_fixed(sys_clk_hz: u32, speed: ArincSpeed) -> (u16, u8) {
     let frac_part = (div_scaled & 0xFF) as u8;
 
     (int_part, frac_part)
-}
-
-/// 兼容别名：计算 TX 状态机分频比 (统一为 20 周期)
-#[inline]
-pub fn calculate_tx_clkdiv_fixed(sys_clk_hz: u32, speed: ArincSpeed) -> (u16, u8) {
-    calculate_clkdiv_fixed(sys_clk_hz, speed)
-}
-
-/// 兼容别名：计算 RX 状态机分频比 (统一为 20 周期)
-#[inline]
-pub fn calculate_rx_clkdiv_fixed(sys_clk_hz: u32, speed: ArincSpeed) -> (u16, u8) {
-    calculate_clkdiv_fixed(sys_clk_hz, speed)
 }
 
 #[cfg(test)]

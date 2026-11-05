@@ -13,4 +13,3 @@ heapless = "0.8"
 [features]
 default = []
 defmt = ["dep:defmt"]
-std = []
