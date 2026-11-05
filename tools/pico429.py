@@ -17,19 +17,22 @@
 from __future__ import annotations
 
 import argparse
+import pathlib
 import sys
 import time
+import tomllib
+import typing
+from typing import Any
 
-try:
+if typing.TYPE_CHECKING:
     import serial
     import serial.tools.list_ports
-except ImportError:
-    print(
-        "错误: 未安装 pyserial。请使用 uv 运行:\n"
-        "  uv run --with pyserial python tools/pico429.py <command>",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+else:
+    try:
+        import serial
+        import serial.tools.list_ports
+    except ImportError:
+        serial = None
 
 try:
     from tools.arinc429_codec import (
@@ -53,6 +56,14 @@ except ModuleNotFoundError:
 
 def find_pico_port(preferred: str | None = None) -> str:
     """自动检索树莓派 Pico 设备串口或校验用户指定串口。"""
+    if serial is None:
+        print(
+            "错误: 未安装 pyserial。请使用 uv 运行:\n"
+            "  uv run --with pyserial python tools/pico429.py <command>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     ports = list(serial.tools.list_ports.comports())
     if not ports:
         print("错误: 系统未检测到任何可用串口。", file=sys.stderr)
@@ -84,6 +95,14 @@ def find_pico_port(preferred: str | None = None) -> str:
 
 def open_serial(port_name: str, timeout: float = 0.5) -> serial.Serial:
     """打开串口并激活 DTR/RTS 信号以满足 CDC 流控。"""
+    if serial is None:
+        print(
+            "错误: 未安装 pyserial。请使用 uv 运行:\n"
+            "  uv run --with pyserial python tools/pico429.py <command>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     try:
         ser = serial.Serial(
             port=port_name,
@@ -130,6 +149,207 @@ def send_command_wait(ser: serial.Serial, cmd: str, timeout: float = 1.0) -> str
     raise TimeoutError(f"指令 '{cmd}' 超时 ({timeout}s) 未收到固件回执")
 
 
+def send_command_wait_multiline(
+    ser: serial.Serial, cmd: str, timeout: float = 1.0, quiet_gap: float = 0.05
+) -> list[str]:
+    """发送文本指令并等待多行响应，当有数据到达且静默超过 quiet_gap 秒后返回所有行。"""
+    payload = f"{cmd.strip()}\r\n".encode("ascii")
+    ser.reset_input_buffer()
+    ser.write(payload)
+    ser.flush()
+
+    t0 = time.perf_counter()
+    line_buf = bytearray()
+    lines: list[str] = []
+    last_rx_time: float | None = None
+
+    while time.perf_counter() - t0 < timeout:
+        n = ser.in_waiting
+        if n > 0:
+            chunk = ser.read(n)
+            line_buf.extend(chunk)
+            last_rx_time = time.perf_counter()
+            while b"\n" in line_buf:
+                raw_line, _, line_buf = line_buf.partition(b"\n")
+                line_str = raw_line.decode("ascii", errors="replace").strip()
+                if line_str:
+                    lines.append(line_str)
+        elif lines and last_rx_time is not None:
+            if time.perf_counter() - last_rx_time > quiet_gap:
+                break
+        else:
+            time.sleep(0.005)
+
+    if not lines:
+        raise TimeoutError(f"指令 '{cmd}' 超时 ({timeout}s) 未收到固件回执")
+    return lines
+
+
+def normalize_speed(speed_str: str) -> str:
+    """标准化波特率名称为 HIGH 或 LOW (兼顾 ARINC 429 规范定义与历史别名)。"""
+    s = speed_str.strip().lower()
+    if s in ("high", "100k", "100", "100kbps"):
+        return "HIGH"
+    elif s in ("low", "12.5k", "12k5", "12.5", "12.5kbps"):
+        return "LOW"
+    raise ValueError(
+        f"未知速率 '{speed_str}'。ARINC 429 仅支持 'high' (100 kbps) 或 'low' (12.5 kbps)。"
+    )
+
+
+def parse_toml_profile(toml_text: str) -> dict[str, Any]:
+    """解析并校验 TOML 格式的 12 通道配置。"""
+    try:
+        data = tomllib.loads(toml_text)
+    except (tomllib.TOMLDecodeError, ValueError) as e:
+        raise ValueError(f"TOML 格式语法错误: {e}") from e
+
+    profile_info = data.get("profile", {})
+    name = str(profile_info.get("name", "Unnamed_Profile"))
+    version = str(profile_info.get("version", "1.0"))
+    boot_slot = profile_info.get("boot_slot")
+    if boot_slot is not None:
+        try:
+            boot_slot = int(boot_slot)
+            if not (0 <= boot_slot <= 3):
+                raise ValueError(f"boot_slot 必须在 0..3 范围内，当前为: {boot_slot}")
+        except ValueError as err:
+            raise ValueError(f"无效的 boot_slot: {boot_slot}") from err
+
+    global_info = data.get("global", {})
+    mode = str(global_info.get("mode", "ASCII")).upper()
+    if mode not in ("ASCII", "BIN"):
+        mode = "ASCII"
+
+    raw_channels = data.get("channel", data.get("channels", {}))
+    channels: dict[int, dict[str, Any]] = {}
+
+    for ch_key, ch_data in raw_channels.items():
+        try:
+            ch_idx = int(ch_key)
+        except ValueError:
+            raise ValueError(f"通道标识必须为数字 (0..11)，当前为: '{ch_key}'")
+
+        if not (0 <= ch_idx <= 11):
+            raise ValueError(f"通道编号超限 (0..11): {ch_idx}")
+
+        raw_dir = str(ch_data.get("direction", "DISABLED")).upper()
+        if raw_dir not in ("TX", "RX", "DISABLED"):
+            raise ValueError(
+                f"CH{ch_idx} 无效工作方向 '{raw_dir}' (有效值: TX, RX, DISABLED)"
+            )
+
+        raw_speed = str(ch_data.get("speed", "high"))
+        norm_speed = normalize_speed(raw_speed)
+
+        filters = ch_data.get("filter", [])
+        if isinstance(filters, str):
+            filters = [filters]
+        elif not isinstance(filters, list):
+            filters = []
+
+        channels[ch_idx] = {
+            "direction": raw_dir,
+            "speed": norm_speed,
+            "filter": filters,
+        }
+
+    return {
+        "name": name,
+        "version": version,
+        "boot_slot": boot_slot,
+        "mode": mode,
+        "channels": channels,
+    }
+
+
+def build_batch_spec(channels: dict[int, dict[str, Any]]) -> str:
+    """生成固件 CFGBATCH 紧凑配置字符串 (0=TX:HIGH,1=RX:HIGH,...)"""
+    parts: list[str] = []
+    for ch_idx in range(12):
+        cfg = channels.get(ch_idx, {"direction": "DISABLED", "speed": "HIGH"})
+        dir_str = cfg.get("direction", "DISABLED").upper()
+        speed_str = cfg.get("speed", "HIGH").upper()
+        parts.append(f"{ch_idx}={dir_str}:{speed_str}")
+    return ",".join(parts)
+
+
+def generate_toml_from_cfgdump(dump_line: str, profile_name: str = "Pico429_Profile") -> str:
+    """从固件 CFGDUMP 响应生成标准的 TOML 配置文本。"""
+    body = dump_line
+    if "CFGDUMP:" in body:
+        body = body.split("CFGDUMP:", 1)[1].strip()
+
+    tokens = body.split()
+    channels_map: dict[int, tuple[str, str]] = {}
+    for tok in tokens:
+        parts = tok.split(":")
+        if len(parts) >= 2:
+            try:
+                ch = int(parts[0])
+                direction = parts[1].upper()
+                speed = parts[2].lower() if len(parts) >= 3 else "high"
+                channels_map[ch] = (direction, speed)
+            except ValueError:
+                pass
+
+    lines = [
+        "# Pico-429 12-Channel ARINC 429 Configuration Profile",
+        "# Generated automatically from hardware state",
+        "[profile]",
+        f'name = "{profile_name}"',
+        'version = "1.0"',
+        "",
+        "[global]",
+        'mode = "ASCII"',
+        "",
+    ]
+
+    for ch in range(12):
+        direction, speed = channels_map.get(ch, ("DISABLED", "high"))
+        speed_norm = "high" if "high" in speed or "100" in speed else "low"
+        lines.append(f"[channel.{ch}]")
+        lines.append(f'direction = "{direction}"')
+        lines.append(f'speed = "{speed_norm}"')
+        if direction == "RX":
+            lines.append("filter = []")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def parse_profile_list_output(lines: list[str]) -> tuple[int | None, list[dict[str, Any]]]:
+    """解析固件 PROFILE LIST 响应。"""
+    boot_slot: int | None = None
+    slots: list[dict[str, Any]] = []
+
+    for line in lines:
+        if "Boot Slot:" in line:
+            if "Some(" in line:
+                try:
+                    slot_str = line.split("Some(", 1)[1].split(")", 1)[0]
+                    boot_slot = int(slot_str)
+                except ValueError:
+                    pass
+        elif "[Slot" in line:
+            try:
+                parts = line.split("[Slot ", 1)[1]
+                slot_id_str, rest = parts.split("]", 1)
+                slot_id = int(slot_id_str)
+                rest = rest.strip()
+                if "ACTIVE" in rest:
+                    name = ""
+                    if '"' in rest:
+                        name = rest.split('"', 1)[1].rsplit('"', 1)[0]
+                    slots.append({"slot": slot_id, "status": "ACTIVE", "name": name})
+                else:
+                    slots.append({"slot": slot_id, "status": "EMPTY", "name": ""})
+            except (ValueError, IndexError):
+                pass
+
+    return boot_slot, slots
+
+
 def cmd_ping(args: argparse.Namespace) -> None:
     port = find_pico_port(args.port)
     print(f"[*] 正在连接 {port} 并发送 PING...")
@@ -166,6 +386,10 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 def cmd_config(args: argparse.Namespace) -> None:
     """通道启停与方向/速率配置。"""
+    if not (0 <= args.channel <= 11):
+        print(f"错误: 通道编号超限 (0..11): {args.channel}", file=sys.stderr)
+        sys.exit(1)
+
     port = find_pico_port(args.port)
     ser = open_serial(port, timeout=0.5)
     try:
@@ -173,13 +397,13 @@ def cmd_config(args: argparse.Namespace) -> None:
             cmd = f"CHCFG {args.channel} DISABLE"
         else:
             dir_str = "TX" if args.dir.upper() == "TX" else "RX"
-            speed_str = "100K" if "100" in args.speed.upper() else "12K5"
+            speed_str = normalize_speed(args.speed)
             cmd = f"CHCFG {args.channel} ENABLE {dir_str} {speed_str}"
 
         print(f"[*] 下发通道配置指令: {cmd}")
         resp = send_command_wait(ser, cmd, timeout=1.0)
         print(f"[\033[32mOK\033[0m] {resp}")
-    except (serial.SerialException, TimeoutError, OSError) as e:
+    except (serial.SerialException, TimeoutError, OSError, ValueError) as e:
         print(f"[\033[31mFAIL\033[0m] 通道配置失败: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
@@ -188,15 +412,19 @@ def cmd_config(args: argparse.Namespace) -> None:
 
 def cmd_speed(args: argparse.Namespace) -> None:
     """动态切换指定通道波特率。"""
+    if not (0 <= args.channel <= 11):
+        print(f"错误: 通道编号超限 (0..11): {args.channel}", file=sys.stderr)
+        sys.exit(1)
+
     port = find_pico_port(args.port)
     ser = open_serial(port, timeout=0.5)
     try:
-        speed_str = "100K" if "100" in args.speed.upper() else "12K5"
+        speed_str = normalize_speed(args.speed)
         cmd = f"CHCFG {args.channel} SPEED {speed_str}"
         print(f"[*] 下发速率切换指令: {cmd}")
         resp = send_command_wait(ser, cmd, timeout=1.0)
         print(f"[\033[32mOK\033[0m] {resp}")
-    except (serial.SerialException, TimeoutError, OSError) as e:
+    except (serial.SerialException, TimeoutError, OSError, ValueError) as e:
         print(f"[\033[31mFAIL\033[0m] 速率配置失败: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
@@ -205,6 +433,10 @@ def cmd_speed(args: argparse.Namespace) -> None:
 
 def cmd_filter(args: argparse.Namespace) -> None:
     """动态配置硬件级 Label 过滤规则。"""
+    if not (0 <= args.channel <= 11):
+        print(f"错误: 通道编号超限 (0..11): {args.channel}", file=sys.stderr)
+        sys.exit(1)
+
     port = find_pico_port(args.port)
     ser = open_serial(port, timeout=0.5)
     try:
@@ -249,6 +481,10 @@ def cmd_mode(args: argparse.Namespace) -> None:
 
 
 def cmd_send(args: argparse.Namespace) -> None:
+    if not (0 <= args.channel <= 11):
+        print(f"错误: 通道编号超限 (0..11): {args.channel}", file=sys.stderr)
+        sys.exit(1)
+
     port = find_pico_port(args.port)
     ser = open_serial(port, timeout=0.5)
     try:
@@ -723,6 +959,194 @@ def cmd_listen(args: argparse.Namespace) -> None:
         ser.close()
 
 
+def cmd_profile_apply(args: argparse.Namespace) -> None:
+    """一键应用 TOML 配置文件到 12 通道硬件。"""
+    toml_path = pathlib.Path(args.file)
+    if not toml_path.exists():
+        print(f"错误: 配置文件不存在: {toml_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        content = toml_path.read_text(encoding="utf-8")
+        parsed = parse_toml_profile(content)
+    except (ValueError, OSError) as e:
+        print(f"[\033[31mFAIL\033[0m] 配置文件解析失败: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    port = find_pico_port(args.port)
+    print(f"[*] 连接 {port} 并下发配置方案 '{parsed['name']}'...")
+    ser = open_serial(port, timeout=0.5)
+
+    try:
+        # 1. 确保在 ASCII 文本模式以接收命令响应
+        send_command_wait(ser, "MODE ASCII", timeout=1.0)
+
+        # 2. 生成紧凑 batch 配置指令
+        batch_spec = build_batch_spec(parsed["channels"])
+        print("[*] 批量安全配置 12 通道 (暂停 -> 重构 -> 恢复)...")
+        resp = send_command_wait(ser, f"CFGBATCH {batch_spec}", timeout=2.0)
+        print(f"[\033[32mOK\033[0m] {resp}")
+
+        # 3. 逐个通道配置 Label 过滤规则 (若有)
+        for ch, ch_cfg in parsed["channels"].items():
+            filters = ch_cfg.get("filter", [])
+            if ch_cfg["direction"] == "RX" and filters:
+                send_command_wait(ser, f"CHCFG {ch} FILTER CLEAR", timeout=1.0)
+                for f_rule in filters:
+                    f_rule = f_rule.strip()
+                    if f_rule.upper().startswith("ALLOW"):
+                        lbl = f_rule.split(None, 1)[1]
+                        send_command_wait(ser, f"CHCFG {ch} FILTER ALLOW {lbl}", timeout=1.0)
+                    elif f_rule.upper().startswith("BLOCK"):
+                        lbl = f_rule.split(None, 1)[1]
+                        send_command_wait(ser, f"CHCFG {ch} FILTER BLOCK {lbl}", timeout=1.0)
+
+        # 4. 切换全局数据模式
+        if parsed.get("mode") == "BIN":
+            send_command_wait(ser, "MODE BIN", timeout=1.0)
+
+        # 5. 打印格式化通道配置概览
+        print("\n" + "=" * 60)
+        print(f"配置方案: {parsed['name']} (v{parsed['version']})")
+        print("-" * 60)
+        print(f"{'通道':<6} {'方向':<10} {'波特率':<8} {'过滤规则'}")
+        print("-" * 60)
+        for ch in range(12):
+            cfg = parsed["channels"].get(ch, {"direction": "DISABLED", "speed": "HIGH", "filter": []})
+            d = cfg["direction"]
+            s = cfg["speed"]
+            flist = cfg.get("filter", [])
+            f_str = ", ".join(flist) if flist else ("-" if d != "RX" else "全部放行")
+            print(f"CH{ch:<4} {d:<10} {s:<8} {f_str}")
+        print("=" * 60)
+
+    except (serial.SerialException, TimeoutError, OSError) as e:
+        print(f"[\033[31mFAIL\033[0m] 应用配置失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        ser.close()
+
+
+def cmd_profile_dump(args: argparse.Namespace) -> None:
+    """从设备固件读取当前 12 通道状态并生成 TOML 配置文件。"""
+    port = find_pico_port(args.port)
+    print(f"[*] 连接 {port} 并导出 12 通道配置...")
+    ser = open_serial(port, timeout=0.5)
+
+    try:
+        send_command_wait(ser, "MODE ASCII", timeout=1.0)
+        resp = send_command_wait(ser, "CFGDUMP", timeout=1.0)
+        toml_content = generate_toml_from_cfgdump(resp, profile_name=args.name)
+
+        if args.stdout:
+            print(toml_content)
+        else:
+            out_path = pathlib.Path(args.output or "pico429_config.toml")
+            out_path.write_text(toml_content, encoding="utf-8")
+            print(f"[\033[32mOK\033[0m] 配置已导出至: {out_path.resolve()}")
+            print("-" * 50)
+            preview = toml_content[:300] + ("\n..." if len(toml_content) > 300 else "")
+            print(preview)
+
+    except (serial.SerialException, TimeoutError, OSError) as e:
+        print(f"[\033[31mFAIL\033[0m] 导出配置失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        ser.close()
+
+
+def cmd_profile_list(args: argparse.Namespace) -> None:
+    """查询片上 Flash 中的非易失配置方案列表。"""
+    port = find_pico_port(args.port)
+    print(f"[*] 连接 {port} 查询片上 Flash 存储方案...")
+    ser = open_serial(port, timeout=0.5)
+
+    try:
+        send_command_wait(ser, "MODE ASCII", timeout=1.0)
+        lines = send_command_wait_multiline(ser, "PROFILE LIST", timeout=1.0)
+        boot_slot, slots = parse_profile_list_output(lines)
+
+        print("\n" + "=" * 50)
+        print("片上 Flash 非易失存储配置方案列表 (Slot 0..3):")
+        print("-" * 50)
+        print(f"{'槽位':<6} {'自启动':<8} {'状态':<10} {'方案名称'}")
+        print("-" * 50)
+
+        for s_info in slots:
+            slot_id = s_info["slot"]
+            is_boot = (boot_slot == slot_id)
+            boot_tag = "  [*]" if is_boot else "   -"
+            name_tag = f'"{s_info["name"]}"' if s_info["status"] == "ACTIVE" else "<空闲>"
+            print(f"Slot {slot_id:<3} {boot_tag:<8} {s_info['status']:<10} {name_tag}")
+
+        print("=" * 50)
+        if boot_slot is not None:
+            print(f"[*] 当前上电自启动槽位: Slot {boot_slot}")
+        else:
+            print("[*] 当前无自启动槽位 (上电恢复出厂默认安全状态: CH0=TX, CH1=RX)")
+
+    except (serial.SerialException, TimeoutError, OSError) as e:
+        print(f"[\033[31mFAIL\033[0m] 查询配置列表失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        ser.close()
+
+
+def cmd_profile_save(args: argparse.Namespace) -> None:
+    """将当前 12 通道配置持久化写入片上 Flash 槽位。"""
+    port = find_pico_port(args.port)
+    name = args.name.strip()
+    cmd = f"PROFILE SAVE {args.slot} {name}"
+    print(f"[*] 连接 {port} 并写入片上 Flash Slot {args.slot} (名称: '{name}')...")
+    ser = open_serial(port, timeout=0.5)
+
+    try:
+        send_command_wait(ser, "MODE ASCII", timeout=1.0)
+        resp = send_command_wait(ser, cmd, timeout=2.0)
+        print(f"[\033[32mOK\033[0m] {resp}")
+    except (serial.SerialException, TimeoutError, OSError) as e:
+        print(f"[\033[31mFAIL\033[0m] 保存方案失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        ser.close()
+
+
+def cmd_profile_load(args: argparse.Namespace) -> None:
+    """从片上 Flash 槽位加载并激活 12 通道配置。"""
+    port = find_pico_port(args.port)
+    cmd = f"PROFILE LOAD {args.slot}"
+    print(f"[*] 连接 {port} 并激活片上 Flash Slot {args.slot} 配置...")
+    ser = open_serial(port, timeout=0.5)
+
+    try:
+        send_command_wait(ser, "MODE ASCII", timeout=1.0)
+        resp = send_command_wait(ser, cmd, timeout=2.0)
+        print(f"[\033[32mOK\033[0m] {resp}")
+    except (serial.SerialException, TimeoutError, OSError) as e:
+        print(f"[\033[31mFAIL\033[0m] 加载方案失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        ser.close()
+
+
+def cmd_profile_boot(args: argparse.Namespace) -> None:
+    """设置上电默认自启动的 Flash 槽位。"""
+    port = find_pico_port(args.port)
+    cmd = f"PROFILE BOOT {args.slot}"
+    print(f"[*] 连接 {port} 设置上电自启动槽位为 Slot {args.slot}...")
+    ser = open_serial(port, timeout=0.5)
+
+    try:
+        send_command_wait(ser, "MODE ASCII", timeout=1.0)
+        resp = send_command_wait(ser, cmd, timeout=2.0)
+        print(f"[\033[32mOK\033[0m] {resp}")
+    except (serial.SerialException, TimeoutError, OSError) as e:
+        print(f"[\033[31mFAIL\033[0m] 设置自启动槽位失败: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        ser.close()
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pico-429 ARINC 429 交互与诊断工具")
     parser.add_argument("--port", "-p", help="串口名称 (例如 COM3，未提供时自动搜索)")
@@ -736,29 +1160,31 @@ def create_parser() -> argparse.ArgumentParser:
     # status
     p_status = subparsers.add_parser("status", help="查询板卡在线状态与通道配置")
     p_status.add_argument("--port", "-p", help="串口名称")
-    p_status.add_argument("--channel", "-c", type=int, help="指定查询的通道号 (0~1)")
+    p_status.add_argument("--channel", "-c", type=int, help="指定查询的通道号 (0~11)")
 
     # config
     p_config = subparsers.add_parser("config", help="通道启停、方向与速率配置")
     p_config.add_argument("--port", "-p", help="串口名称")
-    p_config.add_argument("channel", type=int, help="通道号 (0~1)")
+    p_config.add_argument("channel", type=int, help="通道号 (0~11)")
     p_config.add_argument("--enable", action="store_true", help="启用通道")
     p_config.add_argument("--disable", action="store_true", help="停用通道")
     p_config.add_argument(
         "--dir", choices=["TX", "RX", "tx", "rx"], default="TX", help="通道方向 (TX/RX)"
     )
-    p_config.add_argument("--speed", default="100k", help="速率 (100k 或 12.5k)")
+    p_config.add_argument(
+        "--speed", default="high", help="速率 ('high'/'low' 或 '100k'/'12.5k')"
+    )
 
     # speed
     p_speed = subparsers.add_parser("speed", help="切换通道波特率")
     p_speed.add_argument("--port", "-p", help="串口名称")
-    p_speed.add_argument("channel", type=int, help="通道号 (0~1)")
-    p_speed.add_argument("speed", help="目标速率 (100k 或 12.5k)")
+    p_speed.add_argument("channel", type=int, help="通道号 (0~11)")
+    p_speed.add_argument("speed", help="目标速率 ('high'/'low' 或 '100k'/'12.5k')")
 
     # filter
     p_filter = subparsers.add_parser("filter", help="配置通道 Label 硬件过滤规则")
     p_filter.add_argument("--port", "-p", help="串口名称")
-    p_filter.add_argument("channel", type=int, help="通道号 (0~1)")
+    p_filter.add_argument("channel", type=int, help="通道号 (0~11)")
     p_filter.add_argument("--allow", help="放行的八进制 Label (例如 310)")
     p_filter.add_argument("--block", help="屏蔽的八进制 Label (例如 377)")
     p_filter.add_argument("--clear", action="store_true", help="清空所有过滤规则")
@@ -774,7 +1200,7 @@ def create_parser() -> argparse.ArgumentParser:
     p_send = subparsers.add_parser("send", help="向 ARINC 429 发送单字")
     p_send.add_argument("--port", "-p", help="串口名称")
     p_send.add_argument(
-        "--channel", "-c", type=int, default=0, help="发送通道号 (默认 0)"
+        "--channel", "-c", type=int, default=0, help="发送通道号 (0~11, 默认 0)"
     )
     p_send.add_argument("--label", "-l", help="八进制 Label (例如 310)")
     p_send.add_argument(
@@ -817,6 +1243,42 @@ def create_parser() -> argparse.ArgumentParser:
     )
     p_listen.add_argument("--port", "-p", help="串口名称")
 
+    # profile (12 通道配置方案管理)
+    p_profile = subparsers.add_parser("profile", help="12 通道配置方案管理 (TOML / 片上 Flash)")
+    profile_subs = p_profile.add_subparsers(dest="profile_action", required=True)
+
+    # profile apply
+    p_prof_apply = profile_subs.add_parser("apply", help="从本地 TOML 文件批量加载并应用 12 通道配置")
+    p_prof_apply.add_argument("--port", "-p", help="串口名称")
+    p_prof_apply.add_argument("file", help="TOML 配置文件路径")
+
+    # profile dump
+    p_prof_dump = profile_subs.add_parser("dump", help="从固件导出当前 12 通道配置为 TOML 文件")
+    p_prof_dump.add_argument("--port", "-p", help="串口名称")
+    p_prof_dump.add_argument("-o", "--output", help="输出 TOML 文件路径 (默认 pico429_config.toml)")
+    p_prof_dump.add_argument("--name", default="Pico429_Active", help="配置方案名称")
+    p_prof_dump.add_argument("--stdout", action="store_true", help="直接输出至终端标准输出")
+
+    # profile list
+    p_prof_list = profile_subs.add_parser("list", help="查询片上非易失存储中的配置列表")
+    p_prof_list.add_argument("--port", "-p", help="串口名称")
+
+    # profile save
+    p_prof_save = profile_subs.add_parser("save", help="将当前配置持久化至片上 Flash 槽位 (0..3)")
+    p_prof_save.add_argument("--port", "-p", help="串口名称")
+    p_prof_save.add_argument("slot", type=int, choices=[0, 1, 2, 3], help="Flash 槽位号 (0..3)")
+    p_prof_save.add_argument("--name", "-n", default="Profile", help="方案名称 (最多 31 字符)")
+
+    # profile load
+    p_prof_load = profile_subs.add_parser("load", help="从片上 Flash 槽位加载并激活配置")
+    p_prof_load.add_argument("--port", "-p", help="串口名称")
+    p_prof_load.add_argument("slot", type=int, choices=[0, 1, 2, 3], help="Flash 槽位号 (0..3)")
+
+    # profile boot
+    p_prof_boot = profile_subs.add_parser("boot", help="设置设备上电默认自启动的配置槽位")
+    p_prof_boot.add_argument("--port", "-p", help="串口名称")
+    p_prof_boot.add_argument("slot", type=int, choices=[0, 1, 2, 3], help="Flash 槽位号 (0..3)")
+
     return parser
 
 
@@ -848,6 +1310,19 @@ def main() -> None:
         cmd_interactive(args)
     elif args.command == "listen":
         cmd_listen(args)
+    elif args.command == "profile":
+        if args.profile_action == "apply":
+            cmd_profile_apply(args)
+        elif args.profile_action == "dump":
+            cmd_profile_dump(args)
+        elif args.profile_action == "list":
+            cmd_profile_list(args)
+        elif args.profile_action == "save":
+            cmd_profile_save(args)
+        elif args.profile_action == "load":
+            cmd_profile_load(args)
+        elif args.profile_action == "boot":
+            cmd_profile_boot(args)
 
 
 if __name__ == "__main__":

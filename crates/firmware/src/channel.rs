@@ -4,7 +4,7 @@
 //! 每个通道独立拥有专用下行发送队列与控制队列，杜绝跨任务竞争偷帧。
 //! 生产数据采用广播式 PubSub (GLOBAL_RX_PUBSUB)。
 
-use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::pubsub::PubSubChannel;
@@ -29,10 +29,10 @@ pub struct ChannelHwDescriptor {
     pub pin_b: u8,
 }
 
-/// 当前板载物理装配激活的通道数 (Channel 0: TX, Channel 1: RX)
-pub const ACTIVE_CHANNEL_COUNT: usize = 2;
+/// 当前板载物理装配激活的通道数 (Channel 0..11 共 12 路)
+pub const ACTIVE_CHANNEL_COUNT: usize = 12;
 
-/// 板载通道描述表：编译期声明通道物理方向与管脚映射
+/// 板载通道描述表：12 通道物理引脚映射 (GP0..GP23)
 pub const BOARD_CHANNELS: [ChannelHwDescriptor; ACTIVE_CHANNEL_COUNT] = [
     ChannelHwDescriptor {
         channel_id: 0,
@@ -46,12 +46,100 @@ pub const BOARD_CHANNELS: [ChannelHwDescriptor; ACTIVE_CHANNEL_COUNT] = [
         pin_a: 2,
         pin_b: 3,
     },
+    ChannelHwDescriptor {
+        channel_id: 2,
+        direction: ChannelDirection::Rx,
+        pin_a: 4,
+        pin_b: 5,
+    },
+    ChannelHwDescriptor {
+        channel_id: 3,
+        direction: ChannelDirection::Rx,
+        pin_a: 6,
+        pin_b: 7,
+    },
+    ChannelHwDescriptor {
+        channel_id: 4,
+        direction: ChannelDirection::Rx,
+        pin_a: 8,
+        pin_b: 9,
+    },
+    ChannelHwDescriptor {
+        channel_id: 5,
+        direction: ChannelDirection::Rx,
+        pin_a: 10,
+        pin_b: 11,
+    },
+    ChannelHwDescriptor {
+        channel_id: 6,
+        direction: ChannelDirection::Rx,
+        pin_a: 12,
+        pin_b: 13,
+    },
+    ChannelHwDescriptor {
+        channel_id: 7,
+        direction: ChannelDirection::Rx,
+        pin_a: 14,
+        pin_b: 15,
+    },
+    ChannelHwDescriptor {
+        channel_id: 8,
+        direction: ChannelDirection::Rx,
+        pin_a: 16,
+        pin_b: 17,
+    },
+    ChannelHwDescriptor {
+        channel_id: 9,
+        direction: ChannelDirection::Rx,
+        pin_a: 18,
+        pin_b: 19,
+    },
+    ChannelHwDescriptor {
+        channel_id: 10,
+        direction: ChannelDirection::Rx,
+        pin_a: 20,
+        pin_b: 21,
+    },
+    ChannelHwDescriptor {
+        channel_id: 11,
+        direction: ChannelDirection::Rx,
+        pin_a: 22,
+        pin_b: 23,
+    },
 ];
 
 // 运行时通道方向状态：0: Disabled, 1: Tx, 2: Rx
+// 出厂默认状态：CH0 为 Tx, CH1 为 Rx, CH2..11 为被动监听 Rx (电气绝对安全模式)
 static RUNTIME_CHANNEL_DIRECTIONS: [AtomicU8; ACTIVE_CHANNEL_COUNT] = [
     AtomicU8::new(1), // CH0 默认为 Tx
     AtomicU8::new(2), // CH1 默认为 Rx
+    AtomicU8::new(2), // CH2 默认为 Rx
+    AtomicU8::new(2), // CH3 默认为 Rx
+    AtomicU8::new(2), // CH4 默认为 Rx
+    AtomicU8::new(2), // CH5 默认为 Rx
+    AtomicU8::new(2), // CH6 默认为 Rx
+    AtomicU8::new(2), // CH7 默认为 Rx
+    AtomicU8::new(2), // CH8 默认为 Rx
+    AtomicU8::new(2), // CH9 默认为 Rx
+    AtomicU8::new(2), // CH10 默认为 Rx
+    AtomicU8::new(2), // CH11 默认为 Rx
+];
+
+// 运行时通道波特率：true 为 HIGH (100 kbps), false 为 LOW (12.5 kbps)
+// 出厂默认状态：全部通道默认为 HIGH (100 kbps)
+static RUNTIME_CHANNEL_SPEEDS: [AtomicBool; ACTIVE_CHANNEL_COUNT] = [
+    AtomicBool::new(true), // CH0
+    AtomicBool::new(true), // CH1
+    AtomicBool::new(true), // CH2
+    AtomicBool::new(true), // CH3
+    AtomicBool::new(true), // CH4
+    AtomicBool::new(true), // CH5
+    AtomicBool::new(true), // CH6
+    AtomicBool::new(true), // CH7
+    AtomicBool::new(true), // CH8
+    AtomicBool::new(true), // CH9
+    AtomicBool::new(true), // CH10
+    AtomicBool::new(true), // CH11
 ];
 
 // 全局遥测数据包单调递增包序号 (溢出自动翻转)
@@ -82,6 +170,24 @@ pub fn channel_direction(channel_id: u8) -> Option<ChannelDirection> {
         }
     } else {
         None
+    }
+}
+
+/// 动态更新通道波特率
+#[inline]
+pub fn set_channel_speed(channel_id: u8, high_speed: bool) {
+    if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
+        RUNTIME_CHANNEL_SPEEDS[channel_id as usize].store(high_speed, Ordering::Relaxed);
+    }
+}
+
+/// 查询板载通道当前波特率是否为高速
+#[inline]
+pub fn channel_is_high_speed(channel_id: u8) -> bool {
+    if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
+        RUNTIME_CHANNEL_SPEEDS[channel_id as usize].load(Ordering::Relaxed)
+    } else {
+        true
     }
 }
 
@@ -137,6 +243,10 @@ pub enum ChannelControlCmd {
     },
     /// 过滤规则动作
     Filter(FilterAction),
+    /// 暂停物理收发工作 (停止状态机运行)
+    Pause,
+    /// 恢复物理收发工作 (按当前配置重启状态机)
+    Resume,
 }
 
 // 静态队列构造原型

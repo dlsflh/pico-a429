@@ -93,15 +93,34 @@ uv run --with pyserial python tools/pico429.py interactive
 # 4. 执行硬件自收自发 BIT 闭环自测试 (GP0->GP2, GP1->GP3，RTT < 1ms)
 uv run --with pyserial python tools/pico429.py bit
 
-# 5. 动态配置通道启停与波特率切换
-uv run --with pyserial python tools/pico429.py config 0 --enable --dir TX --speed 100k
-uv run --with pyserial python tools/pico429.py speed 0 100k
+# 5. 动态配置通道启停与波特率切换 (支持 high / low 与 100k / 12.5k)
+uv run --with pyserial python tools/pico429.py config 0 --enable --dir TX --speed high
+uv run --with pyserial python tools/pico429.py speed 0 low
 uv run --with pyserial python tools/pico429.py filter 1 --allow 310
 
-# 6. 发送单个构造字
+# 6. 12 通道 TOML 配置文件管理与一键加载 (模式 B)
+# 导出当前固件 12 通道配置为 TOML 模板
+uv run --with pyserial python tools/pico429.py profile dump -o my_bench.toml
+
+# 按照 TOML 配置文件一键原子重构所有 12 通道 (安全暂停 -> 应用 -> 恢复)
+uv run --with pyserial python tools/pico429.py profile apply my_bench.toml
+
+# 将当前配置持久化保存至片上 Flash 存储槽位 (0..3)
+uv run --with pyserial python tools/pico429.py profile save 0 --name "Avionics_Bench"
+
+# 列出片上 Flash 中的所有配置方案与开机自启动槽位
+uv run --with pyserial python tools/pico429.py profile list
+
+# 切换激活指定的片上 Flash 槽位
+uv run --with pyserial python tools/pico429.py profile load 0
+
+# 设置指定槽位为上电默认自启动
+uv run --with pyserial python tools/pico429.py profile boot 0
+
+# 7. 发送单个构造字
 uv run --with pyserial python tools/pico429.py send --label 310 --data 0x1234
 
-# 7. 彩色监听总线数据流
+# 8. 彩色监听总线数据流
 uv run --with pyserial python tools/pico429.py listen
 ```
 

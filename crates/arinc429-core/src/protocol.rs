@@ -183,7 +183,7 @@ pub enum HostCommand {
     },
     /// 发送原始 32 位十六进制字: TXRAW <ch> <hex_word>
     SendRaw { channel: u8, raw_word: u32 },
-    /// 切换波特率: CHCFG <ch> SPEED <100K|12K5>
+    /// 切换波特率: CHCFG <ch> SPEED <HIGH|LOW|100K|12K5>
     SetSpeed { channel: u8, high_speed: bool },
     /// 切换推送模式: MODE <BIN|ASCII>
     SetMode { binary_mode: bool },
@@ -193,6 +193,22 @@ pub enum HostCommand {
     Ping,
     /// 查询状态: STATUS [ch]
     QueryStatus { channel: Option<u8> },
+    /// 全局暂停所有通道物理收发: PAUSE
+    PauseAll,
+    /// 全局恢复所有使能通道物理收发: RESUME
+    ResumeAll,
+    /// 导出 12 通道当前配置明细: CFGDUMP
+    DumpConfig,
+    /// 保存当前 12 通道配置至 Flash 槽位: PROFILE SAVE <slot> [name]
+    ProfileSave { slot: u8, name: heapless::String<32> },
+    /// 从 Flash 槽位加载并原子应用配置: PROFILE LOAD <slot>
+    ProfileLoad { slot: u8 },
+    /// 设置开机自启动 Flash 槽位: PROFILE BOOT <slot>
+    ProfileBoot { slot: u8 },
+    /// 查询 Flash 槽位配置列表: PROFILE LIST
+    ProfileList,
+    /// 批量原子下发 12 通道配置: CFGBATCH <spec>
+    BatchConfigure { spec: heapless::String<256> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +256,66 @@ impl HostCommand {
             return Ok(Self::Ping);
         }
 
+        if cmd.eq_ignore_ascii_case("PAUSE") {
+            return Ok(Self::PauseAll);
+        }
+
+        if cmd.eq_ignore_ascii_case("RESUME") {
+            return Ok(Self::ResumeAll);
+        }
+
+        if cmd.eq_ignore_ascii_case("CFGDUMP") {
+            return Ok(Self::DumpConfig);
+        }
+
+        if cmd.eq_ignore_ascii_case("CFGBATCH") {
+            let spec_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("spec"))?;
+            let mut spec = heapless::String::new();
+            let _ = spec.push_str(spec_str);
+            return Ok(Self::BatchConfigure { spec });
+        }
+
+        if cmd.eq_ignore_ascii_case("PROFILE") {
+            let sub = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("SAVE/LOAD/BOOT/LIST"))?;
+            if sub.eq_ignore_ascii_case("LIST") {
+                return Ok(Self::ProfileList);
+            } else if sub.eq_ignore_ascii_case("LOAD") {
+                let slot_str = parts
+                    .next()
+                    .ok_or(CommandParseError::MissingArgument("slot"))?;
+                let slot = slot_str
+                    .parse::<u8>()
+                    .map_err(|_| CommandParseError::InvalidChannel)?;
+                return Ok(Self::ProfileLoad { slot });
+            } else if sub.eq_ignore_ascii_case("BOOT") {
+                let slot_str = parts
+                    .next()
+                    .ok_or(CommandParseError::MissingArgument("slot"))?;
+                let slot = slot_str
+                    .parse::<u8>()
+                    .map_err(|_| CommandParseError::InvalidChannel)?;
+                return Ok(Self::ProfileBoot { slot });
+            } else if sub.eq_ignore_ascii_case("SAVE") {
+                let slot_str = parts
+                    .next()
+                    .ok_or(CommandParseError::MissingArgument("slot"))?;
+                let slot = slot_str
+                    .parse::<u8>()
+                    .map_err(|_| CommandParseError::InvalidChannel)?;
+                let mut name = heapless::String::new();
+                if let Some(n) = parts.next() {
+                    let _ = name.push_str(n);
+                }
+                return Ok(Self::ProfileSave { slot, name });
+            } else {
+                return Err(CommandParseError::UnknownSubAction);
+            }
+        }
+
         if cmd.eq_ignore_ascii_case("STATUS") {
             let ch_opt = parts.next().and_then(|s| s.parse::<u8>().ok());
             return Ok(Self::QueryStatus { channel: ch_opt });
@@ -269,9 +345,20 @@ impl HostCommand {
                     .ok_or(CommandParseError::MissingArgument("direction (TX/RX)"))?;
                 let speed_str = parts
                     .next()
-                    .ok_or(CommandParseError::MissingArgument("speed (100K/12K5)"))?;
+                    .ok_or(CommandParseError::MissingArgument("speed (HIGH/LOW/100K/12K5)"))?;
                 let is_tx = dir_str.eq_ignore_ascii_case("TX");
-                let high_speed = speed_str.eq_ignore_ascii_case("100K");
+                let high_speed = if speed_str.eq_ignore_ascii_case("100K")
+                    || speed_str.eq_ignore_ascii_case("HIGH")
+                {
+                    true
+                } else if speed_str.eq_ignore_ascii_case("12K5")
+                    || speed_str.eq_ignore_ascii_case("12.5K")
+                    || speed_str.eq_ignore_ascii_case("LOW")
+                {
+                    false
+                } else {
+                    return Err(CommandParseError::InvalidSpeed);
+                };
                 return Ok(Self::ConfigureChannel {
                     channel,
                     enable: true,
@@ -281,8 +368,19 @@ impl HostCommand {
             } else if action.eq_ignore_ascii_case("SPEED") {
                 let speed_str = parts
                     .next()
-                    .ok_or(CommandParseError::MissingArgument("speed (100K/12K5)"))?;
-                let high_speed = speed_str.eq_ignore_ascii_case("100K");
+                    .ok_or(CommandParseError::MissingArgument("speed (HIGH/LOW/100K/12K5)"))?;
+                let high_speed = if speed_str.eq_ignore_ascii_case("100K")
+                    || speed_str.eq_ignore_ascii_case("HIGH")
+                {
+                    true
+                } else if speed_str.eq_ignore_ascii_case("12K5")
+                    || speed_str.eq_ignore_ascii_case("12.5K")
+                    || speed_str.eq_ignore_ascii_case("LOW")
+                {
+                    false
+                } else {
+                    return Err(CommandParseError::InvalidSpeed);
+                };
                 return Ok(Self::SetSpeed {
                     channel,
                     high_speed,
@@ -550,6 +648,52 @@ mod tests {
             HostCommand::ChannelFilter {
                 channel: 1,
                 action: FilterAction::Clear,
+            }
+        );
+
+        // 测试新增的 12 通道与配置管理指令
+        assert_eq!(HostCommand::parse("PAUSE").unwrap(), HostCommand::PauseAll);
+        assert_eq!(HostCommand::parse("RESUME").unwrap(), HostCommand::ResumeAll);
+        assert_eq!(HostCommand::parse("CFGDUMP").unwrap(), HostCommand::DumpConfig);
+        assert_eq!(
+            HostCommand::parse("PROFILE LIST").unwrap(),
+            HostCommand::ProfileList
+        );
+        assert_eq!(
+            HostCommand::parse("PROFILE LOAD 2").unwrap(),
+            HostCommand::ProfileLoad { slot: 2 }
+        );
+        assert_eq!(
+            HostCommand::parse("PROFILE BOOT 1").unwrap(),
+            HostCommand::ProfileBoot { slot: 1 }
+        );
+        let mut expected_name = heapless::String::new();
+        let _ = expected_name.push_str("BenchA");
+        assert_eq!(
+            HostCommand::parse("PROFILE SAVE 0 BenchA").unwrap(),
+            HostCommand::ProfileSave {
+                slot: 0,
+                name: expected_name
+            }
+        );
+
+        // 支持 HIGH / LOW 语法
+        assert_eq!(
+            HostCommand::parse("CHCFG 5 ENABLE TX HIGH").unwrap(),
+            HostCommand::ConfigureChannel {
+                channel: 5,
+                enable: true,
+                is_tx: true,
+                high_speed: true,
+            }
+        );
+        assert_eq!(
+            HostCommand::parse("CHCFG 6 ENABLE RX LOW").unwrap(),
+            HostCommand::ConfigureChannel {
+                channel: 6,
+                enable: true,
+                is_tx: false,
+                high_speed: false,
             }
         );
     }

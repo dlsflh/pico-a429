@@ -22,9 +22,9 @@ use arinc429_core::protocol::{
 use arinc429_core::word::ArincWord;
 
 use crate::channel::{
-    channel_direction, send_to_channel_ctrl, send_to_channel_tx, set_channel_direction,
-    ChannelControlCmd, ChannelDirection, ChannelError, InboundArincFrame, ACTIVE_CHANNEL_COUNT,
-    BOARD_CHANNELS, GLOBAL_RX_PUBSUB,
+    channel_direction, channel_is_high_speed, send_to_channel_ctrl, send_to_channel_tx,
+    set_channel_direction, set_channel_speed, ChannelControlCmd, ChannelDirection, ChannelError,
+    InboundArincFrame, ACTIVE_CHANNEL_COUNT, GLOBAL_RX_PUBSUB,
 };
 
 /// 推送模式：true 表示二进制高速帧，false 表示 ASCII 文本 (默认启动为 ASCII 便于调试验证)
@@ -198,7 +198,7 @@ async fn cdc_sender_write_all(
 #[derive(Clone)]
 pub enum CommandExecutionResult {
     Pong,
-    SuccessText(String<128>),
+    SuccessText(String<512>),
     ErrorStatic(&'static str),
     ErrorDynamic(String<64>),
 }
@@ -211,7 +211,7 @@ fn validate_channel(
 ) -> Result<(), CommandExecutionResult> {
     if (channel as usize) >= ACTIVE_CHANNEL_COUNT {
         return Err(CommandExecutionResult::ErrorStatic(
-            "ERR: Channel not equipped on hardware (active: 0..1)\r\n",
+            "ERR: Channel out of range (active: 0..11)\r\n",
         ));
     }
     if let Some(expected_dir) = expected {
@@ -244,7 +244,7 @@ async fn handle_channel_filter(channel: u8, action: FilterAction) -> CommandExec
     };
     let _ = send_to_channel_ctrl(channel, ChannelControlCmd::Filter(action)).await;
 
-    let mut resp = String::<128>::new();
+    let mut resp = String::<512>::new();
     core::write!(resp, "OK: Filter rule {} on Channel {}\r\n", desc, channel).ok();
     CommandExecutionResult::SuccessText(resp)
 }
@@ -255,7 +255,7 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
         HostCommand::Ping => CommandExecutionResult::Pong,
         HostCommand::SetMode { binary_mode } => {
             BINARY_OUTPUT_MODE.store(binary_mode, Ordering::Relaxed);
-            let mut s = String::<128>::new();
+            let mut s = String::<512>::new();
             if binary_mode {
                 let _ = s.push_str("OK: Switched to BINARY mode\r\n");
             } else {
@@ -273,7 +273,6 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 return err;
             }
 
-            let hw_desc = &BOARD_CHANNELS[channel as usize];
             let requested_dir = if !enable {
                 ChannelDirection::Disabled
             } else if is_tx {
@@ -282,33 +281,21 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 ChannelDirection::Rx
             };
 
-            // 物理引脚与芯片硬件固化方向守护：杜绝反向配置产生状态倒置与队列死锁
-            if requested_dir != ChannelDirection::Disabled && requested_dir != hw_desc.direction {
-                let mut resp = String::<64>::new();
-                core::write!(
-                    resp,
-                    "ERR: Channel {} hardware is physically {:?}-only\r\n",
-                    channel,
-                    hw_desc.direction
-                )
-                .ok();
-                return CommandExecutionResult::ErrorDynamic(resp);
-            }
-
             set_channel_direction(channel, requested_dir);
+            set_channel_speed(channel, high_speed);
             let cmd = ChannelControlCmd::Configure {
                 direction: requested_dir,
                 high_speed,
             };
             let _ = send_to_channel_ctrl(channel, cmd).await;
 
-            let mut resp = String::<128>::new();
+            let mut resp = String::<512>::new();
             core::write!(
                 resp,
                 "OK: Channel {} configured: {:?}, Speed: {}\r\n",
                 channel,
                 requested_dir,
-                if high_speed { "100K" } else { "12.5K" }
+                if high_speed { "HIGH (100K)" } else { "LOW (12.5K)" }
             )
             .ok();
             CommandExecutionResult::SuccessText(resp)
@@ -324,12 +311,13 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 return err;
             }
             let dir = channel_direction(channel).unwrap_or(ChannelDirection::Disabled);
+            set_channel_speed(channel, high_speed);
             let cmd = ChannelControlCmd::Configure {
                 direction: dir,
                 high_speed,
             };
             let _ = send_to_channel_ctrl(channel, cmd).await;
-            let mut resp = String::<128>::new();
+            let mut resp = String::<512>::new();
             core::write!(
                 resp,
                 "OK: Channel {} set to {}\r\n",
@@ -345,7 +333,7 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             }
             match send_to_channel_tx(channel, raw_word) {
                 Ok(()) => {
-                    let mut resp = String::<128>::new();
+                    let mut resp = String::<512>::new();
                     core::write!(
                         resp,
                         "OK: Queued raw word 0x{:08X} for CH{}\r\n",
@@ -396,7 +384,7 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             };
             match send_to_channel_tx(channel, word.to_raw()) {
                 Ok(()) => {
-                    let mut resp = String::<128>::new();
+                    let mut resp = String::<512>::new();
                     core::write!(
                         resp,
                         "OK: Sent L:{:03o} SDI:{} DATA:0x{:X} RAW:0x{:08X}\r\n",
@@ -433,23 +421,253 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
         HostCommand::RunBit { .. } => CommandExecutionResult::ErrorStatic(
             "ERR: On-device BIT disabled. Perform loopback verification via host\r\n",
         ),
-        HostCommand::QueryStatus { channel: _ } => {
-            let mut resp = String::<128>::new();
-            let ch0_dir = channel_direction(0).unwrap_or(ChannelDirection::Disabled);
-            let ch1_dir = channel_direction(1).unwrap_or(ChannelDirection::Disabled);
-            core::write!(
-                resp,
-                "STATUS: Pico-429 Online [CH0: {:?}, CH1: {:?}]. Mode: {}\r\n",
-                ch0_dir,
-                ch1_dir,
-                if BINARY_OUTPUT_MODE.load(Ordering::Relaxed) {
-                    "BIN"
+        HostCommand::QueryStatus { channel } => {
+            let mut resp = String::<512>::new();
+            if let Some(ch) = channel {
+                if (ch as usize) < ACTIVE_CHANNEL_COUNT {
+                    let dir = channel_direction(ch).unwrap_or(ChannelDirection::Disabled);
+                    core::write!(resp, "STATUS: CH{}: {:?}\r\n", ch, dir).ok();
                 } else {
-                    "ASCII"
+                    core::write!(resp, "ERR: Channel {} out of range (0..11)\r\n", ch).ok();
                 }
-            )
-            .ok();
+            } else {
+                let is_bin = BINARY_OUTPUT_MODE.load(Ordering::Relaxed);
+                core::write!(
+                    resp,
+                    "STATUS: Pico-429 12CH Online. Mode: {}\r\n[CH0..11]:",
+                    if is_bin { "BIN" } else { "ASCII" }
+                )
+                .ok();
+                for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+                    let dir = channel_direction(ch).unwrap_or(ChannelDirection::Disabled);
+                    let tag = match dir {
+                        ChannelDirection::Disabled => "DIS",
+                        ChannelDirection::Tx => "TX",
+                        ChannelDirection::Rx => "RX",
+                    };
+                    core::write!(resp, " {}:{}", ch, tag).ok();
+                }
+                let _ = resp.push_str("\r\n");
+            }
             CommandExecutionResult::SuccessText(resp)
+        }
+        HostCommand::PauseAll => {
+            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+                let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
+            }
+            let mut resp = String::<512>::new();
+            let _ = resp.push_str("OK: All channels paused\r\n");
+            CommandExecutionResult::SuccessText(resp)
+        }
+        HostCommand::ResumeAll => {
+            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+                let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
+            }
+            let mut resp = String::<512>::new();
+            let _ = resp.push_str("OK: All channels resumed\r\n");
+            CommandExecutionResult::SuccessText(resp)
+        }
+        HostCommand::DumpConfig => {
+            let mut resp = String::<512>::new();
+            let _ = resp.push_str("CFGDUMP:");
+            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+                let dir = channel_direction(ch).unwrap_or(ChannelDirection::Disabled);
+                let dir_str = match dir {
+                    ChannelDirection::Disabled => "DISABLED",
+                    ChannelDirection::Tx => "TX",
+                    ChannelDirection::Rx => "RX",
+                };
+                let spd_str = if channel_is_high_speed(ch) { "HIGH" } else { "LOW" };
+                core::write!(resp, " {}:{}:{}", ch, dir_str, spd_str).ok();
+            }
+            let _ = resp.push_str("\r\n");
+            CommandExecutionResult::SuccessText(resp)
+        }
+        HostCommand::BatchConfigure { spec } => {
+            // 1. 暂停所有通道
+            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+                let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
+            }
+
+            let mut count = 0;
+            for token in spec.split(',') {
+                let mut kv = token.split('=');
+                if let (Some(ch_str), Some(val_str)) = (kv.next(), kv.next()) {
+                    if let Ok(ch) = ch_str.trim().parse::<u8>() {
+                        if (ch as usize) < ACTIVE_CHANNEL_COUNT {
+                            let mut val_parts = val_str.split(':');
+                            let dir_str = val_parts.next().unwrap_or("DISABLED");
+                            let speed_str = val_parts.next().unwrap_or("HIGH");
+
+                            let dir = if dir_str.eq_ignore_ascii_case("TX") {
+                                ChannelDirection::Tx
+                            } else if dir_str.eq_ignore_ascii_case("RX") {
+                                ChannelDirection::Rx
+                            } else {
+                                ChannelDirection::Disabled
+                            };
+
+                            let high_speed = !speed_str.eq_ignore_ascii_case("LOW")
+                                && !speed_str.eq_ignore_ascii_case("12K5")
+                                && !speed_str.eq_ignore_ascii_case("12.5K");
+
+                            set_channel_direction(ch, dir);
+                            set_channel_speed(ch, high_speed);
+                            let _ = send_to_channel_ctrl(
+                                ch,
+                                ChannelControlCmd::Configure {
+                                    direction: dir,
+                                    high_speed,
+                                },
+                            )
+                            .await;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+
+            // 2. 恢复所有通道
+            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+                let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
+            }
+
+            let mut resp = String::<512>::new();
+            core::write!(resp, "OK: Batch configured {} channels\r\n", count).ok();
+            CommandExecutionResult::SuccessText(resp)
+        }
+        HostCommand::ProfileSave { slot, name } => {
+            let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
+            if let Some(ref mut mgr) = *flash_guard {
+                let mut records = [crate::flash_storage::ChannelConfigRecord::default(); 12];
+                for ch in 0..ACTIVE_CHANNEL_COUNT {
+                    let dir = channel_direction(ch as u8).unwrap_or(ChannelDirection::Disabled);
+                    records[ch].direction = match dir {
+                        ChannelDirection::Disabled => 0,
+                        ChannelDirection::Tx => 1,
+                        ChannelDirection::Rx => 2,
+                    };
+                    records[ch].high_speed = if channel_is_high_speed(ch as u8) { 1 } else { 0 };
+                    records[ch].filter_mode = 0;
+                }
+
+                match mgr.save_profile(slot, &name, &records) {
+                    Ok(()) => {
+                        let mut resp = String::<512>::new();
+                        core::write!(resp, "OK: Profile saved to slot {}\r\n", slot).ok();
+                        CommandExecutionResult::SuccessText(resp)
+                    }
+                    Err(e) => {
+                        let mut resp = String::<64>::new();
+                        core::write!(resp, "ERR: Save profile failed: {:?}\r\n", e).ok();
+                        CommandExecutionResult::ErrorDynamic(resp)
+                    }
+                }
+            } else {
+                CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
+            }
+        }
+        HostCommand::ProfileLoad { slot } => {
+            let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
+            if let Some(ref mut mgr) = *flash_guard {
+                match mgr.load_profile(slot) {
+                    Ok(record) => {
+                        for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+                            let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
+                        }
+
+                        for ch in 0..ACTIVE_CHANNEL_COUNT {
+                            let rec = &record.channels[ch];
+                            let dir = match rec.direction {
+                                1 => ChannelDirection::Tx,
+                                2 => ChannelDirection::Rx,
+                                _ => ChannelDirection::Disabled,
+                            };
+                            let high_speed = rec.high_speed != 0;
+                            set_channel_direction(ch as u8, dir);
+                            set_channel_speed(ch as u8, high_speed);
+                            let _ = send_to_channel_ctrl(
+                                ch as u8,
+                                ChannelControlCmd::Configure {
+                                    direction: dir,
+                                    high_speed,
+                                },
+                            )
+                            .await;
+                        }
+
+                        for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+                            let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
+                        }
+
+                        let mut resp = String::<512>::new();
+                        core::write!(
+                            resp,
+                            "OK: Profile loaded from slot {} and applied\r\n",
+                            slot
+                        )
+                        .ok();
+                        CommandExecutionResult::SuccessText(resp)
+                    }
+                    Err(e) => {
+                        let mut resp = String::<64>::new();
+                        core::write!(resp, "ERR: Load profile failed: {:?}\r\n", e).ok();
+                        CommandExecutionResult::ErrorDynamic(resp)
+                    }
+                }
+            } else {
+                CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
+            }
+        }
+        HostCommand::ProfileBoot { slot } => {
+            let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
+            if let Some(ref mut mgr) = *flash_guard {
+                match mgr.set_boot_slot(slot) {
+                    Ok(()) => {
+                        let mut resp = String::<512>::new();
+                        core::write!(resp, "OK: Default boot profile set to slot {}\r\n", slot).ok();
+                        CommandExecutionResult::SuccessText(resp)
+                    }
+                    Err(e) => {
+                        let mut resp = String::<64>::new();
+                        core::write!(resp, "ERR: Set boot profile failed: {:?}\r\n", e).ok();
+                        CommandExecutionResult::ErrorDynamic(resp)
+                    }
+                }
+            } else {
+                CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
+            }
+        }
+        HostCommand::ProfileList => {
+            let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
+            if let Some(ref mut mgr) = *flash_guard {
+                let boot_slot = mgr.get_boot_slot();
+                let mut resp = String::<512>::new();
+                core::write!(resp, "PROFILES: Boot Slot: {:?}\r\n", boot_slot).ok();
+                for slot in 0..crate::flash_storage::MAX_PROFILE_SLOTS as u8 {
+                    match mgr.load_profile(slot) {
+                        Ok(rec) => {
+                            let name_str = core::str::from_utf8(&rec.name)
+                                .unwrap_or("Unknown")
+                                .trim_matches(char::from(0));
+                            core::write!(
+                                resp,
+                                "[Slot {}] ACTIVE \"{}\"\r\n",
+                                slot,
+                                name_str
+                            )
+                            .ok();
+                        }
+                        Err(_) => {
+                            core::write!(resp, "[Slot {}] EMPTY\r\n", slot).ok();
+                        }
+                    }
+                }
+                let _ = resp.push_str("OK: Profile list\r\n");
+                CommandExecutionResult::SuccessText(resp)
+            } else {
+                CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
+            }
         }
     }
 }

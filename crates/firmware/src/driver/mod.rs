@@ -1,7 +1,9 @@
+pub mod device;
 pub mod rx;
 pub mod tx;
 
 pub use arinc429_core::baud::ArincSpeed;
+pub use device::ChannelDevice;
 pub use rx::Arinc429Rx;
 pub use tx::Arinc429Tx;
 
