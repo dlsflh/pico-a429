@@ -6,7 +6,6 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod baud;
-pub mod bit;
 pub mod filter;
 pub mod label;
 pub mod parity;
@@ -15,9 +14,6 @@ pub mod word;
 
 // 常用类型直接顶层重导出
 pub use baud::{calculate_clkdiv_fixed, ArincSpeed};
-pub use bit::{
-    evaluate_bit_results, generate_bit_vectors, BitErrorCode, BitReport, BitStatus, BitVector,
-};
 pub use filter::{FilterError, FilterMode, LabelFilter};
 pub use label::Label;
 pub use parity::{apply_parity, check_parity, ParityMode};

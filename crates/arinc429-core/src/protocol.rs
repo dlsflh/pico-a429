@@ -19,8 +19,6 @@ pub mod frame_types {
     pub const CMD_ACK: u8    = 0x02;
     /// 异步告警与硬件总线故障事件
     pub const ASYNC_EVENT: u8 = 0x03;
-    /// 内建自测试 (BIT) 诊断评估报告
-    pub const BIT_REPORT: u8  = 0x04;
 }
 
 /// 状态标志位
