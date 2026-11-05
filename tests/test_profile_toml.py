@@ -29,9 +29,16 @@ class TestProfileToml(unittest.TestCase):
         self.assertEqual(len(parsed["channels"]), 12)
 
         # 抽样验证核心通道的方向与波特率保持一致
-        self.assertEqual(parsed["channels"][0], {"direction": "TX", "speed": "HIGH", "filter": []})
-        self.assertEqual(parsed["channels"][2], {"direction": "RX", "speed": "LOW", "filter": []})
-        self.assertEqual(parsed["channels"][6], {"direction": "DISABLED", "speed": "LOW", "filter": []})
+        self.assertEqual(
+            parsed["channels"][0], {"direction": "TX", "speed": "HIGH", "filter": []}
+        )
+        self.assertEqual(
+            parsed["channels"][2], {"direction": "RX", "speed": "LOW", "filter": []}
+        )
+        self.assertEqual(
+            parsed["channels"][6],
+            {"direction": "DISABLED", "speed": "LOW", "filter": []},
+        )
 
         # 验证批量下发指令生成 (未显式指定的通道默认 DISABLED)
         batch_spec = build_batch_spec(parsed["channels"])
