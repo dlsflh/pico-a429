@@ -192,7 +192,7 @@ async fn main(spawner: Spawner) {
         (channel_8_task, 8, sm2_0, p.PIN_16, p.PIN_17, ChannelDirection::Rx),
         (channel_9_task, 9, sm2_1, p.PIN_18, p.PIN_19, ChannelDirection::Rx),
         (channel_10_task, 10, sm2_2, p.PIN_20, p.PIN_21, ChannelDirection::Rx),
-        (channel_11_task, 11, sm2_3, p.PIN_22, p.PIN_23, ChannelDirection::Rx),
+        (channel_11_task, 11, sm2_3, p.PIN_26, p.PIN_27, ChannelDirection::Rx),
     ]);
 
     // 4. 若 Flash 存在设定的开机自启动 Profile，自动加载并应用
