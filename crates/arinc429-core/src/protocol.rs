@@ -187,8 +187,6 @@ pub enum HostCommand {
     SetSpeed { channel: u8, high_speed: bool },
     /// 切换推送模式: MODE <BIN|ASCII>
     SetMode { binary_mode: bool },
-    /// 执行内建自测试: BIT <tx_ch> <rx_ch>
-    RunBit { tx_channel: u8, rx_channel: u8 },
     /// 快速连通性测试心跳: PING
     Ping,
     /// 查询状态: STATUS [ch]
@@ -418,25 +416,6 @@ impl HostCommand {
             }
         }
 
-        if cmd.eq_ignore_ascii_case("BIT") {
-            let tx_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("tx_ch"))?;
-            let rx_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("rx_ch"))?;
-            let tx_channel = tx_str
-                .parse::<u8>()
-                .map_err(|_| CommandParseError::InvalidChannel)?;
-            let rx_channel = rx_str
-                .parse::<u8>()
-                .map_err(|_| CommandParseError::InvalidChannel)?;
-            return Ok(Self::RunBit {
-                tx_channel,
-                rx_channel,
-            });
-        }
-
         if cmd.eq_ignore_ascii_case("MODE") {
             let mode_str = parts
                 .next()
@@ -583,15 +562,6 @@ mod tests {
             HostCommand::ChannelFilter {
                 channel: 0,
                 action: FilterAction::Allow(Label::from_octal(0o310)),
-            }
-        );
-
-        let cmd4 = HostCommand::parse("BIT 0 1").unwrap();
-        assert_eq!(
-            cmd4,
-            HostCommand::RunBit {
-                tx_channel: 0,
-                rx_channel: 1
             }
         );
 
