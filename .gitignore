@@ -16,3 +16,12 @@ Thumbs.db
 *.uf2
 firmware/*.uf2
 
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+
