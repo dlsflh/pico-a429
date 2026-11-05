@@ -47,7 +47,10 @@ pico-429/
 ├── Cargo.toml                 # 工作空间根配置 (含 Dev/Release Profile 优化与 LTO)
 ├── .cargo/config.toml         # 目标 target: thumbv8m.main-none-eabihf 与链接脚本配置
 ├── tools/
-│   └── pico429.py             # 免编译 Python 极速工具 (支持 ping, status, send, listen, bit)
+│   ├── pico429.py             # 免编译 Python 极速工具 (支持 interactive, bit, config, speed, filter, mode 等)
+│   └── arinc429_codec.py      # 纯算法协议编解码库 (支持字打包、奇偶校验、CRC16-CCITT)
+├── tests/
+│   └── test_codec.py          # Python 协议与基准 BIT 向量单元测试套件
 ├── docs/
 │   ├── HARDWARE_MANUAL.md     # 硬件连线详细手册 (芯片引脚、分立电路、环回自测)
 │   └── USER_GUIDE.md          # 软件使用手册 (固件烧录、host-cli、串口命令、排错)
@@ -78,19 +81,27 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/pico-429-firmware 
 
 #### 方式 A：Python 极速工具（推荐，免编译，自动发现串口）
 ```bash
-# 1. 握手连通性测试 (PING -> PONG)
+# 1. 握手连通性测试 (PING -> PONG，RTT < 0.5ms)
 uv run --with pyserial python tools/pico429.py ping
 
 # 2. 查询通道状态
 uv run --with pyserial python tools/pico429.py status
 
-# 3. 执行硬件自收自发 BIT 闭环自测试 (GP0->GP2, GP1->GP3)
+# 3. 用户自驱动实时回环终端 (开启常驻会话，输入 1234 即时回显并计算 RTT < 1ms)
+uv run --with pyserial python tools/pico429.py interactive
+
+# 4. 执行硬件自收自发 BIT 闭环自测试 (GP0->GP2, GP1->GP3，RTT < 1ms)
 uv run --with pyserial python tools/pico429.py bit
 
-# 4. 发送单个构造字
+# 5. 动态配置通道启停与波特率切换
+uv run --with pyserial python tools/pico429.py config 0 --enable --dir TX --speed 100k
+uv run --with pyserial python tools/pico429.py speed 0 100k
+uv run --with pyserial python tools/pico429.py filter 1 --allow 310
+
+# 6. 发送单个构造字
 uv run --with pyserial python tools/pico429.py send --label 310 --data 0x1234
 
-# 5. 彩色监听总线数据流
+# 7. 彩色监听总线数据流
 uv run --with pyserial python tools/pico429.py listen
 ```
 
