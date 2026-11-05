@@ -19,24 +19,31 @@
    - TX 微码（11 条）+ RX 微码（20 条）= 31 条指令，单块 PIO 内存（32 字）一次性常驻装载，通道切换收发方向零动态重载开销；
 4. **$O(1)$ 高性能 Label 过滤器**：
    - 内置 256-bit 位图过滤引擎（仅占 32 字节 RAM），支持白名单、黑名单与全放行模式；
-5. **双上位机工具链与防死锁 USB CDC**：
+5. **免编译 Python 极速工具链与防死锁 USB CDC**：
    - USB CDC IN 写入增加 100ms 超时保护，RX 入队非阻塞，彻底消除 Windows `Write timeout`；
-   - 提供**免编译 Python 极速工具链 (`tools/pico429.py`)** 与 **Rust 官方 CLI (`arinc429-host-cli`)**。
+   - 提供**免编译 Python 极速工具链 (`tools/pico429.py`)**，支持 12 通道一键 TOML 载入、状态导出、片上 Flash 配置持久化与交互自检。
 
 ---
 
-## 二、 硬件引脚分配 (默认单卡 Channel 0 TX / Channel 1 RX)
+## 二、 硬件引脚分配 (12 通道物理引脚分布 GP0..GP23)
 
-| 物理引脚 | GPIO 编号 | 信号名称 | 信号方向 | 连接外部芯片引脚 | 功能说明 |
-| :---: | :---: | :---: | :---: | :---: | :--- |
-| **Pin 1** | **GP0** | `TX_A` | 输出 (MCU $\to$ Driver) | HI-8585 `TXINA` | 逻辑 1 时输出前半周正脉冲 |
-| **Pin 2** | **GP1** | `TX_B` | 输出 (MCU $\to$ Driver) | HI-8585 `TXINB` | 逻辑 0 时输出前半周正脉冲 |
-| **Pin 3** | **GND** | 地线 | - | 驱动板 GND | 必须共地 |
-| **Pin 4** | **GP2** | `RX_A` | 输入 (Receiver $\to$ MCU) | HI-8588 `ROUTA` | 总线为 $+10\text{V}$ 时输出高电平 |
-| **Pin 5** | **GP3** | `RX_B` | 输入 (Receiver $\to$ MCU) | HI-8588 `ROUTB` | 总线为 $-10\text{V}$ 时输出高电平 |
-| **Pin 36**| **3V3** | 电源 | 输出 (3.3V) | 接收芯片 VCC | 可供电给 3.3V 接收比较器 |
+| 通道 | 状态机分配 | 物理引脚 A (Pin A) | 物理引脚 B (Pin B) | 出厂默认方向 | 默认速率 |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **CH0** | `PIO0_SM0` | **GP0** (Pin 1) | **GP1** (Pin 2) | TX (发送) | High (100k) |
+| **CH1** | `PIO0_SM1` | **GP2** (Pin 4) | **GP3** (Pin 5) | RX (接收) | High (100k) |
+| **CH2** | `PIO0_SM2` | **GP4** (Pin 6) | **GP5** (Pin 7) | RX (接收) | High (100k) |
+| **CH3** | `PIO0_SM3` | **GP6** (Pin 9) | **GP7** (Pin 10) | RX (接收) | High (100k) |
+| **CH4** | `PIO1_SM0` | **GP8** (Pin 11) | **GP9** (Pin 12) | RX (接收) | High (100k) |
+| **CH5** | `PIO1_SM1` | **GP10** (Pin 14) | **GP11** (Pin 15) | RX (接收) | High (100k) |
+| **CH6** | `PIO1_SM2` | **GP12** (Pin 16) | **GP13** (Pin 17) | RX (接收) | High (100k) |
+| **CH7** | `PIO1_SM3` | **GP14** (Pin 19) | **GP15** (Pin 20) | RX (接收) | High (100k) |
+| **CH8** | `PIO2_SM0` | **GP16** (Pin 21) | **GP17** (Pin 22) | RX (接收) | High (100k) |
+| **CH9** | `PIO2_SM1` | **GP18** (Pin 24) | **GP19** (Pin 25) | RX (接收) | High (100k) |
+| **CH10** | `PIO2_SM2` | **GP20** (Pin 26) | **GP21** (Pin 27) | RX (接收) | High (100k) |
+| **CH11** | `PIO2_SM3` | **GP22** (Pin 29) | **GP23** (Pin 30) | RX (接收) | High (100k) |
 
-> **自测短接环回**：在无收发芯片时，可直接用杜邦线短接 `GP0 -> GP2` 与 `GP1 -> GP3` 进行硬件 BIT 环回自测。
+> **出厂默认安全状态**：CH0 为 TX, CH1 为 RX（保持 GP0..GP3 双通道测试夹具兼容），CH2..11 为被动监听 RX（高阻弱下拉，电气绝对安全）。
+> **自测短接环回**：在无外部收发芯片时，可直接用杜邦线短接 `GP0 -> GP2` 与 `GP1 -> GP3` 执行单卡闭环 BIT。
 
 ---
 
@@ -47,27 +54,30 @@ pico-429/
 ├── Cargo.toml                 # 工作空间根配置 (含 Dev/Release Profile 优化与 LTO)
 ├── .cargo/config.toml         # 目标 target: thumbv8m.main-none-eabihf 与链接脚本配置
 ├── tools/
-│   ├── pico429.py             # 免编译 Python 极速工具 (支持 interactive, bit, config, speed, filter, mode 等)
+│   ├── pico429.py             # 免编译 Python 极速工具 (支持 profile, interactive, bit, config, speed, filter 等)
 │   └── arinc429_codec.py      # 纯算法协议编解码库 (支持字打包、奇偶校验、CRC16-CCITT)
 ├── tests/
-│   └── test_codec.py          # Python 协议与基准 BIT 向量单元测试套件
+│   ├── test_codec.py          # Python 协议与基准 BIT 向量单元测试
+│   └── test_profile_toml.py   # Python 12 通道配置方案与 TOML 编解码行为测试
 ├── docs/
 │   ├── HARDWARE_MANUAL.md     # 硬件连线详细手册 (芯片引脚、分立电路、环回自测)
-│   └── USER_GUIDE.md          # 软件使用手册 (固件烧录、host-cli、串口命令、排错)
-├── crates/
-│   ├── arinc429-core/         # 纯 no_std 核心协议库 (32位字格式、奇偶校验、位图过滤)
-│   ├── firmware/              # Pico 2 固件 (Embassy 异步协程、PIO 微代码、USB CDC)
-│   └── host-cli/              # PC 上位机命令行调试与分析工具 (支持抓包与 BIT 环回)
+│   └── USER_GUIDE.md          # 软件使用手册 (固件烧录、串口命令、TOML 配置、排错)
+└── crates/
+    ├── arinc429-core/         # 纯 no_std 核心协议库 (32位字格式、奇偶校验、位图过滤、控制命令解析)
+    └── firmware/              # Pico 2 固件 (Embassy 异步协程、PIO 微代码、片上 Flash、USB CDC)
 ```
 
 ---
 
 ## 四、 快速上手指南
 
-### 1. 运行核心协议栈单元测试
+### 1. 运行核心单元测试
 ```bash
-cargo test -p arinc429-core
-cargo test -p arinc429-host-cli
+# 1. 运行 Rust 协议核心测试
+cargo test -p arinc429-core --no-default-features
+
+# 2. 运行 Python 上位机协议与 TOML 配置测试
+uv run python -m unittest discover tests
 ```
 
 ### 2. 编译与生成 UF2 固件
@@ -77,23 +87,21 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/pico-429-firmware 
 ```
 按住 Pico 2 W 上的 **BOOTSEL** 按钮插入 USB，将 `pico429.uf2` 拖入弹出的 U 盘盘符完成烧录。
 
-### 3. 上位机交互与自检
-
-#### 方式 A：Python 极速工具（推荐，免编译，自动发现串口）
+### 3. Python 极速工具使用指南 (推荐，免编译，自动识别串口)
 ```bash
 # 1. 握手连通性测试 (PING -> PONG，RTT < 0.5ms)
 uv run --with pyserial python tools/pico429.py ping
 
-# 2. 查询通道状态
+# 2. 查询 12 通道在线状态
 uv run --with pyserial python tools/pico429.py status
 
-# 3. 用户自驱动实时回环终端 (开启常驻会话，输入 1234 即时回显并计算 RTT < 1ms)
-uv run --with pyserial python tools/pico429.py interactive
-
-# 4. 执行硬件自收自发 BIT 闭环自测试 (GP0->GP2, GP1->GP3，RTT < 1ms)
+# 3. 硬件自收自发 BIT 闭环自测试 (GP0->GP2, GP1->GP3，RTT < 1ms)
 uv run --with pyserial python tools/pico429.py bit
 
-# 5. 动态配置通道启停与波特率切换 (支持 high / low 与 100k / 12.5k)
+# 4. 用户自驱动实时回环终端 (开启常驻会话，输入载荷即时回显)
+uv run --with pyserial python tools/pico429.py interactive
+
+# 5. 动态单通道启停与速率切换 (速率支持 high / low)
 uv run --with pyserial python tools/pico429.py config 0 --enable --dir TX --speed high
 uv run --with pyserial python tools/pico429.py speed 0 low
 uv run --with pyserial python tools/pico429.py filter 1 --allow 310
@@ -122,11 +130,4 @@ uv run --with pyserial python tools/pico429.py send --label 310 --data 0x1234
 
 # 8. 彩色监听总线数据流
 uv run --with pyserial python tools/pico429.py listen
-```
-
-#### 方式 B：Rust 官方 CLI
-```bash
-cargo run --package arinc429-host-cli -- status --port COM3
-cargo run --package arinc429-host-cli -- bit --port COM3 --tx 0 --rx 1
-cargo run --package arinc429-host-cli -- listen --port COM3
 ```

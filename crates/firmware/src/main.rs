@@ -21,9 +21,7 @@ use embassy_usb::Builder;
 use arinc429_core::baud::ArincSpeed;
 use arinc429_core::filter::LabelFilter;
 
-use crate::channel::{
-    set_channel_direction, ChannelControlCmd, ChannelDirection, ACTIVE_CHANNEL_COUNT,
-};
+use crate::channel::ChannelDirection;
 use crate::driver::ChannelDevice;
 use crate::flash_storage::{FlashProfileManager, FLASH_CAPACITY, FLASH_MGR};
 use crate::usb_service::{usb_cdc_rx_task, usb_cdc_tx_task, usb_task};
@@ -155,179 +153,54 @@ async fn main(spawner: Spawner) {
     let tx_2 = TX_2.init(c2.load_program(&tx_prog));
     let rx_2 = RX_2.init(c2.load_program(&rx_prog));
 
-    // 出厂初始状态：CH0=TX High, CH1=RX High, CH2..11=RX High (被动监听安全模式)
-    let dev0 = ChannelDevice::new(
-        &mut c0,
-        sm0_0,
-        p.PIN_0,
-        p.PIN_1,
-        tx_0,
-        rx_0,
-        ChannelDirection::Tx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev1 = ChannelDevice::new(
-        &mut c0,
-        sm0_1,
-        p.PIN_2,
-        p.PIN_3,
-        tx_0,
-        rx_0,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev2 = ChannelDevice::new(
-        &mut c0,
-        sm0_2,
-        p.PIN_4,
-        p.PIN_5,
-        tx_0,
-        rx_0,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev3 = ChannelDevice::new(
-        &mut c0,
-        sm0_3,
-        p.PIN_6,
-        p.PIN_7,
-        tx_0,
-        rx_0,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
+    macro_rules! spawn_channels {
+        ($spawner:expr, $common:expr, $tx_prog:expr, $rx_prog:expr, [
+            $(($task:ident, $ch:expr, $sm:expr, $pin_a:expr, $pin_b:expr, $dir:expr)),* $(,)?
+        ]) => {
+            $(
+                let dev = ChannelDevice::new(
+                    &mut $common,
+                    $sm,
+                    $pin_a,
+                    $pin_b,
+                    $tx_prog,
+                    $rx_prog,
+                    $dir,
+                    ArincSpeed::High100k,
+                    LabelFilter::new_accept_all(),
+                );
+                $spawner.spawn($task($ch, dev).unwrap());
+            )*
+        };
+    }
 
-    let dev4 = ChannelDevice::new(
-        &mut c1,
-        sm1_0,
-        p.PIN_8,
-        p.PIN_9,
-        tx_1,
-        rx_1,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev5 = ChannelDevice::new(
-        &mut c1,
-        sm1_1,
-        p.PIN_10,
-        p.PIN_11,
-        tx_1,
-        rx_1,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev6 = ChannelDevice::new(
-        &mut c1,
-        sm1_2,
-        p.PIN_12,
-        p.PIN_13,
-        tx_1,
-        rx_1,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev7 = ChannelDevice::new(
-        &mut c1,
-        sm1_3,
-        p.PIN_14,
-        p.PIN_15,
-        tx_1,
-        rx_1,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
+    spawn_channels!(spawner, c0, tx_0, rx_0, [
+        (channel_0_task, 0, sm0_0, p.PIN_0, p.PIN_1, ChannelDirection::Tx),
+        (channel_1_task, 1, sm0_1, p.PIN_2, p.PIN_3, ChannelDirection::Rx),
+        (channel_2_task, 2, sm0_2, p.PIN_4, p.PIN_5, ChannelDirection::Rx),
+        (channel_3_task, 3, sm0_3, p.PIN_6, p.PIN_7, ChannelDirection::Rx),
+    ]);
 
-    let dev8 = ChannelDevice::new(
-        &mut c2,
-        sm2_0,
-        p.PIN_16,
-        p.PIN_17,
-        tx_2,
-        rx_2,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev9 = ChannelDevice::new(
-        &mut c2,
-        sm2_1,
-        p.PIN_18,
-        p.PIN_19,
-        tx_2,
-        rx_2,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev10 = ChannelDevice::new(
-        &mut c2,
-        sm2_2,
-        p.PIN_20,
-        p.PIN_21,
-        tx_2,
-        rx_2,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
-    let dev11 = ChannelDevice::new(
-        &mut c2,
-        sm2_3,
-        p.PIN_22,
-        p.PIN_23,
-        tx_2,
-        rx_2,
-        ChannelDirection::Rx,
-        ArincSpeed::High100k,
-        LabelFilter::new_accept_all(),
-    );
+    spawn_channels!(spawner, c1, tx_1, rx_1, [
+        (channel_4_task, 4, sm1_0, p.PIN_8, p.PIN_9, ChannelDirection::Rx),
+        (channel_5_task, 5, sm1_1, p.PIN_10, p.PIN_11, ChannelDirection::Rx),
+        (channel_6_task, 6, sm1_2, p.PIN_12, p.PIN_13, ChannelDirection::Rx),
+        (channel_7_task, 7, sm1_3, p.PIN_14, p.PIN_15, ChannelDirection::Rx),
+    ]);
 
-    spawner.spawn(channel_0_task(0, dev0).unwrap());
-    spawner.spawn(channel_1_task(1, dev1).unwrap());
-    spawner.spawn(channel_2_task(2, dev2).unwrap());
-    spawner.spawn(channel_3_task(3, dev3).unwrap());
-    spawner.spawn(channel_4_task(4, dev4).unwrap());
-    spawner.spawn(channel_5_task(5, dev5).unwrap());
-    spawner.spawn(channel_6_task(6, dev6).unwrap());
-    spawner.spawn(channel_7_task(7, dev7).unwrap());
-    spawner.spawn(channel_8_task(8, dev8).unwrap());
-    spawner.spawn(channel_9_task(9, dev9).unwrap());
-    spawner.spawn(channel_10_task(10, dev10).unwrap());
-    spawner.spawn(channel_11_task(11, dev11).unwrap());
+    spawn_channels!(spawner, c2, tx_2, rx_2, [
+        (channel_8_task, 8, sm2_0, p.PIN_16, p.PIN_17, ChannelDirection::Rx),
+        (channel_9_task, 9, sm2_1, p.PIN_18, p.PIN_19, ChannelDirection::Rx),
+        (channel_10_task, 10, sm2_2, p.PIN_20, p.PIN_21, ChannelDirection::Rx),
+        (channel_11_task, 11, sm2_3, p.PIN_22, p.PIN_23, ChannelDirection::Rx),
+    ]);
 
     // 4. 若 Flash 存在设定的开机自启动 Profile，自动加载并应用
     if let Some(slot) = boot_slot {
         let mut guard = FLASH_MGR.lock().await;
         if let Some(ref mut m) = *guard {
             if let Ok(record) = m.load_profile(slot) {
-                for ch in 0..ACTIVE_CHANNEL_COUNT {
-                    let rec = &record.channels[ch];
-                    let dir = match rec.direction {
-                        1 => ChannelDirection::Tx,
-                        2 => ChannelDirection::Rx,
-                        _ => ChannelDirection::Disabled,
-                    };
-                    let high_speed = rec.high_speed != 0;
-                    set_channel_direction(ch as u8, dir);
-                    channel::set_channel_speed(ch as u8, high_speed);
-                    let _ = channel::send_to_channel_ctrl(
-                        ch as u8,
-                        ChannelControlCmd::Configure {
-                            direction: dir,
-                            high_speed,
-                        },
-                    )
-                    .await;
-                }
+                crate::usb_service::apply_all_channels(&record.directions, &record.speeds).await;
             }
         }
     }

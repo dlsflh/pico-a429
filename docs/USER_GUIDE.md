@@ -50,47 +50,51 @@ uv run --with pyserial python tools/pico429.py filter 1 --clear
 # 8. 切换上报模式 (BIN / ASCII)
 uv run --with pyserial python tools/pico429.py mode ascii
 
-# 9. 发送单个构造字 (Label 310, 数据 0x1234)
+# 9. 12 通道 TOML 配置文件管理与一键加载 (模式 B)
+# 导出当前固件 12 通道配置为 TOML 模板
+uv run --with pyserial python tools/pico429.py profile dump -o my_bench.toml
+
+# 按照 TOML 配置文件一键原子重构所有 12 通道 (安全暂停 -> 应用 -> 恢复)
+uv run --with pyserial python tools/pico429.py profile apply my_bench.toml
+
+# 将当前配置持久化保存至片上 Flash 存储槽位 (0..3)
+uv run --with pyserial python tools/pico429.py profile save 0 --name "Avionics_Bench"
+
+# 列出片上 Flash 中的所有配置方案与开机自启动槽位
+uv run --with pyserial python tools/pico429.py profile list
+
+# 切换激活指定的片上 Flash 槽位
+uv run --with pyserial python tools/pico429.py profile load 0
+
+# 设置指定槽位为上电默认自启动
+uv run --with pyserial python tools/pico429.py profile boot 0
+
+# 10. 发送单个构造字 (Label 310, 数据 0x1234)
 uv run --with pyserial python tools/pico429.py send --label 310 --data 0x1234
 
-# 10. 彩色流式监听并解码接收数据
+# 11. 彩色流式监听并解码接收数据
 uv run --with pyserial python tools/pico429.py listen
 ```
 
 ---
 
-### 工具 B：Rust 官方 CLI 分析工具 (`arinc429-host-cli`)
-```bash
-# 查询通道状态
-cargo run --package arinc429-host-cli -- status --port COM3
-
-# 硬件自收自发 BIT 自检
-cargo run --package arinc429-host-cli -- bit --port COM3 --tx 0 --rx 1
-
-# 实时监听 USB 串口
-cargo run --package arinc429-host-cli -- listen --port COM3
-
-# 发送构造字
-cargo run --package arinc429-host-cli -- send --port COM3 --label 310 --sdi 1 --data 0x1234 --ssm 3
-
-# 切换通道波特率
-cargo run --package arinc429-host-cli -- speed --port COM3 --channel 0 --speed 12.5k
-
-# 白名单放行 Label
-cargo run --package arinc429-host-cli -- filter --port COM3 --channel 0 --allow 310
-```
-
----
-
-### 工具 C：通用串口助手 (PuTTY / SSCOM / XCOM 等)
+### 工具 B：通用串口助手 (PuTTY / SSCOM / XCOM 等)
 串口波特率配置为 115200（固件默认 ASCII 交互）：
 
 | 指令格式 | 功能说明 | 示例 | 预期响应 |
 | :--- | :--- | :--- | :--- |
 | `PING` | 极速连通性心跳 | `PING` | `PONG` |
-| `STATUS [ch]` | 查询固件状态与当前通道方向 | `STATUS` | `STATUS: Pico-429 Online [CH0: Tx, CH1: Rx]. Mode: ASCII` |
+| `STATUS [ch]` | 查询固件状态与当前通道方向 | `STATUS` | `STATUS: Pico-429 12CH Online...` |
 | `MODE <BIN\|ASCII>` | 切换数据上报格式 | `MODE BIN` | `OK: Switched to BINARY mode` |
-| `CHCFG <ch> SPEED <100K\|12K5>` | 切换指定通道波特率 | `CHCFG 0 SPEED 100K` | `OK: Channel 0 set to 100K` |
+| `PAUSE` | 安全挂起全部 12 通道物理收发 | `PAUSE` | `OK: All channels paused` |
+| `RESUME` | 恢复全部 12 通道物理收发 | `RESUME` | `OK: All channels resumed` |
+| `CFGDUMP` | 导出全部 12 通道紧凑方向与速率 | `CFGDUMP` | `CFGDUMP: 0:TX:HIGH 1:RX:HIGH ...` |
+| `CFGBATCH <spec>` | 批量原子应用通道重构 | `CFGBATCH 0=TX:HIGH,1=RX:HIGH` | `OK: Batch configured 2 channels` |
+| `PROFILE LIST` | 列出片上 Flash 4 个槽位与自启动 | `PROFILE LIST` | `PROFILES: Boot Slot: Some(0)...` |
+| `PROFILE SAVE <slot> [name]` | 保存当前配置至指定 Flash 槽位 | `PROFILE SAVE 0 Bench` | `OK: Profile saved to slot 0` |
+| `PROFILE LOAD <slot>` | 从 Flash 槽位加载并激活配置 | `PROFILE LOAD 0` | `OK: Profile loaded from slot 0` |
+| `PROFILE BOOT <slot>` | 设置上电默认自启动 Flash 槽位 | `PROFILE BOOT 0` | `OK: Default boot profile set to slot 0` |
+| `CHCFG <ch> SPEED <HIGH\|LOW>` | 切换指定通道波特率 | `CHCFG 0 SPEED HIGH` | `OK: Channel 0 set to HIGH` |
 | `CHCFG <ch> FILTER ALLOW <oct>` | 白名单放行指定 Label | `CHCFG 1 FILTER ALLOW 310` | `OK: Filter rule Allowed on Channel 1` |
 | `CHCFG <ch> FILTER BLOCK <oct>` | 黑名单屏蔽指定 Label | `CHCFG 1 FILTER BLOCK 377` | `OK: Filter rule Blocked on Channel 1` |
 | `CHCFG <ch> FILTER CLEAR` | 清空过滤规则 | `CHCFG 1 FILTER CLEAR` | `OK: Filter rule Cleared on Channel 1` |
@@ -99,10 +103,11 @@ cargo run --package arinc429-host-cli -- filter --port COM3 --channel 0 --allow 
 
 ---
 
-## 三、 硬件引脚参考与自检接线
+## 三、 硬件引脚分配与环回接线
 
-* **默认通道映射**：
-  * Channel 0 (TX): `GP0` (TX_A), `GP1` (TX_B)
-  * Channel 1 (RX): `GP2` (RX_A), `GP3` (RX_B)
+* **12 通道物理引脚分布**：
+  * Channel 0: `GP0` (Pin A), `GP1` (Pin B) [出厂默认: TX]
+  * Channel 1: `GP2` (Pin A), `GP3` (Pin B) [出厂默认: RX]
+  * Channel 2..11: `GP4..GP23`（相邻奇偶引脚对）[出厂默认: RX 被动监听]
 * **免收发芯片自测环回**：
   使用杜邦线短接 `GP0 -> GP2` 与 `GP1 -> GP3`，运行 `python tools/pico429.py bit` 即可完成完整电气闭环自检。

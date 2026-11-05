@@ -1092,56 +1092,19 @@ def cmd_profile_list(args: argparse.Namespace) -> None:
         ser.close()
 
 
-def cmd_profile_save(args: argparse.Namespace) -> None:
-    """将当前 12 通道配置持久化写入片上 Flash 槽位。"""
+def cmd_profile_slot(args: argparse.Namespace) -> None:
+    """处理片上 Flash 槽位操作 (SAVE, LOAD, BOOT)。"""
+    action = args.profile_action.upper()
+    name_suffix = f" {args.name.strip()}" if action == "SAVE" and hasattr(args, "name") else ""
+    cmd = f"PROFILE {action} {args.slot}{name_suffix}"
     port = find_pico_port(args.port)
-    name = args.name.strip()
-    cmd = f"PROFILE SAVE {args.slot} {name}"
-    print(f"[*] 连接 {port} 并写入片上 Flash Slot {args.slot} (名称: '{name}')...")
     ser = open_serial(port, timeout=0.5)
-
     try:
         send_command_wait(ser, "MODE ASCII", timeout=1.0)
         resp = send_command_wait(ser, cmd, timeout=2.0)
         print(f"[\033[32mOK\033[0m] {resp}")
     except (serial.SerialException, TimeoutError, OSError) as e:
-        print(f"[\033[31mFAIL\033[0m] 保存方案失败: {e}", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        ser.close()
-
-
-def cmd_profile_load(args: argparse.Namespace) -> None:
-    """从片上 Flash 槽位加载并激活 12 通道配置。"""
-    port = find_pico_port(args.port)
-    cmd = f"PROFILE LOAD {args.slot}"
-    print(f"[*] 连接 {port} 并激活片上 Flash Slot {args.slot} 配置...")
-    ser = open_serial(port, timeout=0.5)
-
-    try:
-        send_command_wait(ser, "MODE ASCII", timeout=1.0)
-        resp = send_command_wait(ser, cmd, timeout=2.0)
-        print(f"[\033[32mOK\033[0m] {resp}")
-    except (serial.SerialException, TimeoutError, OSError) as e:
-        print(f"[\033[31mFAIL\033[0m] 加载方案失败: {e}", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        ser.close()
-
-
-def cmd_profile_boot(args: argparse.Namespace) -> None:
-    """设置上电默认自启动的 Flash 槽位。"""
-    port = find_pico_port(args.port)
-    cmd = f"PROFILE BOOT {args.slot}"
-    print(f"[*] 连接 {port} 设置上电自启动槽位为 Slot {args.slot}...")
-    ser = open_serial(port, timeout=0.5)
-
-    try:
-        send_command_wait(ser, "MODE ASCII", timeout=1.0)
-        resp = send_command_wait(ser, cmd, timeout=2.0)
-        print(f"[\033[32mOK\033[0m] {resp}")
-    except (serial.SerialException, TimeoutError, OSError) as e:
-        print(f"[\033[31mFAIL\033[0m] 设置自启动槽位失败: {e}", file=sys.stderr)
+        print(f"[\033[31mFAIL\033[0m] PROFILE {action} 失败: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
         ser.close()
@@ -1317,12 +1280,8 @@ def main() -> None:
             cmd_profile_dump(args)
         elif args.profile_action == "list":
             cmd_profile_list(args)
-        elif args.profile_action == "save":
-            cmd_profile_save(args)
-        elif args.profile_action == "load":
-            cmd_profile_load(args)
-        elif args.profile_action == "boot":
-            cmd_profile_boot(args)
+        elif args.profile_action in ("save", "load", "boot"):
+            cmd_profile_slot(args)
 
 
 if __name__ == "__main__":

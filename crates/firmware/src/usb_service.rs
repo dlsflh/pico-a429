@@ -249,6 +249,48 @@ async fn handle_channel_filter(channel: u8, action: FilterAction) -> CommandExec
     CommandExecutionResult::SuccessText(resp)
 }
 
+/// 原子暂停全部 12 通道物理收发
+pub async fn pause_all_channels() {
+    for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+        let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
+    }
+}
+
+/// 恢复全部 12 通道物理收发
+pub async fn resume_all_channels() {
+    for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+        let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
+    }
+}
+
+/// 配置单通道方向与速率
+pub async fn apply_channel_config(channel: u8, dir: ChannelDirection, high_speed: bool) {
+    set_channel_direction(channel, dir);
+    set_channel_speed(channel, high_speed);
+    let _ = send_to_channel_ctrl(
+        channel,
+        ChannelControlCmd::Configure {
+            direction: dir,
+            high_speed,
+        },
+    )
+    .await;
+}
+
+/// 批量原子应用 12 通道配置 (暂停 -> 配置 -> 恢复)
+pub async fn apply_all_channels(dirs: &[u8; 12], speeds: &[u8; 12]) {
+    pause_all_channels().await;
+    for ch in 0..ACTIVE_CHANNEL_COUNT {
+        let dir = match dirs[ch] {
+            1 => ChannelDirection::Tx,
+            2 => ChannelDirection::Rx,
+            _ => ChannelDirection::Disabled,
+        };
+        apply_channel_config(ch as u8, dir, speeds[ch] != 0).await;
+    }
+    resume_all_channels().await;
+}
+
 /// 业务执行器：纯状态机与消息派发逻辑 (可直接用于宿主单元测试)
 pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
     match cmd {
@@ -281,13 +323,7 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 ChannelDirection::Rx
             };
 
-            set_channel_direction(channel, requested_dir);
-            set_channel_speed(channel, high_speed);
-            let cmd = ChannelControlCmd::Configure {
-                direction: requested_dir,
-                high_speed,
-            };
-            let _ = send_to_channel_ctrl(channel, cmd).await;
+            apply_channel_config(channel, requested_dir, high_speed).await;
 
             let mut resp = String::<512>::new();
             core::write!(
@@ -311,18 +347,13 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 return err;
             }
             let dir = channel_direction(channel).unwrap_or(ChannelDirection::Disabled);
-            set_channel_speed(channel, high_speed);
-            let cmd = ChannelControlCmd::Configure {
-                direction: dir,
-                high_speed,
-            };
-            let _ = send_to_channel_ctrl(channel, cmd).await;
+            apply_channel_config(channel, dir, high_speed).await;
             let mut resp = String::<512>::new();
             core::write!(
                 resp,
                 "OK: Channel {} set to {}\r\n",
                 channel,
-                if high_speed { "100K" } else { "12.5K" }
+                if high_speed { "HIGH" } else { "LOW" }
             )
             .ok();
             CommandExecutionResult::SuccessText(resp)
@@ -452,17 +483,13 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             CommandExecutionResult::SuccessText(resp)
         }
         HostCommand::PauseAll => {
-            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-                let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
-            }
+            pause_all_channels().await;
             let mut resp = String::<512>::new();
             let _ = resp.push_str("OK: All channels paused\r\n");
             CommandExecutionResult::SuccessText(resp)
         }
         HostCommand::ResumeAll => {
-            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-                let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
-            }
+            resume_all_channels().await;
             let mut resp = String::<512>::new();
             let _ = resp.push_str("OK: All channels resumed\r\n");
             CommandExecutionResult::SuccessText(resp)
@@ -484,53 +511,50 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             CommandExecutionResult::SuccessText(resp)
         }
         HostCommand::BatchConfigure { spec } => {
-            // 1. 暂停所有通道
-            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-                let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
+            let mut dirs = [0u8; 12];
+            let mut speeds = [1u8; 12];
+            for ch in 0..ACTIVE_CHANNEL_COUNT {
+                dirs[ch] = match channel_direction(ch as u8).unwrap_or(ChannelDirection::Disabled) {
+                    ChannelDirection::Tx => 1,
+                    ChannelDirection::Rx => 2,
+                    _ => 0,
+                };
+                speeds[ch] = if channel_is_high_speed(ch as u8) { 1 } else { 0 };
             }
 
             let mut count = 0;
             for token in spec.split(',') {
                 let mut kv = token.split('=');
                 if let (Some(ch_str), Some(val_str)) = (kv.next(), kv.next()) {
-                    if let Ok(ch) = ch_str.trim().parse::<u8>() {
-                        if (ch as usize) < ACTIVE_CHANNEL_COUNT {
+                    if let Ok(ch) = ch_str.trim().parse::<usize>() {
+                        if ch < ACTIVE_CHANNEL_COUNT {
                             let mut val_parts = val_str.split(':');
                             let dir_str = val_parts.next().unwrap_or("DISABLED");
                             let speed_str = val_parts.next().unwrap_or("HIGH");
 
-                            let dir = if dir_str.eq_ignore_ascii_case("TX") {
-                                ChannelDirection::Tx
+                            dirs[ch] = if dir_str.eq_ignore_ascii_case("TX") {
+                                1
                             } else if dir_str.eq_ignore_ascii_case("RX") {
-                                ChannelDirection::Rx
+                                2
                             } else {
-                                ChannelDirection::Disabled
+                                0
                             };
 
-                            let high_speed = !speed_str.eq_ignore_ascii_case("LOW")
-                                && !speed_str.eq_ignore_ascii_case("12K5")
-                                && !speed_str.eq_ignore_ascii_case("12.5K");
-
-                            set_channel_direction(ch, dir);
-                            set_channel_speed(ch, high_speed);
-                            let _ = send_to_channel_ctrl(
-                                ch,
-                                ChannelControlCmd::Configure {
-                                    direction: dir,
-                                    high_speed,
-                                },
-                            )
-                            .await;
+                            speeds[ch] = if speed_str.eq_ignore_ascii_case("LOW")
+                                || speed_str.eq_ignore_ascii_case("12K5")
+                                || speed_str.eq_ignore_ascii_case("12.5K")
+                            {
+                                0
+                            } else {
+                                1
+                            };
                             count += 1;
                         }
                     }
                 }
             }
 
-            // 2. 恢复所有通道
-            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-                let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
-            }
+            apply_all_channels(&dirs, &speeds).await;
 
             let mut resp = String::<512>::new();
             core::write!(resp, "OK: Batch configured {} channels\r\n", count).ok();
@@ -539,19 +563,18 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
         HostCommand::ProfileSave { slot, name } => {
             let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
             if let Some(ref mut mgr) = *flash_guard {
-                let mut records = [crate::flash_storage::ChannelConfigRecord::default(); 12];
+                let mut dirs = [0u8; 12];
+                let mut speeds = [1u8; 12];
                 for ch in 0..ACTIVE_CHANNEL_COUNT {
-                    let dir = channel_direction(ch as u8).unwrap_or(ChannelDirection::Disabled);
-                    records[ch].direction = match dir {
-                        ChannelDirection::Disabled => 0,
+                    dirs[ch] = match channel_direction(ch as u8).unwrap_or(ChannelDirection::Disabled) {
                         ChannelDirection::Tx => 1,
                         ChannelDirection::Rx => 2,
+                        _ => 0,
                     };
-                    records[ch].high_speed = if channel_is_high_speed(ch as u8) { 1 } else { 0 };
-                    records[ch].filter_mode = 0;
+                    speeds[ch] = if channel_is_high_speed(ch as u8) { 1 } else { 0 };
                 }
 
-                match mgr.save_profile(slot, &name, &records) {
+                match mgr.save_profile(slot, &name, &dirs, &speeds) {
                     Ok(()) => {
                         let mut resp = String::<512>::new();
                         core::write!(resp, "OK: Profile saved to slot {}\r\n", slot).ok();
@@ -572,34 +595,7 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             if let Some(ref mut mgr) = *flash_guard {
                 match mgr.load_profile(slot) {
                     Ok(record) => {
-                        for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-                            let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
-                        }
-
-                        for ch in 0..ACTIVE_CHANNEL_COUNT {
-                            let rec = &record.channels[ch];
-                            let dir = match rec.direction {
-                                1 => ChannelDirection::Tx,
-                                2 => ChannelDirection::Rx,
-                                _ => ChannelDirection::Disabled,
-                            };
-                            let high_speed = rec.high_speed != 0;
-                            set_channel_direction(ch as u8, dir);
-                            set_channel_speed(ch as u8, high_speed);
-                            let _ = send_to_channel_ctrl(
-                                ch as u8,
-                                ChannelControlCmd::Configure {
-                                    direction: dir,
-                                    high_speed,
-                                },
-                            )
-                            .await;
-                        }
-
-                        for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-                            let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
-                        }
-
+                        apply_all_channels(&record.directions, &record.speeds).await;
                         let mut resp = String::<512>::new();
                         core::write!(
                             resp,
