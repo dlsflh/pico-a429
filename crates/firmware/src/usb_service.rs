@@ -449,9 +449,6 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 }
             }
         }
-        HostCommand::RunBit { .. } => CommandExecutionResult::ErrorStatic(
-            "ERR: On-device BIT disabled. Perform loopback verification via host\r\n",
-        ),
         HostCommand::QueryStatus { channel } => {
             let mut resp = String::<512>::new();
             if let Some(ch) = channel {
@@ -561,8 +558,9 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             CommandExecutionResult::SuccessText(resp)
         }
         HostCommand::ProfileSave { slot, name } => {
+            pause_all_channels().await;
             let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
-            if let Some(ref mut mgr) = *flash_guard {
+            let result = if let Some(ref mut mgr) = *flash_guard {
                 let mut dirs = [0u8; 12];
                 let mut speeds = [1u8; 12];
                 for ch in 0..ACTIVE_CHANNEL_COUNT {
@@ -588,7 +586,9 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 }
             } else {
                 CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
-            }
+            };
+            resume_all_channels().await;
+            result
         }
         HostCommand::ProfileLoad { slot } => {
             let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
@@ -616,8 +616,9 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             }
         }
         HostCommand::ProfileBoot { slot } => {
+            pause_all_channels().await;
             let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
-            if let Some(ref mut mgr) = *flash_guard {
+            let result = if let Some(ref mut mgr) = *flash_guard {
                 match mgr.set_boot_slot(slot) {
                     Ok(()) => {
                         let mut resp = String::<512>::new();
@@ -632,7 +633,9 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 }
             } else {
                 CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
-            }
+            };
+            resume_all_channels().await;
+            result
         }
         HostCommand::ProfileList => {
             let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
