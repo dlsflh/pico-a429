@@ -151,24 +151,24 @@ HI-8588 包含差分输入衰减网络与比较器，将 $\pm10\text{V}$ 信号�
 
 ---
 
-## 六、 12 通道物理引脚与 PIO/DMA 硬件资源映射表
+## 六、 12 通道物理引脚与 PIO 硬件资源映射表
 
-RP2350 具备 3 个 PIO 块（PIO0, PIO1, PIO2）共 12 个独立状态机，以及 16 个 DMA 通道。本项目架构支持 12 路任意全双工/半双工通道（任何一路均可在初始化配置为发送 TX 或接收 RX）：
+RP2350 具备 3 个 PIO 块（PIO0, PIO1, PIO2）共 12 个独立状态机。本项目采用纯 PIO 硬件 FIFO 异步驱动（零 DMA 依赖），支持 12 路任意全双工/半双工通道（任何一路均可在初始化配置为发送 TX 或接收 RX）：
 
-| 逻辑通道 | 默认引脚 (A / B) | 对应物理引脚 | 对应 PIO 硬件 | 默认分配 DMA 通道 | 功能用途建议 |
+| 逻辑通道 | 默认引脚 (A / B) | 对应物理引脚 | 对应 PIO 硬件 | 驱动架构 | 功能用途建议 |
 | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Channel 0** | **GP0 / GP1** | Pin 1 / Pin 2 | **PIO0 / SM0** | **DMA_CH0** | 默认 TX0 发送通道 (可配置为 RX) |
-| **Channel 1** | **GP2 / GP3** | Pin 4 / Pin 5 | **PIO0 / SM1** | **DMA_CH1** | 默认 RX0 接收通道 (可配置为 TX) |
-| **Channel 2** | **GP4 / GP5** | Pin 6 / Pin 7 | **PIO0 / SM2** | **DMA_CH2** | TX1 / RX1 扩展 |
-| **Channel 3** | **GP6 / GP7** | Pin 9 / Pin 10 | **PIO0 / SM3** | **DMA_CH3** | TX1 / RX1 扩展 |
-| **Channel 4** | **GP8 / GP9** | Pin 11 / Pin 12 | **PIO1 / SM0** | **DMA_CH4** | TX2 / RX2 扩展 |
-| **Channel 5** | **GP10 / GP11** | Pin 14 / Pin 15 | **PIO1 / SM1** | **DMA_CH5** | TX2 / RX2 扩展 |
-| **Channel 6** | **GP12 / GP13** | Pin 16 / Pin 17 | **PIO1 / SM2** | **DMA_CH6** | 高速航电总线节点扩展 |
-| **Channel 7** | **GP14 / GP15** | Pin 19 / Pin 20 | **PIO1 / SM3** | **DMA_CH7** | 高速航电总线节点扩展 |
-| **Channel 8** | **GP16 / GP17** | Pin 21 / Pin 22 | **PIO2 / SM0** | **DMA_CH8** | 低速飞控/导航总线扩展 |
-| **Channel 9** | **GP18 / GP19** | Pin 24 / Pin 25 | **PIO2 / SM1** | **DMA_CH9** | 低速飞控/导航总线扩展 |
-| **Channel 10**| **GP20 / GP21** | Pin 26 / Pin 27 | **PIO2 / SM2** | **DMA_CH10**| 发动机参数监测采集 |
-| **Channel 11**| **GP22 / GP26** | Pin 29 / Pin 31 | **PIO2 / SM3** | **DMA_CH11**| 大气数据机总线采集 |
+| **Channel 0** | **GP0 / GP1** | Pin 1 / Pin 2 | **PIO0 / SM0** | PIO FIFO 异步中断 | 默认 TX0 发送通道 (可配置为 RX) |
+| **Channel 1** | **GP2 / GP3** | Pin 4 / Pin 5 | **PIO0 / SM1** | PIO FIFO 异步中断 | 默认 RX0 接收通道 (可配置为 TX) |
+| **Channel 2** | **GP4 / GP5** | Pin 6 / Pin 7 | **PIO0 / SM2** | PIO FIFO 异步中断 | TX1 / RX1 扩展 |
+| **Channel 3** | **GP6 / GP7** | Pin 9 / Pin 10 | **PIO0 / SM3** | PIO FIFO 异步中断 | TX1 / RX1 扩展 |
+| **Channel 4** | **GP8 / GP9** | Pin 11 / Pin 12 | **PIO1 / SM0** | PIO FIFO 异步中断 | TX2 / RX2 扩展 |
+| **Channel 5** | **GP10 / GP11** | Pin 14 / Pin 15 | **PIO1 / SM1** | PIO FIFO 异步中断 | TX2 / RX2 扩展 |
+| **Channel 6** | **GP12 / GP13** | Pin 16 / Pin 17 | **PIO1 / SM2** | PIO FIFO 异步中断 | 高速航电总线节点扩展 |
+| **Channel 7** | **GP14 / GP15** | Pin 19 / Pin 20 | **PIO1 / SM3** | PIO FIFO 异步中断 | 高速航电总线节点扩展 |
+| **Channel 8** | **GP16 / GP17** | Pin 21 / Pin 22 | **PIO2 / SM0** | PIO FIFO 异步中断 | 低速飞控/导航总线扩展 |
+| **Channel 9** | **GP18 / GP19** | Pin 24 / Pin 25 | **PIO2 / SM1** | PIO FIFO 异步中断 | 低速飞控/导航总线扩展 |
+| **Channel 10**| **GP20 / GP21** | Pin 26 / Pin 27 | **PIO2 / SM2** | PIO FIFO 异步中断 | 发动机参数监测采集 |
+| **Channel 11**| **GP26 / GP27** | Pin 31 / Pin 32 | **PIO2 / SM3** | PIO FIFO 异步中断 | 大气数据机总线采集 |
 
 > ⚠️ **BIT 环回测试注意事项**：
-> 当指定 Channel A 与 Channel B 进行对插自测试（如 `cargo run -p arinc429-host-cli -- bit --tx 0 --rx 1`）时，务必在回路中串接 $100\,\Omega \sim 330\,\Omega$ 限流电阻，并在执行前确保两通道地线共地。
+> 当指定 Channel A 与 Channel B 进行对插自测试（如 `uv run python tools/pico429.py bit --tx 0 --rx 1`）时，务必在回路中串接 $100\,\Omega \sim 330\,\Omega$ 限流电阻，并在执行前确保两通道地线共地。
