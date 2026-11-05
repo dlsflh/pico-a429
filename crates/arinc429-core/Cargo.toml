@@ -7,8 +7,8 @@ description = "Core ARINC 429 protocol, data models, parity, label filtering, an
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-defmt = { version = "0.3", optional = true }
-heapless = "0.8"
+defmt = { version = "1.2", optional = true }
+heapless = "0.9"
 
 [features]
 default = []
