@@ -24,19 +24,36 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/pico-429-firmware 
 基于 `uv run --with pyserial`，无需配置 Python 环境，自动扫描匹配树莓派 Pico 串口：
 
 ```bash
-# 1. 握手测试 (PING -> PONG)
+# 1. 握手测试 (PING -> PONG，RTT < 0.5ms)
 uv run --with pyserial python tools/pico429.py ping
 
 # 2. 查询固件在线状态与通道配置
 uv run --with pyserial python tools/pico429.py status
 
-# 3. 硬件自收自发 BIT 闭环自测试 (GP0->GP2, GP1->GP3)
+# 3. 硬件自收自发 BIT 闭环自测试 (GP0->GP2, GP1->GP3，RTT < 1ms)
 uv run --with pyserial python tools/pico429.py bit
 
-# 4. 发送单个构造字 (Label 310, 数据 0x1234)
+# 4. 用户自驱动实时回环终端 (开启常驻会话，输入 1234 即时回显并计算 RTT)
+uv run --with pyserial python tools/pico429.py interactive
+
+# 5. 动态配置通道启停、方向与速率 (CHCFG)
+uv run --with pyserial python tools/pico429.py config 0 --enable --dir TX --speed 100k
+uv run --with pyserial python tools/pico429.py config 1 --disable
+
+# 6. 切换指定通道波特率
+uv run --with pyserial python tools/pico429.py speed 0 100k
+
+# 7. 配置 Label 硬件过滤规则 (白名单 / 黑名单 / 清空)
+uv run --with pyserial python tools/pico429.py filter 1 --allow 310
+uv run --with pyserial python tools/pico429.py filter 1 --clear
+
+# 8. 切换上报模式 (BIN / ASCII)
+uv run --with pyserial python tools/pico429.py mode ascii
+
+# 9. 发送单个构造字 (Label 310, 数据 0x1234)
 uv run --with pyserial python tools/pico429.py send --label 310 --data 0x1234
 
-# 5. 彩色流式监听并解码接收数据
+# 10. 彩色流式监听并解码接收数据
 uv run --with pyserial python tools/pico429.py listen
 ```
 
