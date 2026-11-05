@@ -2,7 +2,7 @@
 //!
 //! 提供免驱动的全速 USB 串口通信：
 //! - 极低延迟与高吞吐量 (12 Mbps 带宽，满载 ARINC 429 流量仅占用不到 2%)
-//! - 严格支持定长 18 字节二进制模式 (BinaryFrame) 与终端交互 ASCII 模式动态切换
+//! - 严格支持定长 16 字节二进制模式 (BinaryFrame) 与终端交互 ASCII 模式动态切换
 //! - 二进制模式下对命令回执与 BIT 报告采用标准帧封装，杜绝字符流污染
 //! - 命令解析、执行与响应序列化彻底解耦，保障宿主可测试性
 
@@ -23,15 +23,15 @@ use arinc429_core::word::ArincWord;
 
 use crate::channel::{
     channel_direction, send_to_channel_ctrl, send_to_channel_tx, set_channel_direction,
-    ChannelControlCmd, ChannelDirection, InboundArincFrame, ACTIVE_CHANNEL_COUNT,
-    GLOBAL_RX_PUBSUB,
+    ChannelControlCmd, ChannelDirection, ChannelError, InboundArincFrame, ACTIVE_CHANNEL_COUNT,
+    BOARD_CHANNELS, GLOBAL_RX_PUBSUB,
 };
 
 /// 推送模式：true 表示二进制高速帧，false 表示 ASCII 文本 (默认启动为 ASCII 便于调试验证)
 pub static BINARY_OUTPUT_MODE: AtomicBool = AtomicBool::new(false);
 
-/// 向上位机发送控制命令回执的专用非阻塞队列
-pub static USB_CMD_RESP_QUEUE: Channel<CriticalSectionRawMutex, CommandExecutionResult, 4> =
+/// 向上位机发送控制命令回执的专用非阻塞队列 (深度 16，防突发指令丢弃)
+pub static USB_CMD_RESP_QUEUE: Channel<CriticalSectionRawMutex, CommandExecutionResult, 16> =
     Channel::new();
 
 #[embassy_executor::task]
@@ -64,7 +64,12 @@ pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB
                                 Ok(cmd) => execute_host_command(cmd).await,
                                 Err(e) => {
                                     let mut err_str = String::<64>::new();
-                                    core::write!(err_str, "ERR: Command parse failure: {:?}\r\n", e).ok();
+                                    core::write!(
+                                        err_str,
+                                        "ERR: Command parse failure: {:?}\r\n",
+                                        e
+                                    )
+                                    .ok();
                                     CommandExecutionResult::ErrorDynamic(err_str)
                                 }
                             };
@@ -93,7 +98,7 @@ pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB
 
 /// 独立的 USB CDC 发送任务：统一调度命令回执与业务遥测流
 ///
-/// 优先保障上位机命令 ACK / BIT 报告即时输出，在 host 未连接/未读时自动丢弃滞留总线遥测，消灭死锁。
+/// 优先保障上位机命令 ACK / 响应即时输出，在 host 未连接/未读时自动丢弃滞留总线遥测，消灭死锁。
 #[embassy_executor::task]
 pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) {
     let mut bin_batch_buf = [0u8; 64];
@@ -105,16 +110,14 @@ pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) 
     sender.wait_connection().await;
 
     loop {
-        match select(
-            USB_CMD_RESP_QUEUE.receive(),
-            subscriber.next_message_pure(),
-        )
-        .await
-        {
-            // 分支 1：命令回执与 BIT 报告 (最高调度优先级)
+        match select(USB_CMD_RESP_QUEUE.receive(), subscriber.next_message_pure()).await {
+            // 分支 1：命令回执 (最高调度优先级)
             Either::First(result) => {
                 let is_binary = BINARY_OUTPUT_MODE.load(Ordering::Relaxed);
-                if send_execution_result(&mut sender, result, is_binary).await.is_err() {
+                if send_execution_result(&mut sender, result, is_binary)
+                    .await
+                    .is_err()
+                {
                     sender.wait_connection().await;
                 }
             }
@@ -147,13 +150,19 @@ pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) 
                         }
                     }
 
-                    if cdc_sender_write_all(&mut sender, &bin_batch_buf[..offset]).await.is_err() {
+                    if cdc_sender_write_all(&mut sender, &bin_batch_buf[..offset])
+                        .await
+                        .is_err()
+                    {
                         sender.wait_connection().await;
                     }
                 } else {
                     let mut line = String::<128>::new();
                     format_ascii_frame(&first_frame, &mut line);
-                    if cdc_sender_write_all(&mut sender, line.as_bytes()).await.is_err() {
+                    if cdc_sender_write_all(&mut sender, line.as_bytes())
+                        .await
+                        .is_err()
+                    {
                         sender.wait_connection().await;
                     }
                 }
@@ -178,19 +187,8 @@ async fn cdc_sender_write_all(
         .await
         .is_err()
         {
-            // 上位机未读取 IN 端点，直接超时丢弃避免全系统死锁
-            return Ok(());
-        }
-    }
-    if (data.len() & 63) == 0 {
-        if embassy_time::with_timeout(
-            embassy_time::Duration::from_millis(100),
-            sender.write_packet(&[]),
-        )
-        .await
-        .is_err()
-        {
-            return Ok(());
+            // 上位机未及时拉取 IN 端点，超时报错退出避免阻塞 USB 主调度
+            return Err(embassy_usb::driver::EndpointError::BufferOverflow);
         }
     }
     Ok(())
@@ -207,7 +205,10 @@ pub enum CommandExecutionResult {
 
 /// 校验通道编号是否已装配且符合预期方向
 #[inline]
-fn validate_channel(channel: u8, expected: Option<ChannelDirection>) -> Result<(), CommandExecutionResult> {
+fn validate_channel(
+    channel: u8,
+    expected: Option<ChannelDirection>,
+) -> Result<(), CommandExecutionResult> {
     if (channel as usize) >= ACTIVE_CHANNEL_COUNT {
         return Err(CommandExecutionResult::ErrorStatic(
             "ERR: Channel not equipped on hardware (active: 0..1)\r\n",
@@ -272,16 +273,31 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 return err;
             }
 
-            let dir = if !enable {
+            let hw_desc = &BOARD_CHANNELS[channel as usize];
+            let requested_dir = if !enable {
                 ChannelDirection::Disabled
             } else if is_tx {
                 ChannelDirection::Tx
             } else {
                 ChannelDirection::Rx
             };
-            set_channel_direction(channel, dir);
+
+            // 物理引脚与芯片硬件固化方向守护：杜绝反向配置产生状态倒置与队列死锁
+            if requested_dir != ChannelDirection::Disabled && requested_dir != hw_desc.direction {
+                let mut resp = String::<64>::new();
+                core::write!(
+                    resp,
+                    "ERR: Channel {} hardware is physically {:?}-only\r\n",
+                    channel,
+                    hw_desc.direction
+                )
+                .ok();
+                return CommandExecutionResult::ErrorDynamic(resp);
+            }
+
+            set_channel_direction(channel, requested_dir);
             let cmd = ChannelControlCmd::Configure {
-                direction: dir,
+                direction: requested_dir,
                 high_speed,
             };
             let _ = send_to_channel_ctrl(channel, cmd).await;
@@ -291,7 +307,7 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 resp,
                 "OK: Channel {} configured: {:?}, Speed: {}\r\n",
                 channel,
-                dir,
+                requested_dir,
                 if high_speed { "100K" } else { "12.5K" }
             )
             .ok();
@@ -300,7 +316,10 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
         HostCommand::ChannelFilter { channel, action } => {
             handle_channel_filter(channel, action).await
         }
-        HostCommand::SetSpeed { channel, high_speed } => {
+        HostCommand::SetSpeed {
+            channel,
+            high_speed,
+        } => {
             if let Err(err) = validate_channel(channel, None) {
                 return err;
             }
@@ -324,16 +343,39 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             if let Err(err) = validate_channel(channel, Some(ChannelDirection::Tx)) {
                 return err;
             }
-            let _ = send_to_channel_tx(channel, raw_word).await;
-            let mut resp = String::<128>::new();
-            core::write!(
-                resp,
-                "OK: Queued raw word 0x{:08X} for CH{}\r\n",
-                raw_word,
-                channel
-            )
-            .ok();
-            CommandExecutionResult::SuccessText(resp)
+            match send_to_channel_tx(channel, raw_word) {
+                Ok(()) => {
+                    let mut resp = String::<128>::new();
+                    core::write!(
+                        resp,
+                        "OK: Queued raw word 0x{:08X} for CH{}\r\n",
+                        raw_word,
+                        channel
+                    )
+                    .ok();
+                    CommandExecutionResult::SuccessText(resp)
+                }
+                Err(ChannelError::QueueFull(ch)) => {
+                    let mut resp = String::<64>::new();
+                    core::write!(resp, "ERR: TX queue full on Channel {}\r\n", ch).ok();
+                    CommandExecutionResult::ErrorDynamic(resp)
+                }
+                Err(ChannelError::ChannelDisabled(ch)) => {
+                    let mut resp = String::<64>::new();
+                    core::write!(resp, "ERR: Channel {} is disabled\r\n", ch).ok();
+                    CommandExecutionResult::ErrorDynamic(resp)
+                }
+                Err(ChannelError::NotTxChannel(ch)) => {
+                    let mut resp = String::<64>::new();
+                    core::write!(resp, "ERR: Channel {} is not a TX channel\r\n", ch).ok();
+                    CommandExecutionResult::ErrorDynamic(resp)
+                }
+                Err(ChannelError::ChannelOutOfRange(ch)) => {
+                    let mut resp = String::<64>::new();
+                    core::write!(resp, "ERR: Channel {} out of range\r\n", ch).ok();
+                    CommandExecutionResult::ErrorDynamic(resp)
+                }
+            }
         }
         HostCommand::SendConstructed {
             channel,
@@ -349,29 +391,48 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
             let word = match ArincWord::from_fields(label, sdi, data, ssm, parity) {
                 Ok(w) => w,
                 Err(_) => {
-                    return CommandExecutionResult::ErrorStatic(
-                        "ERR: Invalid word parameters\r\n",
-                    );
+                    return CommandExecutionResult::ErrorStatic("ERR: Invalid word parameters\r\n");
                 }
             };
-            let _ = send_to_channel_tx(channel, word.to_raw()).await;
-            let mut resp = String::<128>::new();
-            core::write!(
-                resp,
-                "OK: Sent L:{:03o} SDI:{} DATA:0x{:X} RAW:0x{:08X}\r\n",
-                label.to_octal(),
-                sdi,
-                data,
-                word.to_raw()
-            )
-            .ok();
-            CommandExecutionResult::SuccessText(resp)
+            match send_to_channel_tx(channel, word.to_raw()) {
+                Ok(()) => {
+                    let mut resp = String::<128>::new();
+                    core::write!(
+                        resp,
+                        "OK: Sent L:{:03o} SDI:{} DATA:0x{:X} RAW:0x{:08X}\r\n",
+                        label.to_octal(),
+                        sdi,
+                        data,
+                        word.to_raw()
+                    )
+                    .ok();
+                    CommandExecutionResult::SuccessText(resp)
+                }
+                Err(ChannelError::QueueFull(ch)) => {
+                    let mut resp = String::<64>::new();
+                    core::write!(resp, "ERR: TX queue full on Channel {}\r\n", ch).ok();
+                    CommandExecutionResult::ErrorDynamic(resp)
+                }
+                Err(ChannelError::ChannelDisabled(ch)) => {
+                    let mut resp = String::<64>::new();
+                    core::write!(resp, "ERR: Channel {} is disabled\r\n", ch).ok();
+                    CommandExecutionResult::ErrorDynamic(resp)
+                }
+                Err(ChannelError::NotTxChannel(ch)) => {
+                    let mut resp = String::<64>::new();
+                    core::write!(resp, "ERR: Channel {} is not a TX channel\r\n", ch).ok();
+                    CommandExecutionResult::ErrorDynamic(resp)
+                }
+                Err(ChannelError::ChannelOutOfRange(ch)) => {
+                    let mut resp = String::<64>::new();
+                    core::write!(resp, "ERR: Channel {} out of range\r\n", ch).ok();
+                    CommandExecutionResult::ErrorDynamic(resp)
+                }
+            }
         }
-        HostCommand::RunBit { .. } => {
-            CommandExecutionResult::ErrorStatic(
-                "ERR: On-device BIT disabled. Perform loopback verification via host\r\n",
-            )
-        }
+        HostCommand::RunBit { .. } => CommandExecutionResult::ErrorStatic(
+            "ERR: On-device BIT disabled. Perform loopback verification via host\r\n",
+        ),
         HostCommand::QueryStatus { channel: _ } => {
             let mut resp = String::<128>::new();
             let ch0_dir = channel_direction(0).unwrap_or(ChannelDirection::Disabled);
@@ -381,7 +442,11 @@ pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
                 "STATUS: Pico-429 Online [CH0: {:?}, CH1: {:?}]. Mode: {}\r\n",
                 ch0_dir,
                 ch1_dir,
-                if BINARY_OUTPUT_MODE.load(Ordering::Relaxed) { "BIN" } else { "ASCII" }
+                if BINARY_OUTPUT_MODE.load(Ordering::Relaxed) {
+                    "BIN"
+                } else {
+                    "ASCII"
+                }
             )
             .ok();
             CommandExecutionResult::SuccessText(resp)
@@ -402,14 +467,8 @@ async fn send_execution_result(
         CommandExecutionResult::SuccessText(text) => {
             if is_binary {
                 // 二进制模式：封装为 CMD_ACK 帧
-                let ack_frame = BinaryFrame::new_full(
-                    frame_types::CMD_ACK,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0x0000_0000,
-                );
+                let ack_frame =
+                    BinaryFrame::new_full(frame_types::CMD_ACK, 0, 0, 0, 0, 0x0000_0000);
                 let mut buf = [0u8; BINARY_FRAME_LEN];
                 ack_frame.encode(&mut buf);
                 cdc_sender_write_all(sender, &buf).await?;

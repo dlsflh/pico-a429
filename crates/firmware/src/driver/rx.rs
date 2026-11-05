@@ -6,15 +6,15 @@
 
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::gpio::Pull;
-use embassy_rp::pio::{Common, Direction, Instance, PioPin, ShiftConfig, ShiftDirection, StateMachine};
+use embassy_rp::pio::{
+    Common, Direction, Instance, LoadedProgram, PioPin, ShiftConfig, ShiftDirection, StateMachine,
+};
 use embassy_rp::Peri;
 
 use arinc429_core::baud::ArincSpeed;
 use arinc429_core::filter::LabelFilter;
 
 use super::calculate_pio_clkdiv;
-
-use crate::pio_programs;
 
 pub struct Arinc429Rx<'d, T: Instance, const SM: usize> {
     sm: StateMachine<'d, T, SM>,
@@ -23,21 +23,20 @@ pub struct Arinc429Rx<'d, T: Instance, const SM: usize> {
 }
 
 impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
-    /// 初始化 ARINC 429 RX 驱动
+    /// 初始化 ARINC 429 RX 驱动 (共享已加载的 PIO 程序)
     ///
     /// `pin_a`: RX_A 引脚 (base pin)
     /// `pin_b`: RX_B 引脚 (base pin + 1，必须在物理引脚编号上相邻)
+    /// `program`: 预先常驻装载的 RX 微码引用
     pub fn new(
         common: &mut Common<'d, T>,
         mut sm: StateMachine<'d, T, SM>,
         pin_a: Peri<'d, impl PioPin>,
         pin_b: Peri<'d, impl PioPin>,
+        program: &LoadedProgram<'d, T>,
         initial_speed: ArincSpeed,
         filter: LabelFilter,
     ) -> Self {
-        let prg = pio_programs::arinc429_rx_program();
-        let loaded = common.load_program(&prg);
-
         let mut pin_a = common.make_pio_pin(pin_a);
         let mut pin_b = common.make_pio_pin(pin_b);
         pin_a.set_pull(Pull::Down);
@@ -46,7 +45,7 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
         sm.set_pin_dirs(Direction::In, &[&pin_a, &pin_b]);
 
         let mut cfg = embassy_rp::pio::Config::default();
-        cfg.use_program(&loaded, &[]);
+        cfg.use_program(program, &[]);
         cfg.set_in_pins(&[&pin_a, &pin_b]);
 
         // LSB 优先移入 (Bit 1 最先到达，存入最低位 bit 0)，满 32 位由硬件 Autopush 自动推入 FIFO 并清空 ISR
@@ -73,6 +72,11 @@ impl<'d, T: Instance, const SM: usize> Arinc429Rx<'d, T, SM> {
             speed: initial_speed,
             filter,
         }
+    }
+
+    /// 启用或挂起状态机
+    pub fn set_enable(&mut self, enable: bool) {
+        self.sm.set_enable(enable);
     }
 
     /// 动态切换波特率 (高速 100k / 低速 12.5k)

@@ -275,6 +275,13 @@ def cmd_listen(args: argparse.Namespace) -> None:
     print(f"[*] 打开 {port} 开始监听 ARINC 429 流量 (Ctrl+C 退出)...")
     ser = open_serial(port, timeout=0.1)
 
+    # 切换固件输出模式为 BINARY 模式以接收 16 字节定长二进制帧
+    try:
+        ser.write(b"MODE BIN\r\n")
+        ser.flush()
+    except (serial.SerialException, OSError) as e:
+        print(f"[\033[33mWARN\033[0m] 切换 BINARY 模式失败: {e}")
+
     rx_buf = bytearray()
     print("-" * 96)
     print(

@@ -122,14 +122,9 @@ mod tests {
 
     #[test]
     fn test_word_from_fields_and_extraction() {
-        let word = ArincWord::from_fields(
-            Label::from_octal(0o310),
-            1,
-            0x1234,
-            0b11,
-            ParityMode::Odd,
-        )
-        .unwrap();
+        let word =
+            ArincWord::from_fields(Label::from_octal(0o310), 1, 0x1234, 0b11, ParityMode::Odd)
+                .unwrap();
 
         assert_eq!(word.label().to_octal(), 0o310);
         assert_eq!(word.sdi(), 1);

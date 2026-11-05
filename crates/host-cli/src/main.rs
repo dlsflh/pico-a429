@@ -207,7 +207,10 @@ fn send_command_and_wait(port_name: &str, cmd: &str, timeout_ms: u64) -> Result<
                         if let Ok(frame) = BinaryFrame::decode(&raw_buf[..BINARY_FRAME_LEN]) {
                             match frame.frame_type {
                                 frame_types::CMD_ACK => {
-                                    return Ok(format!("OK: Command acknowledged (binary mode, seq {})", frame.seq_num));
+                                    return Ok(format!(
+                                        "OK: Command acknowledged (binary mode, seq {})",
+                                        frame.seq_num
+                                    ));
                                 }
                                 frame_types::ASYNC_EVENT => {
                                     return Err("ERR: Device error / bus fault event".to_string());
@@ -227,7 +230,10 @@ fn send_command_and_wait(port_name: &str, cmd: &str, timeout_ms: u64) -> Result<
                     let ch = b as char;
                     if ch == '\n' {
                         let trimmed = line_buf.trim();
-                        if trimmed.starts_with("OK:") || trimmed.starts_with("STATUS:") || trimmed == "PONG" {
+                        if trimmed.starts_with("OK:")
+                            || trimmed.starts_with("STATUS:")
+                            || trimmed == "PONG"
+                        {
                             return Ok(trimmed.to_string());
                         } else if trimmed.starts_with("ERR:") {
                             return Err(trimmed.to_string());
@@ -264,6 +270,14 @@ fn listen_serial(port_name: &str, baud_rate: u32) {
             std::process::exit(1);
         });
 
+    let _ = port.write_data_terminal_ready(true);
+    let _ = port.write_request_to_send(true);
+
+    // 切换固件输出模式为 BINARY 模式以接收 16 字节定长二进制帧
+    if let Err(e) = port.write_all(b"MODE BIN\r\n").and_then(|_| port.flush()) {
+        eprintln!("{} 切换 BINARY 模式失败: {}", "[WARN]".yellow().bold(), e);
+    }
+
     print_table_header();
 
     let mut decoder = FrameStreamDecoder::new();
@@ -288,15 +302,11 @@ fn listen_serial(port_name: &str, baud_rate: u32) {
 }
 
 /// 发送构造的 ARINC 字
-fn send_word(
-    port_name: &str,
-    channel: u8,
-    label_octal: &str,
-    sdi: u8,
-    data_hex: &str,
-    ssm: u8,
-) {
-    let cmd = format!("TX {} {} {} {} {}", channel, label_octal, sdi, data_hex, ssm);
+fn send_word(port_name: &str, channel: u8, label_octal: &str, sdi: u8, data_hex: &str, ssm: u8) {
+    let cmd = format!(
+        "TX {} {} {} {} {}",
+        channel, label_octal, sdi, data_hex, ssm
+    );
     println!("{} 发送指令: {}", "[TX]".cyan().bold(), cmd);
 
     match send_command_and_wait(port_name, &cmd, 1500) {
@@ -420,7 +430,9 @@ fn run_bit(port_name: &str, tx_ch: u8, rx_ch: u8) {
                                 sent_raw = Some(trimmed[pos + 4..].trim().to_uppercase());
                             }
                         } else if trimmed.starts_with(&format!("[CH{}]", rx_ch)) {
-                            if let (Some(start), Some(end)) = (trimmed.rfind('('), trimmed.rfind(')')) {
+                            if let (Some(start), Some(end)) =
+                                (trimmed.rfind('('), trimmed.rfind(')'))
+                            {
                                 recv_raw = Some(trimmed[start + 1..end].trim().to_uppercase());
                             }
                             if trimmed.contains("P:OK") {
@@ -446,7 +458,11 @@ fn run_bit(port_name: &str, tx_ch: u8, rx_ch: u8) {
             passed += 1;
         }
 
-        let status = if is_pass { "PASS".green().bold() } else { "FAIL".red().bold() };
+        let status = if is_pass {
+            "PASS".green().bold()
+        } else {
+            "FAIL".red().bold()
+        };
         let tx_info = format!("L:{} 0x{:05X}", label, data);
         let s_disp = sent_raw.unwrap_or_else(|| "TIMEOUT".to_string());
         let r_disp = recv_raw.unwrap_or_else(|| "TIMEOUT".to_string());
@@ -466,7 +482,11 @@ fn run_bit(port_name: &str, tx_ch: u8, rx_ch: u8) {
 
     println!("{}", "=".repeat(100).bright_black());
     let total = vectors.len();
-    let avg_rtt = if total > 0 { rtt_sum / total as f64 } else { 0.0 };
+    let avg_rtt = if total > 0 {
+        rtt_sum / total as f64
+    } else {
+        0.0
+    };
     let loss_rate = ((total - passed) as f64 / total as f64) * 100.0;
 
     if passed == total {
@@ -505,8 +525,16 @@ fn print_decoded_frame(frame: &BinaryFrame) {
     let parity_err = (frame.flags & flags::PARITY_ERROR) != 0;
 
     let time_sec = frame.timestamp_us as f64 / 1_000_000.0;
-    let speed_str = if is_high_speed { "100k".green() } else { "12.5k".yellow() };
-    let parity_str = if parity_err { "FAIL".red().bold() } else { "OK".green() };
+    let speed_str = if is_high_speed {
+        "100k".green()
+    } else {
+        "12.5k".yellow()
+    };
+    let parity_str = if parity_err {
+        "FAIL".red().bold()
+    } else {
+        "OK".green()
+    };
 
     let label = word.label().to_octal();
     let sdi = word.sdi();

@@ -1,15 +1,15 @@
 //! 12 通道通用路由器与消息总线架构 (12-Channel Router)
 //!
-//! 支持从单通道平滑扩展至 12 路任意物理通道。
-//! 每个通道独立拥有独立的下行发送队列与专用控制队列，杜绝跨任务竞争偷帧。
+//! 支持从单通道平滑扩展至 12 路物理通道。
+//! 每个通道独立拥有专用下行发送队列与控制队列，杜绝跨任务竞争偷帧。
 //! 生产数据采用广播式 PubSub (GLOBAL_RX_PUBSUB)。
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::pubsub::PubSubChannel;
 
-use arinc429_core::protocol::{flags, BinaryFrame, FilterAction};
+use arinc429_core::protocol::{flags, frame_types, BinaryFrame, FilterAction};
 use arinc429_core::word::ArincWord;
 
 /// 通道工作模式
@@ -54,6 +54,9 @@ static RUNTIME_CHANNEL_DIRECTIONS: [AtomicU8; ACTIVE_CHANNEL_COUNT] = [
     AtomicU8::new(2), // CH1 默认为 Rx
 ];
 
+// 全局遥测数据包单调递增包序号 (溢出自动翻转)
+static TELEMETRY_SEQ: AtomicU16 = AtomicU16::new(0);
+
 /// 动态更新通道方向
 #[inline]
 pub fn set_channel_direction(channel_id: u8, dir: ChannelDirection) {
@@ -86,6 +89,9 @@ pub fn channel_direction(channel_id: u8) -> Option<ChannelDirection> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum ChannelError {
     ChannelOutOfRange(u8),
+    NotTxChannel(u8),
+    QueueFull(u8),
+    ChannelDisabled(u8),
 }
 
 /// 接收到的单帧消息包
@@ -99,7 +105,7 @@ pub struct InboundArincFrame {
 }
 
 impl InboundArincFrame {
-    /// 转换为上位机通信所需的标准 16 字节二进制遥测帧 (完美整除 64 字节 USB 端点)
+    /// 转换为上位机通信所需的标准 16 字节二进制遥测帧 (分配单调自增序号)
     pub fn to_binary_frame(&self) -> BinaryFrame {
         let mut f = 0u8;
         if !self.parity_ok {
@@ -108,8 +114,16 @@ impl InboundArincFrame {
         if self.high_speed {
             f |= flags::SPEED_100K;
         }
+        let seq = TELEMETRY_SEQ.fetch_add(1, Ordering::Relaxed);
 
-        BinaryFrame::new(self.channel_id, f, self.timestamp_us, self.word.to_raw())
+        BinaryFrame::new_full(
+            frame_types::ARINC_DATA,
+            self.channel_id,
+            f,
+            seq,
+            self.timestamp_us,
+            self.word.to_raw(),
+        )
     }
 }
 
@@ -136,28 +150,41 @@ pub static CHANNEL_TX_QUEUES: [Channel<CriticalSectionRawMutex, u32, 16>; ACTIVE
     [TX_QUEUE_INIT; ACTIVE_CHANNEL_COUNT];
 
 /// 激活通道的控制与配置命令队列数组 (每个通道独立独享 1 个，零竞态偷帧)
-pub static CHANNEL_CTRL_QUEUES: [Channel<CriticalSectionRawMutex, ChannelControlCmd, 4>; ACTIVE_CHANNEL_COUNT] =
-    [CTRL_QUEUE_INIT; ACTIVE_CHANNEL_COUNT];
+pub static CHANNEL_CTRL_QUEUES: [Channel<CriticalSectionRawMutex, ChannelControlCmd, 4>;
+    ACTIVE_CHANNEL_COUNT] = [CTRL_QUEUE_INIT; ACTIVE_CHANNEL_COUNT];
 
 /// 集中式多路接收遥测广播总线
 ///
 /// 具备 128 帧深度的环形缓冲，支持 4 个独立订阅端 (USB 等)，对应当前激活通道发布者。
 /// 满载自动丢弃最旧帧，绝不反向阻塞物理层总线接收。
-pub static GLOBAL_RX_PUBSUB: PubSubChannel<CriticalSectionRawMutex, InboundArincFrame, 128, 4, ACTIVE_CHANNEL_COUNT> =
-    PubSubChannel::new();
+pub static GLOBAL_RX_PUBSUB: PubSubChannel<
+    CriticalSectionRawMutex,
+    InboundArincFrame,
+    128,
+    4,
+    ACTIVE_CHANNEL_COUNT,
+> = PubSubChannel::new();
 
-/// 向指定通道投递发送数据帧 (Fail-Fast 参数校验)
-pub async fn send_to_channel_tx(channel_id: u8, raw_word: u32) -> Result<(), ChannelError> {
-    if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
-        CHANNEL_TX_QUEUES[channel_id as usize].send(raw_word).await;
-        Ok(())
-    } else {
-        Err(ChannelError::ChannelOutOfRange(channel_id))
+/// 向指定通道投递发送数据帧 (非阻塞 Fail-Fast，彻底消除 USB 接收端死锁)
+pub fn send_to_channel_tx(channel_id: u8, raw_word: u32) -> Result<(), ChannelError> {
+    if (channel_id as usize) >= ACTIVE_CHANNEL_COUNT {
+        return Err(ChannelError::ChannelOutOfRange(channel_id));
     }
+    match channel_direction(channel_id) {
+        Some(ChannelDirection::Tx) => {}
+        Some(ChannelDirection::Disabled) => return Err(ChannelError::ChannelDisabled(channel_id)),
+        _ => return Err(ChannelError::NotTxChannel(channel_id)),
+    }
+    CHANNEL_TX_QUEUES[channel_id as usize]
+        .try_send(raw_word)
+        .map_err(|_| ChannelError::QueueFull(channel_id))
 }
 
 /// 向指定通道投递控制/过滤命令 (Fail-Fast 参数校验)
-pub async fn send_to_channel_ctrl(channel_id: u8, cmd: ChannelControlCmd) -> Result<(), ChannelError> {
+pub async fn send_to_channel_ctrl(
+    channel_id: u8,
+    cmd: ChannelControlCmd,
+) -> Result<(), ChannelError> {
     if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
         CHANNEL_CTRL_QUEUES[channel_id as usize].send(cmd).await;
         Ok(())

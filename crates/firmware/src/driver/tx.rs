@@ -5,14 +5,14 @@
 
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::gpio::Pull;
-use embassy_rp::pio::{Common, Direction, Instance, PioPin, ShiftConfig, ShiftDirection, StateMachine};
+use embassy_rp::pio::{
+    Common, Direction, Instance, LoadedProgram, PioPin, ShiftConfig, ShiftDirection, StateMachine,
+};
 use embassy_rp::Peri;
 
 use arinc429_core::baud::ArincSpeed;
 
 use super::calculate_pio_clkdiv;
-
-use crate::pio_programs;
 
 pub struct Arinc429Tx<'d, T: Instance, const SM: usize> {
     sm: StateMachine<'d, T, SM>,
@@ -20,20 +20,19 @@ pub struct Arinc429Tx<'d, T: Instance, const SM: usize> {
 }
 
 impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
-    /// 初始化 ARINC 429 TX 驱动
+    /// 初始化 ARINC 429 TX 驱动 (共享已加载的 PIO 程序)
     ///
     /// `pin_a`: TX_A 引脚 (base pin)
     /// `pin_b`: TX_B 引脚 (base pin + 1，必须在物理引脚编号上相邻)
+    /// `program`: 预先常驻装载的 TX 微码引用
     pub fn new(
         common: &mut Common<'d, T>,
         mut sm: StateMachine<'d, T, SM>,
         pin_a: Peri<'d, impl PioPin>,
         pin_b: Peri<'d, impl PioPin>,
+        program: &LoadedProgram<'d, T>,
         initial_speed: ArincSpeed,
     ) -> Self {
-        let prg = pio_programs::arinc429_tx_program();
-        let loaded = common.load_program(&prg);
-
         let mut pin_a = common.make_pio_pin(pin_a);
         let mut pin_b = common.make_pio_pin(pin_b);
         pin_a.set_pull(Pull::None);
@@ -42,7 +41,7 @@ impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
         sm.set_pin_dirs(Direction::Out, &[&pin_a, &pin_b]);
 
         let mut cfg = embassy_rp::pio::Config::default();
-        cfg.use_program(&loaded, &[]);
+        cfg.use_program(program, &[]);
         cfg.set_set_pins(&[&pin_a, &pin_b]);
         cfg.set_out_pins(&[&pin_a, &pin_b]);
 
@@ -69,6 +68,11 @@ impl<'d, T: Instance, const SM: usize> Arinc429Tx<'d, T, SM> {
     /// 获取当前速率
     pub fn speed(&self) -> ArincSpeed {
         self.speed
+    }
+
+    /// 启用或挂起状态机
+    pub fn set_enable(&mut self, enable: bool) {
+        self.sm.set_enable(enable);
     }
 
     /// 动态切换波特率 (高速 100k / 低速 12.5k)

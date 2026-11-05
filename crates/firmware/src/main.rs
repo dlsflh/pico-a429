@@ -23,7 +23,7 @@ use arinc429_core::filter::LabelFilter;
 use arinc429_core::word::ArincWord;
 
 use crate::channel::{
-    ChannelControlCmd, InboundArincFrame, CHANNEL_CTRL_QUEUES, CHANNEL_TX_QUEUES,
+    ChannelControlCmd, ChannelDirection, InboundArincFrame, CHANNEL_CTRL_QUEUES, CHANNEL_TX_QUEUES,
     GLOBAL_RX_PUBSUB,
 };
 use crate::driver::{Arinc429Rx, Arinc429Tx, ArincSpeed};
@@ -38,9 +38,18 @@ bind_interrupts!(struct Irqs {
 async fn channel_0_tx_task(channel_id: u8, mut tx: Arinc429Tx<'static, PIO0, 0>) {
     loop {
         while let Ok(cmd) = CHANNEL_CTRL_QUEUES[channel_id as usize].try_receive() {
-            if let ChannelControlCmd::Configure { high_speed, .. } = cmd {
-                let speed = if high_speed { ArincSpeed::High100k } else { ArincSpeed::Low12k5 };
+            if let ChannelControlCmd::Configure {
+                direction,
+                high_speed,
+            } = cmd
+            {
+                let speed = if high_speed {
+                    ArincSpeed::High100k
+                } else {
+                    ArincSpeed::Low12k5
+                };
                 tx.set_speed(speed);
+                tx.set_enable(direction == ChannelDirection::Tx);
             }
         }
 
@@ -54,9 +63,18 @@ async fn channel_0_tx_task(channel_id: u8, mut tx: Arinc429Tx<'static, PIO0, 0>)
                 tx.send_raw(raw_word).await;
             }
             Either::Second(cmd) => {
-                if let ChannelControlCmd::Configure { high_speed, .. } = cmd {
-                    let speed = if high_speed { ArincSpeed::High100k } else { ArincSpeed::Low12k5 };
+                if let ChannelControlCmd::Configure {
+                    direction,
+                    high_speed,
+                } = cmd
+                {
+                    let speed = if high_speed {
+                        ArincSpeed::High100k
+                    } else {
+                        ArincSpeed::Low12k5
+                    };
                     tx.set_speed(speed);
+                    tx.set_enable(direction == ChannelDirection::Tx);
                 }
             }
         }
@@ -71,9 +89,17 @@ async fn channel_1_rx_task(channel_id: u8, mut rx: Arinc429Rx<'static, PIO0, 1>)
     loop {
         while let Ok(cmd) = CHANNEL_CTRL_QUEUES[channel_id as usize].try_receive() {
             match cmd {
-                ChannelControlCmd::Configure { high_speed, .. } => {
-                    let speed = if high_speed { ArincSpeed::High100k } else { ArincSpeed::Low12k5 };
+                ChannelControlCmd::Configure {
+                    direction,
+                    high_speed,
+                } => {
+                    let speed = if high_speed {
+                        ArincSpeed::High100k
+                    } else {
+                        ArincSpeed::Low12k5
+                    };
                     rx.set_speed(speed);
+                    rx.set_enable(direction == ChannelDirection::Rx);
                 }
                 ChannelControlCmd::Filter(action) => match action {
                     arinc429_core::protocol::FilterAction::Allow(label) => {
@@ -113,9 +139,17 @@ async fn channel_1_rx_task(channel_id: u8, mut rx: Arinc429Rx<'static, PIO0, 1>)
                 }
             }
             Either::Second(cmd) => match cmd {
-                ChannelControlCmd::Configure { high_speed, .. } => {
-                    let speed = if high_speed { ArincSpeed::High100k } else { ArincSpeed::Low12k5 };
+                ChannelControlCmd::Configure {
+                    direction,
+                    high_speed,
+                } => {
+                    let speed = if high_speed {
+                        ArincSpeed::High100k
+                    } else {
+                        ArincSpeed::Low12k5
+                    };
                     rx.set_speed(speed);
+                    rx.set_enable(direction == ChannelDirection::Rx);
                 }
                 ChannelControlCmd::Filter(action) => match action {
                     arinc429_core::protocol::FilterAction::Allow(label) => {
@@ -171,7 +205,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb_cdc_tx_task(sender).unwrap());
 
     // 2. 初始化物理 PIO0 (Channel 0 TX 绑定 sm0, Channel 1 RX 绑定 sm1)
-    // 两个程序分别占用 11 与 20 条指令，总和 31 / 32 字空间，完美常驻单一 PIO0
+    // 两个程序分别占用 11 与 20 条指令，总和 31 / 32 字空间，在 PIO0 仅加载一次，完美常驻单一 PIO0
     let Pio {
         mut common,
         sm0,
@@ -179,10 +213,30 @@ async fn main(spawner: Spawner) {
         ..
     } = Pio::new(p.PIO0, Irqs);
 
+    let tx_prog = pio_programs::arinc429_tx_program();
+    let tx_loaded = common.load_program(&tx_prog);
+    let rx_prog = pio_programs::arinc429_rx_program();
+    let rx_loaded = common.load_program(&rx_prog);
+
     let default_speed = ArincSpeed::High100k;
-    let tx = Arinc429Tx::new(&mut common, sm0, p.PIN_0, p.PIN_1, default_speed);
+    let tx = Arinc429Tx::new(
+        &mut common,
+        sm0,
+        p.PIN_0,
+        p.PIN_1,
+        &tx_loaded,
+        default_speed,
+    );
     let filter = LabelFilter::new_accept_all();
-    let rx = Arinc429Rx::new(&mut common, sm1, p.PIN_2, p.PIN_3, default_speed, filter);
+    let rx = Arinc429Rx::new(
+        &mut common,
+        sm1,
+        p.PIN_2,
+        p.PIN_3,
+        &rx_loaded,
+        default_speed,
+        filter,
+    );
 
     spawner.spawn(channel_0_tx_task(0, tx).unwrap());
     spawner.spawn(channel_1_rx_task(1, rx).unwrap());

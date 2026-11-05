@@ -22,17 +22,17 @@ pub fn arinc429_tx_program() -> pio::Program<32> {
         "    out y, 1",
         "    jmp !y, send_zero",
         "send_one:",
-        "    set pins, 0b01 [8]",       // 1 cycle + 8 delay = 9 cycles
-        "    jmp emit_null",            // 1 cycle (pins 0b01 持续共 10 周期)
+        "    set pins, 0b01 [8]", // 1 cycle + 8 delay = 9 cycles
+        "    jmp emit_null",      // 1 cycle (pins 0b01 持续共 10 周期)
         "send_zero:",
-        "    set pins, 0b10 [9]",       // 1 cycle + 9 delay = 10 cycles (pins 0b10 持续共 10 周期)
+        "    set pins, 0b10 [9]", // 1 cycle + 9 delay = 10 cycles (pins 0b10 持续共 10 周期)
         "emit_null:",
-        "    set pins, 0b00 [6]",       // 1 cycle + 6 delay = 7 cycles
-        "    jmp x--, bit_loop",        // 1 cycle (加上 bit_loop 的 out y [1] 与 jmp [1]，Null 恰好持续 10 周期)
+        "    set pins, 0b00 [6]", // 1 cycle + 6 delay = 7 cycles
+        "    jmp x--, bit_loop", // 1 cycle (加上 bit_loop 的 out y [1] 与 jmp [1]，Null 恰好持续 10 周期)
         "send_gap:",
         "    set y, 15",
         "gap_loop:",
-        "    jmp y--, gap_loop [4]",    // 16 轮循环 * (1 + 4 delay) = 80 周期 (严格等于 4.0 bit 间隙)
+        "    jmp y--, gap_loop [4]", // 16 轮循环 * (1 + 4 delay) = 80 周期 (严格等于 4.0 bit 间隙)
         ".wrap"
     )
     .program
@@ -48,37 +48,34 @@ pub fn arinc429_tx_program() -> pio::Program<32> {
 pub fn arinc429_rx_program() -> pio::Program<32> {
     pio::pio_asm!(
         "reset_gap:",
-        "    set x, 16",                  // [0] 17 轮 * 4 周期 = 68 周期 (3.4 bits 低电平计时)
+        "    set x, 16", // [0] 17 轮 * 4 周期 = 68 周期 (3.4 bits 低电平计时)
         "gap_or_next_bit:",
-        "    mov osr, pins",              // [1] (1) T0: 首次采样
-        "    out y, 2",                   // [2] (1) T0+1
-        "    jmp !y, count_null",         // [3] (1) T0+2: 仍为 00，继续累计低电平时间
-        "    jmp verify_pulse",           // [4] (1) T0+3: <3.4 bits 内出现边沿 -> 当前帧的下一位！
+        "    mov osr, pins",      // [1] (1) T0: 首次采样
+        "    out y, 2",           // [2] (1) T0+1
+        "    jmp !y, count_null", // [3] (1) T0+2: 仍为 00，继续累计低电平时间
+        "    jmp verify_pulse",   // [4] (1) T0+3: <3.4 bits 内出现边沿 -> 当前帧的下一位！
         "count_null:",
-        "    jmp x--, gap_or_next_bit",   // [5] (1) 4 周期轮询环
-
+        "    jmp x--, gap_or_next_bit", // [5] (1) 4 周期轮询环
         // --- 低电平已持续 ~3.7 bits，帧间 Gap 验证通过！---
         "sync_ready:",
-        "    mov isr, null",              // [6] 清空任何未满 32 位的残帧/杂波，复位硬件移位计数器
+        "    mov isr, null", // [6] 清空任何未满 32 位的残帧/杂波，复位硬件移位计数器
         "wait_first_bit:",
-        "    mov osr, pins",              // [7] (1) T0: 帧首位采样
-        "    out y, 2",                   // [8] (1) T0+1
-        "    jmp !y, wait_first_bit",     // [9] (1) 无限死等新帧 Bit 1 (空闲期 0% 漏帧！)
-
+        "    mov osr, pins",          // [7] (1) T0: 帧首位采样
+        "    out y, 2",               // [8] (1) T0+1
+        "    jmp !y, wait_first_bit", // [9] (1) 无限死等新帧 Bit 1 (空闲期 0% 漏帧！)
         "verify_pulse:",
-        "    mov osr, pins",              // [10] (1) 二次采样 (4.1~8.0 周期处)，处于 10 周期脉冲中段
-        "    out y, 2",                   // [11] (1)
-        "    jmp !y, reset_gap",          // [12] (1) 若已掉回 00 则为窄毛刺，跳回 reset_gap
-        "    in y, 1",                    // [13] (1) 移入有效位 (满 32 位由硬件 Autopush 推入 FIFO)
-
-        "    set x, 16",                  // [14] (1) 归零看门狗 (68 周期上限)
+        "    mov osr, pins", // [10] (1) 二次采样 (4.1~8.0 周期处)，处于 10 周期脉冲中段
+        "    out y, 2",      // [11] (1)
+        "    jmp !y, reset_gap", // [12] (1) 若已掉回 00 则为窄毛刺，跳回 reset_gap
+        "    in y, 1",       // [13] (1) 移入有效位 (满 32 位由硬件 Autopush 推入 FIFO)
+        "    set x, 16",     // [14] (1) 归零看门狗 (68 周期上限)
         ".wrap_target",
         "wait_null:",
-        "    mov osr, pins",              // [15] (1)
-        "    out y, 2",                   // [16] (1)
-        "    jmp !y, reset_gap",          // [17] (1) 成功归零，跳去测量低电平持续时间
-        "    jmp x--, wait_null",         // [18] (1) 等待归零
-        "    mov isr, null",              // [19] (1) 常高故障超时：清空残帧，由 .wrap 跳回 wait_null 挂起
+        "    mov osr, pins",      // [15] (1)
+        "    out y, 2",           // [16] (1)
+        "    jmp !y, reset_gap",  // [17] (1) 成功归零，跳去测量低电平持续时间
+        "    jmp x--, wait_null", // [18] (1) 等待归零
+        "    mov isr, null",      // [19] (1) 常高故障超时：清空残帧，由 .wrap 跳回 wait_null 挂起
         ".wrap"
     )
     .program

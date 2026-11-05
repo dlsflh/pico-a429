@@ -16,7 +16,7 @@ pub mod frame_types {
     /// 正常 ARINC 429 接收/发送字数据载荷
     pub const ARINC_DATA: u8 = 0x01;
     /// 上位机配置或控制命令执行确认 (ACK / NAK)
-    pub const CMD_ACK: u8    = 0x02;
+    pub const CMD_ACK: u8 = 0x02;
     /// 异步告警与硬件总线故障事件
     pub const ASYNC_EVENT: u8 = 0x03;
 }
@@ -24,10 +24,10 @@ pub mod frame_types {
 /// 状态标志位
 pub mod flags {
     pub const PARITY_ERROR: u8 = 1 << 0;
-    pub const SPEED_100K: u8   = 1 << 1; // 1: 100k (高速), 0: 12.5k (低速)
-    pub const GAP_ERROR: u8    = 1 << 2;
-    pub const IS_TX_ECHO: u8   = 1 << 3; // 该帧为发送回显还是接收捕获
-    pub const BUS_FAULT: u8    = 1 << 4; // 双引脚同高或持续高电平故障
+    pub const SPEED_100K: u8 = 1 << 1; // 1: 100k (高速), 0: 12.5k (低速)
+    pub const GAP_ERROR: u8 = 1 << 2;
+    pub const IS_TX_ECHO: u8 = 1 << 3; // 该帧为发送回显还是接收捕获
+    pub const BUS_FAULT: u8 = 1 << 4; // 双引脚同高或持续高电平故障
 }
 
 /// 定长 16 字节的高性能二进制遥测帧 (完美整除 64 字节 USB CDC 端点)
@@ -171,10 +171,7 @@ pub enum HostCommand {
         high_speed: bool,
     },
     /// 动态配置通道过滤: CHCFG <ch> FILTER <ALLOW|BLOCK|CLEAR> [octal]
-    ChannelFilter {
-        channel: u8,
-        action: FilterAction,
-    },
+    ChannelFilter { channel: u8, action: FilterAction },
     /// 发送构造的 ARINC 字: TX <ch> <octal_label> <sdi> <data_hex> <ssm>
     SendConstructed {
         channel: u8,
@@ -185,30 +182,17 @@ pub enum HostCommand {
         parity: ParityMode,
     },
     /// 发送原始 32 位十六进制字: TXRAW <ch> <hex_word>
-    SendRaw {
-        channel: u8,
-        raw_word: u32,
-    },
+    SendRaw { channel: u8, raw_word: u32 },
     /// 切换波特率: CHCFG <ch> SPEED <100K|12K5>
-    SetSpeed {
-        channel: u8,
-        high_speed: bool,
-    },
+    SetSpeed { channel: u8, high_speed: bool },
     /// 切换推送模式: MODE <BIN|ASCII>
-    SetMode {
-        binary_mode: bool,
-    },
+    SetMode { binary_mode: bool },
     /// 执行内建自测试: BIT <tx_ch> <rx_ch>
-    RunBit {
-        tx_channel: u8,
-        rx_channel: u8,
-    },
+    RunBit { tx_channel: u8, rx_channel: u8 },
     /// 快速连通性测试心跳: PING
     Ping,
     /// 查询状态: STATUS [ch]
-    QueryStatus {
-        channel: Option<u8>,
-    },
+    QueryStatus { channel: Option<u8> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,9 +246,15 @@ impl HostCommand {
         }
 
         if cmd.eq_ignore_ascii_case("CHCFG") {
-            let ch_str = parts.next().ok_or(CommandParseError::MissingArgument("channel"))?;
-            let channel = ch_str.parse::<u8>().map_err(|_| CommandParseError::InvalidChannel)?;
-            let action = parts.next().ok_or(CommandParseError::MissingArgument("action"))?;
+            let ch_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("channel"))?;
+            let channel = ch_str
+                .parse::<u8>()
+                .map_err(|_| CommandParseError::InvalidChannel)?;
+            let action = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("action"))?;
 
             if action.eq_ignore_ascii_case("DISABLE") {
                 return Ok(Self::ConfigureChannel {
@@ -274,8 +264,12 @@ impl HostCommand {
                     high_speed: true,
                 });
             } else if action.eq_ignore_ascii_case("ENABLE") {
-                let dir_str = parts.next().ok_or(CommandParseError::MissingArgument("direction (TX/RX)"))?;
-                let speed_str = parts.next().ok_or(CommandParseError::MissingArgument("speed (100K/12K5)"))?;
+                let dir_str = parts
+                    .next()
+                    .ok_or(CommandParseError::MissingArgument("direction (TX/RX)"))?;
+                let speed_str = parts
+                    .next()
+                    .ok_or(CommandParseError::MissingArgument("speed (100K/12K5)"))?;
                 let is_tx = dir_str.eq_ignore_ascii_case("TX");
                 let high_speed = speed_str.eq_ignore_ascii_case("100K");
                 return Ok(Self::ConfigureChannel {
@@ -285,19 +279,29 @@ impl HostCommand {
                     high_speed,
                 });
             } else if action.eq_ignore_ascii_case("SPEED") {
-                let speed_str = parts.next().ok_or(CommandParseError::MissingArgument("speed (100K/12K5)"))?;
+                let speed_str = parts
+                    .next()
+                    .ok_or(CommandParseError::MissingArgument("speed (100K/12K5)"))?;
                 let high_speed = speed_str.eq_ignore_ascii_case("100K");
-                return Ok(Self::SetSpeed { channel, high_speed });
+                return Ok(Self::SetSpeed {
+                    channel,
+                    high_speed,
+                });
             } else if action.eq_ignore_ascii_case("FILTER") {
-                let sub = parts.next().ok_or(CommandParseError::MissingArgument("ALLOW/BLOCK/CLEAR"))?;
+                let sub = parts
+                    .next()
+                    .ok_or(CommandParseError::MissingArgument("ALLOW/BLOCK/CLEAR"))?;
                 if sub.eq_ignore_ascii_case("CLEAR") {
                     return Ok(Self::ChannelFilter {
                         channel,
                         action: FilterAction::Clear,
                     });
                 }
-                let lbl_str = parts.next().ok_or(CommandParseError::MissingArgument("octal label"))?;
-                let label = Label::parse_str(lbl_str).map_err(|_| CommandParseError::InvalidOctalLabel)?;
+                let lbl_str = parts
+                    .next()
+                    .ok_or(CommandParseError::MissingArgument("octal label"))?;
+                let label =
+                    Label::parse_str(lbl_str).map_err(|_| CommandParseError::InvalidOctalLabel)?;
                 if sub.eq_ignore_ascii_case("ALLOW") {
                     return Ok(Self::ChannelFilter {
                         channel,
@@ -317,47 +321,87 @@ impl HostCommand {
         }
 
         if cmd.eq_ignore_ascii_case("BIT") {
-            let tx_str = parts.next().ok_or(CommandParseError::MissingArgument("tx_ch"))?;
-            let rx_str = parts.next().ok_or(CommandParseError::MissingArgument("rx_ch"))?;
-            let tx_channel = tx_str.parse::<u8>().map_err(|_| CommandParseError::InvalidChannel)?;
-            let rx_channel = rx_str.parse::<u8>().map_err(|_| CommandParseError::InvalidChannel)?;
-            return Ok(Self::RunBit { tx_channel, rx_channel });
+            let tx_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("tx_ch"))?;
+            let rx_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("rx_ch"))?;
+            let tx_channel = tx_str
+                .parse::<u8>()
+                .map_err(|_| CommandParseError::InvalidChannel)?;
+            let rx_channel = rx_str
+                .parse::<u8>()
+                .map_err(|_| CommandParseError::InvalidChannel)?;
+            return Ok(Self::RunBit {
+                tx_channel,
+                rx_channel,
+            });
         }
 
         if cmd.eq_ignore_ascii_case("MODE") {
-            let mode_str = parts.next().ok_or(CommandParseError::MissingArgument("BIN/ASCII"))?;
+            let mode_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("BIN/ASCII"))?;
             let is_bin = mode_str.eq_ignore_ascii_case("BIN");
-            return Ok(Self::SetMode { binary_mode: is_bin });
+            return Ok(Self::SetMode {
+                binary_mode: is_bin,
+            });
         }
 
         if cmd.eq_ignore_ascii_case("TXRAW") {
-            let ch_str = parts.next().ok_or(CommandParseError::MissingArgument("channel"))?;
-            let hex_token = parts.next().ok_or(CommandParseError::MissingArgument("hex_word"))?;
-            let channel = ch_str.parse::<u8>().map_err(|_| CommandParseError::InvalidChannel)?;
+            let ch_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("channel"))?;
+            let hex_token = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("hex_word"))?;
+            let channel = ch_str
+                .parse::<u8>()
+                .map_err(|_| CommandParseError::InvalidChannel)?;
             let hex_str = strip_hex_prefix(hex_token);
-            let raw_word = u32::from_str_radix(hex_str, 16).map_err(|_| CommandParseError::InvalidHexWord)?;
+            let raw_word =
+                u32::from_str_radix(hex_str, 16).map_err(|_| CommandParseError::InvalidHexWord)?;
             return Ok(Self::SendRaw { channel, raw_word });
         }
 
         if cmd.eq_ignore_ascii_case("TX") {
-            let ch_str = parts.next().ok_or(CommandParseError::MissingArgument("channel"))?;
-            let label_str = parts.next().ok_or(CommandParseError::MissingArgument("octal label"))?;
-            let sdi_str = parts.next().ok_or(CommandParseError::MissingArgument("sdi"))?;
-            let data_str = parts.next().ok_or(CommandParseError::MissingArgument("data_hex"))?;
-            let ssm_str = parts.next().ok_or(CommandParseError::MissingArgument("ssm"))?;
+            let ch_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("channel"))?;
+            let label_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("octal label"))?;
+            let sdi_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("sdi"))?;
+            let data_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("data_hex"))?;
+            let ssm_str = parts
+                .next()
+                .ok_or(CommandParseError::MissingArgument("ssm"))?;
 
-            let channel = ch_str.parse::<u8>().map_err(|_| CommandParseError::InvalidChannel)?;
-            let label = Label::parse_str(label_str).map_err(|_| CommandParseError::InvalidOctalLabel)?;
-            let sdi = sdi_str.parse::<u8>().map_err(|_| CommandParseError::InvalidSdi(0))?;
+            let channel = ch_str
+                .parse::<u8>()
+                .map_err(|_| CommandParseError::InvalidChannel)?;
+            let label =
+                Label::parse_str(label_str).map_err(|_| CommandParseError::InvalidOctalLabel)?;
+            let sdi = sdi_str
+                .parse::<u8>()
+                .map_err(|_| CommandParseError::InvalidSdi(0))?;
             if sdi > 3 {
                 return Err(CommandParseError::InvalidSdi(sdi));
             }
             let hex_str = strip_hex_prefix(data_str);
-            let data = u32::from_str_radix(hex_str, 16).map_err(|_| CommandParseError::InvalidDataHex)?;
+            let data =
+                u32::from_str_radix(hex_str, 16).map_err(|_| CommandParseError::InvalidDataHex)?;
             if data > 0x0007_FFFF {
                 return Err(CommandParseError::DataOutOfRange(data));
             }
-            let ssm = ssm_str.parse::<u8>().map_err(|_| CommandParseError::InvalidSsm(0))?;
+            let ssm = ssm_str
+                .parse::<u8>()
+                .map_err(|_| CommandParseError::InvalidSsm(0))?;
             if ssm > 3 {
                 return Err(CommandParseError::InvalidSsm(ssm));
             }
@@ -382,7 +426,14 @@ mod tests {
 
     #[test]
     fn test_binary_frame_codec() {
-        let frame = BinaryFrame::new_full(frame_types::ARINC_DATA, 1, flags::SPEED_100K, 42, 1234567, 0x812345C8);
+        let frame = BinaryFrame::new_full(
+            frame_types::ARINC_DATA,
+            1,
+            flags::SPEED_100K,
+            42,
+            1234567,
+            0x812345C8,
+        );
         let mut buf = [0u8; BINARY_FRAME_LEN];
         assert_eq!(buf.len(), 16);
         frame.encode(&mut buf);
@@ -411,10 +462,22 @@ mod tests {
         assert_eq!(cmd_ping, HostCommand::Ping);
 
         let cmd1 = HostCommand::parse("CHCFG 0 SPEED 100K").unwrap();
-        assert_eq!(cmd1, HostCommand::SetSpeed { channel: 0, high_speed: true });
+        assert_eq!(
+            cmd1,
+            HostCommand::SetSpeed {
+                channel: 0,
+                high_speed: true
+            }
+        );
 
         let cmd2 = HostCommand::parse("TXRAW 1 0x812345C8").unwrap();
-        assert_eq!(cmd2, HostCommand::SendRaw { channel: 1, raw_word: 0x812345C8 });
+        assert_eq!(
+            cmd2,
+            HostCommand::SendRaw {
+                channel: 1,
+                raw_word: 0x812345C8
+            }
+        );
 
         let cmd3 = HostCommand::parse("CHCFG 0 FILTER ALLOW 310").unwrap();
         assert_eq!(
@@ -426,7 +489,13 @@ mod tests {
         );
 
         let cmd4 = HostCommand::parse("BIT 0 1").unwrap();
-        assert_eq!(cmd4, HostCommand::RunBit { tx_channel: 0, rx_channel: 1 });
+        assert_eq!(
+            cmd4,
+            HostCommand::RunBit {
+                tx_channel: 0,
+                rx_channel: 1
+            }
+        );
 
         // 测试新增的 CHCFG 命令
         let cmd5 = HostCommand::parse("CHCFG 2 ENABLE RX 12K5").unwrap();
@@ -488,11 +557,20 @@ mod tests {
     #[test]
     fn test_parse_commands_robustness_and_errors() {
         assert_eq!(HostCommand::parse(""), Err(CommandParseError::EmptyCommand));
-        assert_eq!(HostCommand::parse("UNKNOWN_CMD"), Err(CommandParseError::UnknownCommand));
+        assert_eq!(
+            HostCommand::parse("UNKNOWN_CMD"),
+            Err(CommandParseError::UnknownCommand)
+        );
 
         // SDI / SSM 越界必须返回对应错误
-        assert_eq!(HostCommand::parse("TX 0 310 4 0x12 2"), Err(CommandParseError::InvalidSdi(4)));
-        assert_eq!(HostCommand::parse("TX 0 310 1 0x12 4"), Err(CommandParseError::InvalidSsm(4)));
+        assert_eq!(
+            HostCommand::parse("TX 0 310 4 0x12 2"),
+            Err(CommandParseError::InvalidSdi(4))
+        );
+        assert_eq!(
+            HostCommand::parse("TX 0 310 1 0x12 4"),
+            Err(CommandParseError::InvalidSsm(4))
+        );
         assert_eq!(
             HostCommand::parse("TX 0 310 1 0x80000 2"),
             Err(CommandParseError::DataOutOfRange(0x80000))
@@ -520,12 +598,18 @@ mod tests {
     #[test]
     fn test_binary_frame_decode_error_types() {
         // 缓冲区长度不足
-        assert_eq!(BinaryFrame::decode(&[0x41]), Err(DecodeError::BufferTooShort));
+        assert_eq!(
+            BinaryFrame::decode(&[0x41]),
+            Err(DecodeError::BufferTooShort)
+        );
 
         // Magic 错误
         let mut invalid_magic = [0u8; BINARY_FRAME_LEN];
         invalid_magic[0] = 0x00;
         invalid_magic[1] = 0x00;
-        assert_eq!(BinaryFrame::decode(&invalid_magic), Err(DecodeError::InvalidMagic));
+        assert_eq!(
+            BinaryFrame::decode(&invalid_magic),
+            Err(DecodeError::InvalidMagic)
+        );
     }
 }

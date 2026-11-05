@@ -16,9 +16,7 @@ impl Default for FrameStreamDecoder {
 
 impl FrameStreamDecoder {
     pub const fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-        }
+        Self { buffer: Vec::new() }
     }
 
     /// 喂入新的字节切片并返回当前已完整解码的帧列表
@@ -29,7 +27,8 @@ impl FrameStreamDecoder {
 
         while cursor + BINARY_FRAME_LEN <= self.buffer.len() {
             // 搜索 Magic 头部 0x41, 0x29 ("A)")
-            if self.buffer[cursor] == BINARY_MAGIC[0] && self.buffer[cursor + 1] == BINARY_MAGIC[1] {
+            if self.buffer[cursor] == BINARY_MAGIC[0] && self.buffer[cursor + 1] == BINARY_MAGIC[1]
+            {
                 let candidate = &self.buffer[cursor..cursor + BINARY_FRAME_LEN];
                 if let Ok(frame) = BinaryFrame::decode(candidate) {
                     frames.push(frame);
