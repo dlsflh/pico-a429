@@ -19,30 +19,31 @@
    - TX 微码（11 条）+ RX 微码（20 条）= 31 条指令，单块 PIO 内存（32 字）一次性常驻装载，通道切换收发方向零动态重载开销；
 4. **$O(1)$ 高性能 Label 过滤器**：
    - 内置 256-bit 位图过滤引擎（仅占 32 字节 RAM），支持白名单、黑名单与全放行模式；
-5. **免编译 Python 极速工具链与防死锁 USB CDC**：
-   - USB CDC IN 写入增加 100ms 超时保护，RX 入队非阻塞，彻底消除 Windows `Write timeout`；
+5. **全对称 16 字节纯二进制协议与单核确定性执行**：
+   - 全面淘汰 ASCII 文本指令，采用 16 字节定长二进制帧（`BinaryFrame`）及硬件 CRC16 校验；
+   - 固件消除所有动态字符串格式化与堆内存分配，Flash 空间大幅缩减 42 KB，彻底避免 USB 阻塞与内存碎裂；
    - 提供**免编译 Python 极速工具链 (`tools/pico429.py`)**，支持 12 通道一键 TOML 载入、状态导出、片上 Flash 配置持久化与交互自检。
 
 ---
 
 ## 二、 硬件引脚分配 (12 通道物理引脚分布 GP0..GP21, GP26..GP27)
 
-| 通道 | 状态机分配 | 物理引脚 A (Pin A) | 物理引脚 B (Pin B) | 出厂默认方向 | 默认速率 |
+| 通道 | 状态机分配 | 物理引脚 A (Pin A) | 物理引脚 B (Pin B) | 上电初始基态 | 默认速率 |
 | :---: | :---: | :---: | :---: | :---: | :---: |
-| **CH0** | `PIO0_SM0` | **GP0** (Pin 1) | **GP1** (Pin 2) | TX (发送) | High (100k) |
-| **CH1** | `PIO0_SM1` | **GP2** (Pin 4) | **GP3** (Pin 5) | RX (接收) | High (100k) |
-| **CH2** | `PIO0_SM2` | **GP4** (Pin 6) | **GP5** (Pin 7) | RX (接收) | High (100k) |
-| **CH3** | `PIO0_SM3` | **GP6** (Pin 9) | **GP7** (Pin 10) | RX (接收) | High (100k) |
-| **CH4** | `PIO1_SM0` | **GP8** (Pin 11) | **GP9** (Pin 12) | RX (接收) | High (100k) |
-| **CH5** | `PIO1_SM1` | **GP10** (Pin 14) | **GP11** (Pin 15) | RX (接收) | High (100k) |
-| **CH6** | `PIO1_SM2` | **GP12** (Pin 16) | **GP13** (Pin 17) | RX (接收) | High (100k) |
-| **CH7** | `PIO1_SM3` | **GP14** (Pin 19) | **GP15** (Pin 20) | RX (接收) | High (100k) |
-| **CH8** | `PIO2_SM0` | **GP16** (Pin 21) | **GP17** (Pin 22) | RX (接收) | High (100k) |
-| **CH9** | `PIO2_SM1` | **GP18** (Pin 24) | **GP19** (Pin 25) | RX (接收) | High (100k) |
-| **CH10** | `PIO2_SM2` | **GP20** (Pin 26) | **GP21** (Pin 27) | RX (接收) | High (100k) |
-| **CH11** | `PIO2_SM3` | **GP26** (Pin 31) | **GP27** (Pin 32) | RX (接收) | High (100k) |
+| **CH0** | `PIO0_SM0` | **GP0** (Pin 1) | **GP1** (Pin 2) | Disabled (静默) | High (100k) |
+| **CH1** | `PIO0_SM1` | **GP2** (Pin 4) | **GP3** (Pin 5) | Disabled (静默) | High (100k) |
+| **CH2** | `PIO0_SM2` | **GP4** (Pin 6) | **GP5** (Pin 7) | Disabled (静默) | High (100k) |
+| **CH3** | `PIO0_SM3` | **GP6** (Pin 9) | **GP7** (Pin 10) | Disabled (静默) | High (100k) |
+| **CH4** | `PIO1_SM0` | **GP8** (Pin 11) | **GP9** (Pin 12) | Disabled (静默) | High (100k) |
+| **CH5** | `PIO1_SM1` | **GP10** (Pin 14) | **GP11** (Pin 15) | Disabled (静默) | High (100k) |
+| **CH6** | `PIO1_SM2` | **GP12** (Pin 16) | **GP13** (Pin 17) | Disabled (静默) | High (100k) |
+| **CH7** | `PIO1_SM3` | **GP14** (Pin 19) | **GP15** (Pin 20) | Disabled (静默) | High (100k) |
+| **CH8** | `PIO2_SM0` | **GP16** (Pin 21) | **GP17** (Pin 22) | Disabled (静默) | High (100k) |
+| **CH9** | `PIO2_SM1` | **GP18** (Pin 24) | **GP19** (Pin 25) | Disabled (静默) | High (100k) |
+| **CH10** | `PIO2_SM2` | **GP20** (Pin 26) | **GP21** (Pin 27) | Disabled (静默) | High (100k) |
+| **CH11** | `PIO2_SM3` | **GP26** (Pin 31) | **GP27** (Pin 32) | Disabled (静默) | High (100k) |
 
-> **出厂默认安全状态**：CH0 为 TX, CH1 为 RX（保持 GP0..GP3 双通道测试夹具兼容），CH2..11 为被动监听 RX（高阻弱下拉，电气绝对安全）。
+> **出厂默认安全状态**：上电时固件默认进入 **Config 模式**，全部 12 通道处于 Disabled 静默状态（高阻弱下拉，电气绝对安全），等待上位机下发批量配置；若 Flash 槽位配置了开机自启动 Profile，则在上电时自动原子加载并切入 **Operational 模式**。
 > **引脚说明**：Pico 物理 Pin 30 为硬件 `RUN` (复位脚)，GP23 为板载内部专用引脚；因此 Channel 11 采用排针引出的 `GP26` (Pin 31) 与 `GP27` (Pin 32)。
 > **自测短接环回**：在无外部收发芯片时，可直接用杜邦线短接 `GP0 -> GP2` 与 `GP1 -> GP3` 执行单卡闭环 BIT。
 
@@ -108,11 +109,15 @@ uv run --with pyserial python tools/pico429.py config 0 --enable --dir TX --spee
 uv run --with pyserial python tools/pico429.py speed 0 low
 uv run --with pyserial python tools/pico429.py filter 1 --allow 310
 
-# 6. 12 通道 TOML 配置文件管理与一键加载 (模式 B)
+# 6. 切换工作模式 (Config 物理静默重配 / Operational 总线运行)
+uv run --with pyserial python tools/pico429.py opmode config
+uv run --with pyserial python tools/pico429.py opmode operational
+
+# 7. 12 通道 TOML 配置文件管理与一键加载
 # 导出当前固件 12 通道配置为 TOML 模板
 uv run --with pyserial python tools/pico429.py profile dump -o my_bench.toml
 
-# 按照 TOML 配置文件一键原子重构所有 12 通道 (安全暂停 -> 应用 -> 恢复)
+# 按照 TOML 配置文件一键原子重构所有 12 通道 (下发 CFGBATCH)
 uv run --with pyserial python tools/pico429.py profile apply my_bench.toml
 
 # 将当前配置持久化保存至片上 Flash 存储槽位 (0..3)
@@ -127,9 +132,9 @@ uv run --with pyserial python tools/pico429.py profile load 0
 # 设置指定槽位为上电默认自启动
 uv run --with pyserial python tools/pico429.py profile boot 0
 
-# 7. 发送单个构造字
-uv run --with pyserial python tools/pico429.py send --label 310 --data 0x1234
+# 8. 发送单个构造字 (Label 310, 数据 0x1234, 自动奇校验)
+uv run --with pyserial python tools/pico429.py send --channel 0 --label 310 --data 0x1234
 
-# 8. 彩色监听总线数据流
+# 9. 彩色监听总线数据流
 uv run --with pyserial python tools/pico429.py listen
 ```

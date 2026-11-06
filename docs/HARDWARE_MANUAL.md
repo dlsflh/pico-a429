@@ -4,36 +4,62 @@
 
 ---
 
-## 一、 Pico 2 W (RP2350) 核心引脚物理定义
+## 一、 Pico 2 W (RP2350) 40 引脚物理排针全景总线映射
 
-Pico 2 W 共有 40 个物理引脚（DIP-40 封装，间距 2.54mm）。下表列出本项目 ARINC 429 通道 0 默认占用的引脚及电源地线分布：
+Pico 2 W 共有 40 个物理排针引脚（标准 DIP-40 封装，间距 2.54mm）。本项目 12 通道 ARINC 429 收发系统（每通道独立 A / B 差分双线，共占用 24 个物理 GPIO）的完整物理引脚全景分布如下：
 
 ```
-                           Pico 2 W Pinout (ARINC 429 CH0)
-                                    ┌─── USB ───┐
-      (TX_A) GPIO 0  [Pin 1]  ───● │           │ ●─── [Pin 40] VBUS (5V 输入)
-      (TX_B) GPIO 1  [Pin 2]  ───● │           │ ●─── [Pin 39] VSYS
-                GND  [Pin 3]  ───● │           │ ●─── [Pin 38] GND (系统地)
-      (RX_A) GPIO 2  [Pin 4]  ───● │           │ ●─── [Pin 37] 3V3_EN
-      (RX_B) GPIO 3  [Pin 5]  ───● │           │ ●─── [Pin 36] 3V3_OUT (3.3V 输出)
-             GPIO 4  [Pin 6]  ───● │           │ ●─── [Pin 35] ADC_VREF
-             GPIO 5  [Pin 7]  ───● │           │ ●─── [Pin 34] GPIO 28
-                GND  [Pin 8]  ───● │           │ ●─── [Pin 33] GND
-                                   │    ...    │
-                                   └───────────┘
+                               Pico 2 W 40-Pin 全景总线映射图
+                                        ┌─── USB ───┐
+ (CH0 Pin A / TX0_A) GPIO 0   [Pin 1]  ───● │           │ ●─── [Pin 40] VBUS (5V 输入)
+ (CH0 Pin B / TX0_B) GPIO 1   [Pin 2]  ───● │           │ ●─── [Pin 39] VSYS (系统电源输入)
+                     GND      [Pin 3]  ───● │           │ ●─── [Pin 38] GND (系统地)
+ (CH1 Pin A / RX0_A) GPIO 2   [Pin 4]  ───● │           │ ●─── [Pin 37] 3V3_EN (3.3V 使能)
+ (CH1 Pin B / RX0_B) GPIO 3   [Pin 5]  ───● │           │ ●─── [Pin 36] 3V3_OUT (3.3V 逻辑电源输出)
+ (CH2 Pin A)         GPIO 4   [Pin 6]  ───● │           │ ●─── [Pin 35] ADC_VREF
+ (CH2 Pin B)         GPIO 5   [Pin 7]  ───● │           │ ●─── [Pin 34] GPIO 28 (未占用备用)
+                     GND      [Pin 8]  ───● │           │ ●─── [Pin 33] AGND (模拟地)
+ (CH3 Pin A)         GPIO 6   [Pin 9]  ───● │           │ ●─── [Pin 32] GPIO 27 (CH11 Pin B)
+ (CH3 Pin B)         GPIO 7   [Pin 10] ───● │           │ ●─── [Pin 31] GPIO 26 (CH11 Pin A)
+ (CH4 Pin A)         GPIO 8   [Pin 11] ───● │           │ ●─── [Pin 30] RUN (芯片复位控制，严禁接线)
+ (CH4 Pin B)         GPIO 9   [Pin 12] ───● │           │ ●─── [Pin 29] GPIO 22 (未占用备用)
+                     GND      [Pin 13] ───● │           │ ●─── [Pin 28] GND (系统地)
+ (CH5 Pin A)         GPIO 10  [Pin 14] ───● │           │ ●─── [Pin 27] GPIO 21 (CH10 Pin B)
+ (CH5 Pin B)         GPIO 11  [Pin 15] ───● │           │ ●─── [Pin 26] GPIO 20 (CH10 Pin A)
+ (CH6 Pin A)         GPIO 12  [Pin 16] ───● │           │ ●─── [Pin 25] GPIO 19 (CH9 Pin B)
+ (CH6 Pin B)         GPIO 13  [Pin 17] ───● │           │ ●─── [Pin 24] GPIO 18 (CH9 Pin A)
+                     GND      [Pin 18] ───● │           │ ●─── [Pin 23] GND (系统地)
+ (CH7 Pin A)         GPIO 14  [Pin 19] ───● │           │ ●─── [Pin 22] GPIO 17 (CH8 Pin B)
+ (CH7 Pin B)         GPIO 15  [Pin 20] ───● │           │ ●─── [Pin 21] GPIO 16 (CH8 Pin A)
+                                        └───────────┘
 ```
 
-### 默认引脚功能定义表 (Channel 0)
+> ⚠️ **排针接线硬件避坑规范 (必读)**：
+> 1. **Pin 30 (`RUN`) 为单片机硬件复位脚**：绝对禁止连接任何信号线或误碰地线，拉低直接导致芯片硬件复位！
+> 2. **内部引脚说明**：Pico 2 W 上的 `GP23, GP24, GP25, GP29` 为板载 CYW43439 芯片专用内部布线，开发板排针上**根本未引出**。因此 Channel 11 采用排针正式引出的 `GP26` (Pin 31) 与 `GP27` (Pin 32)。
+> 3. **未占用备用引脚**：`GP22` (Pin 29) 与 `GP28` (Pin 34) 处于空闲状态，可作为用户自定义外部同步信号或触发输出。
 
-| 物理引脚 | 芯片 GPIO | 信号名称 | 方向 (相对MCU) | 内部上下拉配置 | 电气标准 | 说明 |
-| :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Pin 1** | **GP0** | `TX0_A` | 输出 (OUT) | 浮空 (None) | 3.3V CMOS | 发送通道 A 脉冲 (逻辑 1 为高) |
-| **Pin 2** | **GP1** | `TX0_B` | 输出 (OUT) | 浮空 (None) | 3.3V CMOS | 发送通道 B 脉冲 (逻辑 0 为高) |
-| **Pin 3** | **GND** | 地线 | - | - | 0V 电位 | **必须与收发器地共地** |
-| **Pin 4** | **GP2** | `RX0_A` | 输入 (IN) | 下拉 (Pull-Down) | 3.3V CMOS | 接收通道 A 脉冲 (+10V 为高) |
-| **Pin 5** | **GP3** | `RX0_B` | 输入 (IN) | 下拉 (Pull-Down) | 3.3V CMOS | 接收通道 B 脉冲 (-10V 为高) |
-| **Pin 36**| **3V3** | 电源输出 | 输出 (3.3V) | - | 3.3V 最大300mA | 可供电给 3.3V 接收比较器 |
-| **Pin 38**| **GND** | 地线 | - | - | 0V 电位 | 屏蔽层与电源返回地 |
+### 核心引脚电气与通道映射定义表
+
+| 物理排针 | 芯片 GPIO | 绑定通道 | 信号属性 | 方向 (相对MCU) | 内部上下拉配置 | 电气标准 | 作用说明 |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Pin 1** | **GP0** | **CH0** | `CH0_A` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH0 A 脉冲 (上电初始静默，可配为 TX 或 RX) |
+| **Pin 2** | **GP1** | **CH0** | `CH0_B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH0 B 脉冲 (上电初始静默，可配为 TX 或 RX) |
+| **Pin 3** | **GND** | 全部 | 地线 | - | - | 0V 电位 | **必须与所有外部收发器共地** |
+| **Pin 4** | **GP2** | **CH1** | `CH1_A` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH1 A 脉冲 (上电初始静默，可配为 TX 或 RX) |
+| **Pin 5** | **GP3** | **CH1** | `CH1_B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH1 B 脉冲 (上电初始静默，可配为 TX 或 RX) |
+| **Pin 6, 7** | **GP4, GP5** | **CH2** | `CH2_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH2 差分信号对 (可配为 TX 或 RX) |
+| **Pin 9, 10** | **GP6, GP7** | **CH3** | `CH3_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH3 差分信号对 (可配为 TX 或 RX) |
+| **Pin 11, 12** | **GP8, GP9** | **CH4** | `CH4_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH4 差分信号对 (可配为 TX 或 RX) |
+| **Pin 14, 15** | **GP10, GP11** | **CH5** | `CH5_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH5 差分信号对 (可配为 TX 或 RX) |
+| **Pin 16, 17** | **GP12, GP13** | **CH6** | `CH6_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH6 差分信号对 (可配为 TX 或 RX) |
+| **Pin 19, 20** | **GP14, GP15** | **CH7** | `CH7_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH7 差分信号对 (可配为 TX 或 RX) |
+| **Pin 21, 22** | **GP16, GP17** | **CH8** | `CH8_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH8 差分信号对 (可配为 TX 或 RX) |
+| **Pin 24, 25** | **GP18, GP19** | **CH9** | `CH9_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH9 差分信号对 (可配为 TX 或 RX) |
+| **Pin 26, 27** | **GP20, GP21** | **CH10** | `CH10_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH10 差分信号对 (可配为 TX 或 RX) |
+| **Pin 31, 32** | **GP26, GP27** | **CH11** | `CH11_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | **CH11 差分信号对 (排针引出，可配为 TX/RX)** |
+| **Pin 36**| **3V3** | 电源输出 | 3.3V 逻辑电源 | 输出 (3.3V) | - | 3.3V 最大300mA | 外部电平转换或光耦隔离供电 |
+| **Pin 38**| **GND** | 全部 | 地线 | - | - | 0V 电位 | 屏蔽双绞线屏蔽层与电源返回地 |
 
 ---
 
@@ -168,7 +194,7 @@ RP2350 具备 3 个 PIO 块（PIO0, PIO1, PIO2）共 12 个独立状态机。本
 | **Channel 8** | **GP16 / GP17** | Pin 21 / Pin 22 | **PIO2 / SM0** | PIO FIFO 异步中断 | 低速飞控/导航总线扩展 |
 | **Channel 9** | **GP18 / GP19** | Pin 24 / Pin 25 | **PIO2 / SM1** | PIO FIFO 异步中断 | 低速飞控/导航总线扩展 |
 | **Channel 10**| **GP20 / GP21** | Pin 26 / Pin 27 | **PIO2 / SM2** | PIO FIFO 异步中断 | 发动机参数监测采集 |
-| **Channel 11**| **GP22 / GP23** | Pin 29 / 内部 (Wi-Fi 禁用) | **PIO2 / SM3** | PIO FIFO 异步中断 | 大气数据机总线采集 |
+| **Channel 11**| **GP26 / GP27** | Pin 31 / Pin 32 | **PIO2 / SM3** | PIO FIFO 异步中断 | 大气数据机总线采集 |
 
 > ⚠️ **BIT 环回测试注意事项**：
 > 当指定 Channel A 与 Channel B 进行对插自测试（如 `uv run python tools/pico429.py bit --tx 0 --rx 1`）时，务必在回路中串接 $100\,\Omega \sim 330\,\Omega$ 限流电阻，并在执行前确保两通道地线共地。
