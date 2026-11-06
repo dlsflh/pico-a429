@@ -32,7 +32,6 @@ pub struct ChannelDevice<'d, T: Instance, const SM: usize> {
     direction: ChannelDirection,
     speed: ArincSpeed,
     filter: LabelFilter,
-    is_paused: bool,
 }
 
 impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
@@ -60,7 +59,6 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
             direction: ChannelDirection::Disabled,
             speed: initial_speed,
             filter,
-            is_paused: false,
         };
 
         dev.reconfigure(initial_dir, initial_speed);
@@ -103,11 +101,9 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
 
         match dir {
             ChannelDirection::Tx => {
-                // 配置物理引脚为无上拉推挽输出
+                // 配置物理引脚为无上拉输出或在 Config 模式下保持高阻输入
                 self.pin_a.set_pull(Pull::None);
                 self.pin_b.set_pull(Pull::None);
-                self.sm
-                    .set_pin_dirs(Direction::Out, &[&self.pin_a, &self.pin_b]);
 
                 let mut cfg = embassy_rp::pio::Config::default();
                 cfg.use_program(self.tx_prog, &[]);
@@ -123,9 +119,16 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                 cfg.clock_divider = clkdiv;
 
                 self.sm.set_config(&cfg);
-                self.sm.restart();
-                if !self.is_paused {
+
+                if !crate::channel::is_config_mode() {
+                    self.sm
+                        .set_pin_dirs(Direction::Out, &[&self.pin_a, &self.pin_b]);
+                    self.sm.restart();
                     self.sm.set_enable(true);
+                } else {
+                    self.sm
+                        .set_pin_dirs(Direction::In, &[&self.pin_a, &self.pin_b]);
+                    self.sm.set_enable(false);
                 }
             }
             ChannelDirection::Rx => {
@@ -153,9 +156,12 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                 cfg.clock_divider = clkdiv;
 
                 self.sm.set_config(&cfg);
-                self.sm.restart();
-                if !self.is_paused {
+
+                if !crate::channel::is_config_mode() {
+                    self.sm.restart();
                     self.sm.set_enable(true);
+                } else {
+                    self.sm.set_enable(false);
                 }
             }
             ChannelDirection::Disabled => {
@@ -168,18 +174,30 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
         }
     }
 
-    /// 暂停物理收发工作
+    /// 暂停物理收发工作 (切换引脚为高阻输入以确保物理总线静默)
     pub fn pause(&mut self) {
-        self.is_paused = true;
         self.sm.set_enable(false);
+        if self.direction == ChannelDirection::Tx {
+            self.sm
+                .set_pin_dirs(Direction::In, &[&self.pin_a, &self.pin_b]);
+        }
     }
 
-    /// 恢复物理收发工作
+    /// 恢复物理收发工作 (必须受全局 OperatingMode 严格把关)
     pub fn resume(&mut self) {
-        self.is_paused = false;
-        if self.direction != ChannelDirection::Disabled {
+        if self.direction != ChannelDirection::Disabled && !crate::channel::is_config_mode() {
+            if self.direction == ChannelDirection::Tx {
+                self.sm
+                    .set_pin_dirs(Direction::Out, &[&self.pin_a, &self.pin_b]);
+            }
             self.sm.restart();
             self.sm.set_enable(true);
+        } else {
+            self.sm.set_enable(false);
+            if self.direction == ChannelDirection::Tx {
+                self.sm
+                    .set_pin_dirs(Direction::In, &[&self.pin_a, &self.pin_b]);
+            }
         }
     }
 
@@ -229,8 +247,11 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                 self.handle_cmd(channel_id, cmd);
             }
 
-            if self.is_paused || self.direction == ChannelDirection::Disabled {
-                // 挂起或停用状态：休眠等待控制命令激活
+            let is_operational =
+                !crate::channel::is_config_mode() && self.direction != ChannelDirection::Disabled;
+
+            if !is_operational {
+                // 挂起或处于 Config 维护模式或停用状态：休眠等待控制命令激活
                 let cmd = CHANNEL_CTRL_QUEUES[channel_id as usize].receive().await;
                 self.handle_cmd(channel_id, cmd);
             } else if self.direction == ChannelDirection::Tx {

@@ -1,95 +1,82 @@
-//! USB CDC-ACM 虚拟串口服务
+//! USB CDC-ACM 全二进制通信服务 (no_std)
 //!
 //! 提供免驱动的全速 USB 串口通信：
-//! - 极低延迟与高吞吐量 (12 Mbps 带宽，满载 ARINC 429 流量仅占用不到 2%)
-//! - 严格支持定长 16 字节二进制模式 (BinaryFrame) 与终端交互 ASCII 模式动态切换
-//! - 二进制模式下对命令回执与 BIT 报告采用标准帧封装，杜绝字符流污染
-//! - 命令解析、执行与响应序列化彻底解耦，保障宿主可测试性
+//! - 采用对称、定长 16 字节通用二进制通信帧 (BinaryFrame)；
+//! - 完美整除 USB 64 字节端点 ($4 \times 16 = 64$)，零填充碎片；
+//! - 严格采用 1 字节增量滑动窗口搜帧，彻底免疫任意相位偏移与流失步；
+//! - 固件内部零字符串格式化、零堆分配，具备确定性的硬实时响应。
 
-use core::fmt::Write as FmtWrite;
-use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_futures::select::{select, Either};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_usb::class::cdc_acm::{Receiver, Sender};
-use heapless::String;
 
+use arinc429_core::label::Label;
 use arinc429_core::protocol::{
-    flags, frame_types, BinaryFrame, FilterAction, HostCommand, BINARY_FRAME_LEN,
+    ack_status, find_frame_in_stream, frame_types, opcodes, pack_12_channels, profile_sub_ops,
+    unpack_12_channels, unpack_channel_nibble, BinaryFrame, FilterAction, BINARY_FRAME_LEN,
 };
-use arinc429_core::word::ArincWord;
 
 use crate::channel::{
     channel_direction, channel_is_high_speed, send_to_channel_ctrl, send_to_channel_tx,
-    set_channel_direction, set_channel_speed, ChannelControlCmd, ChannelDirection, ChannelError,
-    InboundArincFrame, ACTIVE_CHANNEL_COUNT, GLOBAL_RX_PUBSUB,
+    set_channel_direction, set_channel_speed, ChannelControlCmd, ChannelDirection,
+    ACTIVE_CHANNEL_COUNT, GLOBAL_RX_PUBSUB,
 };
 
-/// 推送模式：true 表示二进制高速帧，false 表示 ASCII 文本 (默认启动为 ASCII 便于调试验证)
-pub static BINARY_OUTPUT_MODE: AtomicBool = AtomicBool::new(false);
-
 /// 向上位机发送控制命令回执的专用非阻塞队列 (深度 16，防突发指令丢弃)
-pub static USB_CMD_RESP_QUEUE: Channel<CriticalSectionRawMutex, CommandExecutionResult, 16> =
-    Channel::new();
+pub static USB_CMD_RESP_QUEUE: Channel<CriticalSectionRawMutex, BinaryFrame, 16> = Channel::new();
 
 #[embassy_executor::task]
 pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, Driver<'static, USB>>) {
     usb_device.run().await;
 }
 
-/// 独立的 USB CDC 接收任务：专职读取上位机下发的控制指令
+/// 独立的 USB CDC 接收任务：专职读取上位机下发的二进制控制命令 (CMD_REQ)
 ///
 /// 架构隔离：绝不受下行发送阻塞影响，USB OUT 端点始终处于就绪武装状态，彻底杜绝上位机写入超时 (Win32 Error 121)。
 #[embassy_executor::task]
 pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB>>) {
-    let mut rx_buf = [0u8; 128];
-    let mut rx_line = String::<128>::new();
-    let mut overflow_discard = false;
+    let mut rx_packet = [0u8; 64];
+    let mut stream_buf = [0u8; 128];
+    let mut stream_len = 0usize;
 
     receiver.wait_connection().await;
 
     loop {
-        match receiver.read_packet(&mut rx_buf).await {
+        match receiver.read_packet(&mut rx_packet).await {
             Ok(0) => {} // 忽略零长包
             Ok(n) => {
-                for &b in &rx_buf[..n] {
-                    if b == b'\r' || b == b'\n' {
-                        if overflow_discard {
-                            overflow_discard = false;
-                            rx_line.clear();
-                        } else if !rx_line.is_empty() {
-                            let result = match HostCommand::parse(&rx_line) {
-                                Ok(cmd) => execute_host_command(cmd).await,
-                                Err(e) => {
-                                    let mut err_str = String::<64>::new();
-                                    core::write!(
-                                        err_str,
-                                        "ERR: Command parse failure: {:?}\r\n",
-                                        e
-                                    )
-                                    .ok();
-                                    CommandExecutionResult::ErrorDynamic(err_str)
-                                }
-                            };
-                            let _ = USB_CMD_RESP_QUEUE.try_send(result);
-                            rx_line.clear();
-                        }
-                    } else if overflow_discard {
-                        // 处于超长丢弃状态，跳过后续字符直至换行
-                    } else if rx_line.len() >= 120 {
-                        overflow_discard = true;
-                        rx_line.clear();
-                        let _ = USB_CMD_RESP_QUEUE.try_send(CommandExecutionResult::ErrorStatic(
-                            "ERR: Command line buffer overflow\r\n",
-                        ));
-                    } else {
-                        let _ = rx_line.push(b as char);
+                if stream_len + n > stream_buf.len() {
+                    // 防溢出保护：清空滑动缓冲并重新同步
+                    stream_len = 0;
+                }
+                stream_buf[stream_len..stream_len + n].copy_from_slice(&rx_packet[..n]);
+                stream_len += n;
+
+                // 采用 1 字节增量滑动窗口持续搜索合法帧
+                while let Some((frame, consumed)) =
+                    find_frame_in_stream(&stream_buf[..stream_len])
+                {
+                    if frame.frame_type == frame_types::CMD_REQ {
+                        execute_binary_command(frame).await;
                     }
+                    // 滑动移出已消耗字节 (包含噪声与完整帧)
+                    stream_buf.copy_within(consumed..stream_len, 0);
+                    stream_len -= consumed;
+                }
+
+                // 缓冲区即将耗尽且仍未匹配到帧头时，丢弃无效头部，仅保留最后不足一帧的数据
+                if stream_len > BINARY_FRAME_LEN * 2 {
+                    let keep = BINARY_FRAME_LEN - 1;
+                    let start = stream_len - keep;
+                    stream_buf.copy_within(start..stream_len, 0);
+                    stream_len = keep;
                 }
             }
             Err(_) => {
+                stream_len = 0;
                 receiver.wait_connection().await;
             }
         }
@@ -98,7 +85,7 @@ pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB
 
 /// 独立的 USB CDC 发送任务：统一调度命令回执与业务遥测流
 ///
-/// 优先保障上位机命令 ACK / 响应即时输出，在 host 未连接/未读时自动丢弃滞留总线遥测，消灭死锁。
+/// 优先保障上位机命令 ACK 即时输出，在 host 未连接/未读时自动丢弃滞留总线遥测，消灭死锁。
 #[embassy_executor::task]
 pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) {
     let mut bin_batch_buf = [0u8; 64];
@@ -111,60 +98,47 @@ pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) 
 
     loop {
         match select(USB_CMD_RESP_QUEUE.receive(), subscriber.next_message_pure()).await {
-            // 分支 1：命令回执 (最高调度优先级)
-            Either::First(result) => {
-                let is_binary = BINARY_OUTPUT_MODE.load(Ordering::Relaxed);
-                if send_execution_result(&mut sender, result, is_binary)
-                    .await
-                    .is_err()
-                {
+            // 分支 1：命令回执 (最高调度优先级，始终以 16 字节 CMD_ACK 二进制帧即刻响应)
+            Either::First(ack_frame) => {
+                let mut single_buf = [0u8; BINARY_FRAME_LEN];
+                ack_frame.encode(&mut single_buf);
+                if cdc_sender_write_all(&mut sender, &single_buf).await.is_err() {
                     sender.wait_connection().await;
                 }
             }
-            // 分支 2：总线接收遥测数据流
+            // 分支 2：总线接收遥测数据流 (16 字节 ARINC_DATA 二进制帧流)
             Either::Second(first_frame) => {
                 // 若 host 未就绪监听 (DTR 假)，静默跳过，避免总线背景流量塞满 IN 端点导致后续命令卡死
                 if !sender.dtr() {
                     continue;
                 }
 
-                if BINARY_OUTPUT_MODE.load(Ordering::Relaxed) {
-                    let mut offset = 0;
-                    let mut single_buf = [0u8; BINARY_FRAME_LEN];
+                let mut offset = 0;
+                let mut single_buf = [0u8; BINARY_FRAME_LEN];
 
-                    let bin = first_frame.to_binary_frame();
-                    bin.encode(&mut single_buf);
-                    bin_batch_buf[offset..offset + BINARY_FRAME_LEN].copy_from_slice(&single_buf);
-                    offset += BINARY_FRAME_LEN;
+                let bin = first_frame.to_binary_frame();
+                bin.encode(&mut single_buf);
+                bin_batch_buf[offset..offset + BINARY_FRAME_LEN].copy_from_slice(&single_buf);
+                offset += BINARY_FRAME_LEN;
 
-                    // 批量拉取当前队列中滞留的后续帧 (最多凑 4 帧 64 字节填满单包端点)
-                    while offset + BINARY_FRAME_LEN <= bin_batch_buf.len() {
-                        if let Some(next_frame) = subscriber.try_next_message_pure() {
-                            let next_bin = next_frame.to_binary_frame();
-                            next_bin.encode(&mut single_buf);
-                            bin_batch_buf[offset..offset + BINARY_FRAME_LEN]
-                                .copy_from_slice(&single_buf);
-                            offset += BINARY_FRAME_LEN;
-                        } else {
-                            break;
-                        }
+                // 批量拉取当前队列中滞留的后续帧 (最多凑 4 帧 64 字节填满单包端点)
+                while offset + BINARY_FRAME_LEN <= bin_batch_buf.len() {
+                    if let Some(next_frame) = subscriber.try_next_message_pure() {
+                        let next_bin = next_frame.to_binary_frame();
+                        next_bin.encode(&mut single_buf);
+                        bin_batch_buf[offset..offset + BINARY_FRAME_LEN]
+                            .copy_from_slice(&single_buf);
+                        offset += BINARY_FRAME_LEN;
+                    } else {
+                        break;
                     }
+                }
 
-                    if cdc_sender_write_all(&mut sender, &bin_batch_buf[..offset])
-                        .await
-                        .is_err()
-                    {
-                        sender.wait_connection().await;
-                    }
-                } else {
-                    let mut line = String::<128>::new();
-                    format_ascii_frame(&first_frame, &mut line);
-                    if cdc_sender_write_all(&mut sender, line.as_bytes())
-                        .await
-                        .is_err()
-                    {
-                        sender.wait_connection().await;
-                    }
+                if cdc_sender_write_all(&mut sender, &bin_batch_buf[..offset])
+                    .await
+                    .is_err()
+                {
+                    sender.wait_connection().await;
                 }
             }
         }
@@ -192,61 +166,6 @@ async fn cdc_sender_write_all(
         }
     }
     Ok(())
-}
-
-/// 指令执行结果枚举 (解耦执行器与 USB I/O)
-#[derive(Clone)]
-pub enum CommandExecutionResult {
-    Pong,
-    SuccessText(String<512>),
-    ErrorStatic(&'static str),
-    ErrorDynamic(String<64>),
-}
-
-/// 校验通道编号是否已装配且符合预期方向
-#[inline]
-fn validate_channel(
-    channel: u8,
-    expected: Option<ChannelDirection>,
-) -> Result<(), CommandExecutionResult> {
-    if (channel as usize) >= ACTIVE_CHANNEL_COUNT {
-        return Err(CommandExecutionResult::ErrorStatic(
-            "ERR: Channel out of range (active: 0..11)\r\n",
-        ));
-    }
-    if let Some(expected_dir) = expected {
-        if let Some(actual_dir) = channel_direction(channel) {
-            if actual_dir != expected_dir {
-                let mut resp = String::<64>::new();
-                core::write!(
-                    resp,
-                    "ERR: Channel {} is {:?}, but expected {:?}\r\n",
-                    channel,
-                    actual_dir,
-                    expected_dir
-                )
-                .ok();
-                return Err(CommandExecutionResult::ErrorDynamic(resp));
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn handle_channel_filter(channel: u8, action: FilterAction) -> CommandExecutionResult {
-    if let Err(err) = validate_channel(channel, Some(ChannelDirection::Rx)) {
-        return err;
-    }
-    let desc = match action {
-        FilterAction::Allow(_) => "Allowed",
-        FilterAction::Block(_) => "Blocked",
-        FilterAction::Clear => "Cleared",
-    };
-    let _ = send_to_channel_ctrl(channel, ChannelControlCmd::Filter(action)).await;
-
-    let mut resp = String::<512>::new();
-    core::write!(resp, "OK: Filter rule {} on Channel {}\r\n", desc, channel).ok();
-    CommandExecutionResult::SuccessText(resp)
 }
 
 /// 原子暂停全部 12 通道物理收发
@@ -288,467 +207,355 @@ pub async fn apply_all_channels(dirs: &[u8; 12], speeds: &[u8; 12]) {
         };
         apply_channel_config(ch as u8, dir, speeds[ch] != 0).await;
     }
-    resume_all_channels().await;
+    if !crate::channel::is_config_mode() {
+        resume_all_channels().await;
+    }
 }
 
-/// 业务执行器：纯状态机与消息派发逻辑 (可直接用于宿主单元测试)
-pub async fn execute_host_command(cmd: HostCommand) -> CommandExecutionResult {
-    match cmd {
-        HostCommand::Ping => CommandExecutionResult::Pong,
-        HostCommand::SetMode { binary_mode } => {
-            BINARY_OUTPUT_MODE.store(binary_mode, Ordering::Relaxed);
-            let mut s = String::<512>::new();
-            if binary_mode {
-                let _ = s.push_str("OK: Switched to BINARY mode\r\n");
-            } else {
-                let _ = s.push_str("OK: Switched to ASCII mode\r\n");
-            }
-            CommandExecutionResult::SuccessText(s)
+/// 二进制命令执行调度器：纯状态机与消息派发逻辑 (零动态分配)
+async fn execute_binary_command(req: BinaryFrame) {
+    let opcode = req.opcode();
+    match opcode {
+        opcodes::PING => {
+            let ack = BinaryFrame::new_cmd_ack(
+                req.channel,
+                ack_status::OK,
+                req.seq_num,
+                req.payload_0,
+                0,
+            );
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
-        HostCommand::ConfigureChannel {
-            channel,
-            enable,
-            is_tx,
-            high_speed,
-        } => {
-            if let Err(err) = validate_channel(channel, None) {
-                return err;
+        opcodes::SET_CHANNEL_CFG => {
+            let ch = req.channel;
+            if (ch as usize) >= ACTIVE_CHANNEL_COUNT {
+                let ack = BinaryFrame::new_cmd_ack(
+                    ch,
+                    ack_status::ERR_INVALID_PARAM,
+                    req.seq_num,
+                    0,
+                    0,
+                );
+                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                return;
             }
-
-            let requested_dir = if !enable {
+            let (enable, is_rx, high_speed) =
+                unpack_channel_nibble((req.payload_0 & 0x0F) as u8);
+            let dir = if !enable {
                 ChannelDirection::Disabled
-            } else if is_tx {
-                ChannelDirection::Tx
-            } else {
+            } else if is_rx {
                 ChannelDirection::Rx
+            } else {
+                ChannelDirection::Tx
             };
-
-            apply_channel_config(channel, requested_dir, high_speed).await;
-
-            let mut resp = String::<512>::new();
-            core::write!(
-                resp,
-                "OK: Channel {} configured: {:?}, Speed: {}\r\n",
-                channel,
-                requested_dir,
-                if high_speed { "HIGH (100K)" } else { "LOW (12.5K)" }
-            )
-            .ok();
-            CommandExecutionResult::SuccessText(resp)
+            apply_channel_config(ch, dir, high_speed).await;
+            let ack = BinaryFrame::new_cmd_ack(
+                ch,
+                ack_status::OK,
+                req.seq_num,
+                req.payload_0,
+                0,
+            );
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
-        HostCommand::ChannelFilter { channel, action } => {
-            handle_channel_filter(channel, action).await
-        }
-        HostCommand::SetSpeed {
-            channel,
-            high_speed,
-        } => {
-            if let Err(err) = validate_channel(channel, None) {
-                return err;
+        opcodes::SET_FILTER => {
+            let ch = req.channel;
+            if (ch as usize) >= ACTIVE_CHANNEL_COUNT
+                || channel_direction(ch) != Some(ChannelDirection::Rx)
+            {
+                let ack = BinaryFrame::new_cmd_ack(
+                    ch,
+                    ack_status::ERR_INVALID_PARAM,
+                    req.seq_num,
+                    0,
+                    0,
+                );
+                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                return;
             }
-            let dir = channel_direction(channel).unwrap_or(ChannelDirection::Disabled);
-            apply_channel_config(channel, dir, high_speed).await;
-            let mut resp = String::<512>::new();
-            core::write!(
-                resp,
-                "OK: Channel {} set to {}\r\n",
-                channel,
-                if high_speed { "HIGH" } else { "LOW" }
-            )
-            .ok();
-            CommandExecutionResult::SuccessText(resp)
+            let action_code = (req.payload_0 & 0xFF) as u8;
+            let octal_label = ((req.payload_0 >> 8) & 0xFF) as u8;
+            let action = match action_code {
+                0 => FilterAction::Clear,
+                1 => FilterAction::Allow(Label::from_octal(octal_label)),
+                2 => FilterAction::Block(Label::from_octal(octal_label)),
+                _ => {
+                    let ack = BinaryFrame::new_cmd_ack(
+                        ch,
+                        ack_status::ERR_INVALID_PARAM,
+                        req.seq_num,
+                        0,
+                        0,
+                    );
+                    let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    return;
+                }
+            };
+            let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Filter(action)).await;
+            let ack = BinaryFrame::new_cmd_ack(
+                ch,
+                ack_status::OK,
+                req.seq_num,
+                req.payload_0,
+                0,
+            );
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
-        HostCommand::SendRaw { channel, raw_word } => {
-            if let Err(err) = validate_channel(channel, Some(ChannelDirection::Tx)) {
-                return err;
+        opcodes::TX_RAW_WORD => {
+            let ch = req.channel;
+            if crate::channel::is_config_mode()
+                || (ch as usize) >= ACTIVE_CHANNEL_COUNT
+                || channel_direction(ch) != Some(ChannelDirection::Tx)
+            {
+                let ack = BinaryFrame::new_cmd_ack(
+                    ch,
+                    ack_status::ERR_MODE_CONFLICT,
+                    req.seq_num,
+                    0,
+                    0,
+                );
+                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                return;
             }
-            match send_to_channel_tx(channel, raw_word) {
+            match send_to_channel_tx(ch, req.payload_0) {
                 Ok(()) => {
-                    let mut resp = String::<512>::new();
-                    core::write!(
-                        resp,
-                        "OK: Queued raw word 0x{:08X} for CH{}\r\n",
-                        raw_word,
-                        channel
-                    )
-                    .ok();
-                    CommandExecutionResult::SuccessText(resp)
+                    let ack = BinaryFrame::new_cmd_ack(
+                        ch,
+                        ack_status::OK,
+                        req.seq_num,
+                        req.payload_0,
+                        0,
+                    );
+                    let _ = USB_CMD_RESP_QUEUE.try_send(ack);
                 }
-                Err(ChannelError::QueueFull(ch)) => {
-                    let mut resp = String::<64>::new();
-                    core::write!(resp, "ERR: TX queue full on Channel {}\r\n", ch).ok();
-                    CommandExecutionResult::ErrorDynamic(resp)
-                }
-                Err(ChannelError::ChannelDisabled(ch)) => {
-                    let mut resp = String::<64>::new();
-                    core::write!(resp, "ERR: Channel {} is disabled\r\n", ch).ok();
-                    CommandExecutionResult::ErrorDynamic(resp)
-                }
-                Err(ChannelError::NotTxChannel(ch)) => {
-                    let mut resp = String::<64>::new();
-                    core::write!(resp, "ERR: Channel {} is not a TX channel\r\n", ch).ok();
-                    CommandExecutionResult::ErrorDynamic(resp)
-                }
-                Err(ChannelError::ChannelOutOfRange(ch)) => {
-                    let mut resp = String::<64>::new();
-                    core::write!(resp, "ERR: Channel {} out of range\r\n", ch).ok();
-                    CommandExecutionResult::ErrorDynamic(resp)
-                }
-            }
-        }
-        HostCommand::SendConstructed {
-            channel,
-            label,
-            sdi,
-            data,
-            ssm,
-            parity,
-        } => {
-            if let Err(err) = validate_channel(channel, Some(ChannelDirection::Tx)) {
-                return err;
-            }
-            let word = match ArincWord::from_fields(label, sdi, data, ssm, parity) {
-                Ok(w) => w,
                 Err(_) => {
-                    return CommandExecutionResult::ErrorStatic("ERR: Invalid word parameters\r\n");
-                }
-            };
-            match send_to_channel_tx(channel, word.to_raw()) {
-                Ok(()) => {
-                    let mut resp = String::<512>::new();
-                    core::write!(
-                        resp,
-                        "OK: Sent L:{:03o} SDI:{} DATA:0x{:X} RAW:0x{:08X}\r\n",
-                        label.to_octal(),
-                        sdi,
-                        data,
-                        word.to_raw()
-                    )
-                    .ok();
-                    CommandExecutionResult::SuccessText(resp)
-                }
-                Err(ChannelError::QueueFull(ch)) => {
-                    let mut resp = String::<64>::new();
-                    core::write!(resp, "ERR: TX queue full on Channel {}\r\n", ch).ok();
-                    CommandExecutionResult::ErrorDynamic(resp)
-                }
-                Err(ChannelError::ChannelDisabled(ch)) => {
-                    let mut resp = String::<64>::new();
-                    core::write!(resp, "ERR: Channel {} is disabled\r\n", ch).ok();
-                    CommandExecutionResult::ErrorDynamic(resp)
-                }
-                Err(ChannelError::NotTxChannel(ch)) => {
-                    let mut resp = String::<64>::new();
-                    core::write!(resp, "ERR: Channel {} is not a TX channel\r\n", ch).ok();
-                    CommandExecutionResult::ErrorDynamic(resp)
-                }
-                Err(ChannelError::ChannelOutOfRange(ch)) => {
-                    let mut resp = String::<64>::new();
-                    core::write!(resp, "ERR: Channel {} out of range\r\n", ch).ok();
-                    CommandExecutionResult::ErrorDynamic(resp)
+                    let ack = BinaryFrame::new_cmd_ack(
+                        ch,
+                        ack_status::ERR_BUFFER_FULL,
+                        req.seq_num,
+                        0,
+                        0,
+                    );
+                    let _ = USB_CMD_RESP_QUEUE.try_send(ack);
                 }
             }
         }
-        HostCommand::QueryStatus { channel } => {
-            let mut resp = String::<512>::new();
-            if let Some(ch) = channel {
-                if (ch as usize) < ACTIVE_CHANNEL_COUNT {
-                    let dir = channel_direction(ch).unwrap_or(ChannelDirection::Disabled);
-                    core::write!(resp, "STATUS: CH{}: {:?}\r\n", ch, dir).ok();
-                } else {
-                    core::write!(resp, "ERR: Channel {} out of range (0..11)\r\n", ch).ok();
-                }
+        opcodes::SET_OPERATING_MODE => {
+            let to_operational = req.payload_0 != 0;
+            if to_operational {
+                crate::channel::set_operating_mode(crate::channel::OperatingMode::Operational);
+                resume_all_channels().await;
             } else {
-                let is_bin = BINARY_OUTPUT_MODE.load(Ordering::Relaxed);
-                core::write!(
-                    resp,
-                    "STATUS: Pico-429 12CH Online. Mode: {}\r\n[CH0..11]:",
-                    if is_bin { "BIN" } else { "ASCII" }
-                )
-                .ok();
-                for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-                    let dir = channel_direction(ch).unwrap_or(ChannelDirection::Disabled);
-                    let tag = match dir {
-                        ChannelDirection::Disabled => "DIS",
-                        ChannelDirection::Tx => "TX",
-                        ChannelDirection::Rx => "RX",
-                    };
-                    core::write!(resp, " {}:{}", ch, tag).ok();
-                }
-                let _ = resp.push_str("\r\n");
+                crate::channel::set_operating_mode(crate::channel::OperatingMode::Config);
+                pause_all_channels().await;
             }
-            CommandExecutionResult::SuccessText(resp)
+            let current_mode = if crate::channel::is_config_mode() { 0 } else { 1 };
+            let ack = BinaryFrame::new_cmd_ack(
+                0,
+                ack_status::OK,
+                req.seq_num,
+                current_mode,
+                0,
+            );
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
-        HostCommand::PauseAll => {
+        opcodes::PAUSE_RESUME_ALL => {
+            let resume = req.payload_0 != 0;
+            if resume {
+                resume_all_channels().await;
+            } else {
+                pause_all_channels().await;
+            }
+            let ack = BinaryFrame::new_cmd_ack(
+                0,
+                ack_status::OK,
+                req.seq_num,
+                req.payload_0,
+                0,
+            );
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+        }
+        opcodes::CFGBATCH => {
+            let channels = unpack_12_channels(req.payload_0, req.payload_1);
             pause_all_channels().await;
-            let mut resp = String::<512>::new();
-            let _ = resp.push_str("OK: All channels paused\r\n");
-            CommandExecutionResult::SuccessText(resp)
-        }
-        HostCommand::ResumeAll => {
-            resume_all_channels().await;
-            let mut resp = String::<512>::new();
-            let _ = resp.push_str("OK: All channels resumed\r\n");
-            CommandExecutionResult::SuccessText(resp)
-        }
-        HostCommand::DumpConfig => {
-            let mut resp = String::<512>::new();
-            let _ = resp.push_str("CFGDUMP:");
-            for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-                let dir = channel_direction(ch).unwrap_or(ChannelDirection::Disabled);
-                let dir_str = match dir {
-                    ChannelDirection::Disabled => "DISABLED",
-                    ChannelDirection::Tx => "TX",
-                    ChannelDirection::Rx => "RX",
-                };
-                let spd_str = if channel_is_high_speed(ch) { "HIGH" } else { "LOW" };
-                core::write!(resp, " {}:{}:{}", ch, dir_str, spd_str).ok();
-            }
-            let _ = resp.push_str("\r\n");
-            CommandExecutionResult::SuccessText(resp)
-        }
-        HostCommand::BatchConfigure { spec } => {
-            let mut dirs = [0u8; 12];
-            let mut speeds = [1u8; 12];
             for ch in 0..ACTIVE_CHANNEL_COUNT {
-                dirs[ch] = match channel_direction(ch as u8).unwrap_or(ChannelDirection::Disabled) {
-                    ChannelDirection::Tx => 1,
-                    ChannelDirection::Rx => 2,
-                    _ => 0,
+                let (enable, is_rx, high_speed) = channels[ch];
+                let dir = if !enable {
+                    ChannelDirection::Disabled
+                } else if is_rx {
+                    ChannelDirection::Rx
+                } else {
+                    ChannelDirection::Tx
                 };
-                speeds[ch] = if channel_is_high_speed(ch as u8) { 1 } else { 0 };
+                apply_channel_config(ch as u8, dir, high_speed).await;
             }
-
-            let mut count = 0;
-            for token in spec.split(',') {
-                let mut kv = token.split('=');
-                if let (Some(ch_str), Some(val_str)) = (kv.next(), kv.next()) {
-                    if let Ok(ch) = ch_str.trim().parse::<usize>() {
-                        if ch < ACTIVE_CHANNEL_COUNT {
-                            let mut val_parts = val_str.split(':');
-                            let dir_str = val_parts.next().unwrap_or("DISABLED");
-                            let speed_str = val_parts.next().unwrap_or("HIGH");
-
-                            dirs[ch] = if dir_str.eq_ignore_ascii_case("TX") {
-                                1
-                            } else if dir_str.eq_ignore_ascii_case("RX") {
-                                2
-                            } else {
-                                0
-                            };
-
-                            speeds[ch] = if speed_str.eq_ignore_ascii_case("LOW")
-                                || speed_str.eq_ignore_ascii_case("12K5")
-                                || speed_str.eq_ignore_ascii_case("12.5K")
-                            {
-                                0
-                            } else {
-                                1
-                            };
-                            count += 1;
-                        }
-                    }
-                }
+            if !crate::channel::is_config_mode() {
+                resume_all_channels().await;
             }
-
-            apply_all_channels(&dirs, &speeds).await;
-
-            let mut resp = String::<512>::new();
-            core::write!(resp, "OK: Batch configured {} channels\r\n", count).ok();
-            CommandExecutionResult::SuccessText(resp)
+            let ack = BinaryFrame::new_cmd_ack(
+                0,
+                ack_status::OK,
+                req.seq_num,
+                req.payload_0,
+                req.payload_1,
+            );
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
-        HostCommand::ProfileSave { slot, name } => {
-            pause_all_channels().await;
-            let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
-            let result = if let Some(ref mut mgr) = *flash_guard {
-                let mut dirs = [0u8; 12];
-                let mut speeds = [1u8; 12];
-                for ch in 0..ACTIVE_CHANNEL_COUNT {
-                    dirs[ch] = match channel_direction(ch as u8).unwrap_or(ChannelDirection::Disabled) {
-                        ChannelDirection::Tx => 1,
-                        ChannelDirection::Rx => 2,
-                        _ => 0,
-                    };
-                    speeds[ch] = if channel_is_high_speed(ch as u8) { 1 } else { 0 };
-                }
-
-                match mgr.save_profile(slot, &name, &dirs, &speeds) {
-                    Ok(()) => {
-                        let mut resp = String::<512>::new();
-                        core::write!(resp, "OK: Profile saved to slot {}\r\n", slot).ok();
-                        CommandExecutionResult::SuccessText(resp)
-                    }
-                    Err(e) => {
-                        let mut resp = String::<64>::new();
-                        core::write!(resp, "ERR: Save profile failed: {:?}\r\n", e).ok();
-                        CommandExecutionResult::ErrorDynamic(resp)
-                    }
-                }
-            } else {
-                CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
-            };
-            resume_all_channels().await;
-            result
+        opcodes::QUERY_STATUS => {
+            let mut channels = [(false, false, false); 12];
+            for ch in 0..ACTIVE_CHANNEL_COUNT {
+                let dir = channel_direction(ch as u8);
+                let (en, is_rx) = match dir {
+                    Some(ChannelDirection::Tx) => (true, false),
+                    Some(ChannelDirection::Rx) => (true, true),
+                    _ => (false, false),
+                };
+                let hs = channel_is_high_speed(ch as u8);
+                channels[ch] = (en, is_rx, hs);
+            }
+            let (p0, p1) = pack_12_channels(&channels);
+            let mode = if crate::channel::is_config_mode() { 0 } else { 1 };
+            let ack = BinaryFrame::new_cmd_ack(mode, ack_status::OK, req.seq_num, p0, p1);
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
-        HostCommand::ProfileLoad { slot } => {
+        opcodes::PROFILE_OP => {
+            let sub_op = (req.payload_0 & 0xFF) as u8;
+            let slot = req.channel;
             let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
             if let Some(ref mut mgr) = *flash_guard {
-                match mgr.load_profile(slot) {
-                    Ok(record) => {
-                        apply_all_channels(&record.directions, &record.speeds).await;
-                        let mut resp = String::<512>::new();
-                        core::write!(
-                            resp,
-                            "OK: Profile loaded from slot {} and applied\r\n",
-                            slot
-                        )
-                        .ok();
-                        CommandExecutionResult::SuccessText(resp)
-                    }
-                    Err(e) => {
-                        let mut resp = String::<64>::new();
-                        core::write!(resp, "ERR: Load profile failed: {:?}\r\n", e).ok();
-                        CommandExecutionResult::ErrorDynamic(resp)
-                    }
-                }
-            } else {
-                CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
-            }
-        }
-        HostCommand::ProfileBoot { slot } => {
-            pause_all_channels().await;
-            let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
-            let result = if let Some(ref mut mgr) = *flash_guard {
-                match mgr.set_boot_slot(slot) {
-                    Ok(()) => {
-                        let mut resp = String::<512>::new();
-                        core::write!(resp, "OK: Default boot profile set to slot {}\r\n", slot).ok();
-                        CommandExecutionResult::SuccessText(resp)
-                    }
-                    Err(e) => {
-                        let mut resp = String::<64>::new();
-                        core::write!(resp, "ERR: Set boot profile failed: {:?}\r\n", e).ok();
-                        CommandExecutionResult::ErrorDynamic(resp)
-                    }
-                }
-            } else {
-                CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
-            };
-            resume_all_channels().await;
-            result
-        }
-        HostCommand::ProfileList => {
-            let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
-            if let Some(ref mut mgr) = *flash_guard {
-                let boot_slot = mgr.get_boot_slot();
-                let mut resp = String::<512>::new();
-                core::write!(resp, "PROFILES: Boot Slot: {:?}\r\n", boot_slot).ok();
-                for slot in 0..crate::flash_storage::MAX_PROFILE_SLOTS as u8 {
-                    match mgr.load_profile(slot) {
-                        Ok(rec) => {
-                            let name_str = core::str::from_utf8(&rec.name)
-                                .unwrap_or("Unknown")
-                                .trim_matches(char::from(0));
-                            core::write!(
-                                resp,
-                                "[Slot {}] ACTIVE \"{}\"\r\n",
-                                slot,
-                                name_str
-                            )
-                            .ok();
-                        }
-                        Err(_) => {
-                            core::write!(resp, "[Slot {}] EMPTY\r\n", slot).ok();
+                match sub_op {
+                    profile_sub_ops::LIST => {
+                        let boot_slot = mgr.get_boot_slot();
+                        for s in 0..crate::flash_storage::MAX_PROFILE_SLOTS as u8 {
+                            match mgr.load_profile(s) {
+                                Ok(rec) => {
+                                    let is_boot = if Some(s) == boot_slot { 1u32 } else { 0u32 };
+                                    let p0 = 1u32 | (is_boot << 8) | ((rec.crc16 as u32) << 16);
+                                    let ack = BinaryFrame::new_cmd_ack(
+                                        s,
+                                        ack_status::OK,
+                                        req.seq_num,
+                                        p0,
+                                        0,
+                                    );
+                                    let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                                }
+                                Err(_) => {
+                                    let ack = BinaryFrame::new_cmd_ack(
+                                        s,
+                                        ack_status::OK,
+                                        req.seq_num,
+                                        0,
+                                        0,
+                                    );
+                                    let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                                }
+                            }
                         }
                     }
+                    profile_sub_ops::SAVE => {
+                        let mut dirs = [0u8; 12];
+                        let mut speeds = [0u8; 12];
+                        for ch in 0..12 {
+                            dirs[ch] = match channel_direction(ch as u8) {
+                                Some(ChannelDirection::Tx) => 1,
+                                Some(ChannelDirection::Rx) => 2,
+                                _ => 0,
+                            };
+                            speeds[ch] = if channel_is_high_speed(ch as u8) { 1 } else { 0 };
+                        }
+                        let status = match mgr.save_profile(slot, "PROFILE", &dirs, &speeds) {
+                            Ok(()) => ack_status::OK,
+                            Err(_) => ack_status::ERR_FLASH,
+                        };
+                        let ack = BinaryFrame::new_cmd_ack(
+                            slot,
+                            status,
+                            req.seq_num,
+                            0,
+                            0,
+                        );
+                        let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    }
+                    profile_sub_ops::LOAD => {
+                        let status = match mgr.load_profile(slot) {
+                            Ok(rec) => {
+                                crate::channel::set_operating_mode(
+                                    crate::channel::OperatingMode::Operational,
+                                );
+                                apply_all_channels(&rec.directions, &rec.speeds).await;
+                                ack_status::OK
+                            }
+                            Err(_) => ack_status::ERR_FLASH,
+                        };
+                        let ack = BinaryFrame::new_cmd_ack(
+                            slot,
+                            status,
+                            req.seq_num,
+                            0,
+                            0,
+                        );
+                        let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    }
+                    profile_sub_ops::BOOT => {
+                        let status = match mgr.set_boot_slot(slot) {
+                            Ok(()) => ack_status::OK,
+                            Err(_) => ack_status::ERR_FLASH,
+                        };
+                        let ack = BinaryFrame::new_cmd_ack(
+                            slot,
+                            status,
+                            req.seq_num,
+                            0,
+                            0,
+                        );
+                        let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    }
+                    profile_sub_ops::CLEAR_BOOT => {
+                        let status = match mgr.clear_boot_slot() {
+                            Ok(()) => ack_status::OK,
+                            Err(_) => ack_status::ERR_FLASH,
+                        };
+                        let ack = BinaryFrame::new_cmd_ack(
+                            0,
+                            status,
+                            req.seq_num,
+                            0,
+                            0,
+                        );
+                        let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    }
+                    _ => {
+                        let ack = BinaryFrame::new_cmd_ack(
+                            slot,
+                            ack_status::ERR_INVALID_PARAM,
+                            req.seq_num,
+                            0,
+                            0,
+                        );
+                        let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    }
                 }
-                let _ = resp.push_str("OK: Profile list\r\n");
-                CommandExecutionResult::SuccessText(resp)
             } else {
-                CommandExecutionResult::ErrorStatic("ERR: Flash manager not initialized\r\n")
+                let ack = BinaryFrame::new_cmd_ack(
+                    slot,
+                    ack_status::ERR_FLASH,
+                    req.seq_num,
+                    0,
+                    0,
+                );
+                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
             }
+        }
+        _ => {
+            let ack = BinaryFrame::new_cmd_ack(
+                req.channel,
+                ack_status::ERR_UNKNOWN_CMD,
+                req.seq_num,
+                0,
+                0,
+            );
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
     }
-}
-
-/// 响应序列化器：保证在 BINARY 模式下严禁混入裸 ASCII 字符串 (消灭流污染)
-async fn send_execution_result(
-    sender: &mut Sender<'static, Driver<'static, USB>>,
-    result: CommandExecutionResult,
-    is_binary: bool,
-) -> Result<(), embassy_usb::driver::EndpointError> {
-    match result {
-        CommandExecutionResult::Pong => {
-            cdc_sender_write_all(sender, b"PONG\r\n").await?;
-        }
-        CommandExecutionResult::SuccessText(text) => {
-            if is_binary {
-                // 二进制模式：封装为 CMD_ACK 帧
-                let ack_frame =
-                    BinaryFrame::new_full(frame_types::CMD_ACK, 0, 0, 0, 0, 0x0000_0000);
-                let mut buf = [0u8; BINARY_FRAME_LEN];
-                ack_frame.encode(&mut buf);
-                cdc_sender_write_all(sender, &buf).await?;
-            } else {
-                cdc_sender_write_all(sender, text.as_bytes()).await?;
-            }
-        }
-        CommandExecutionResult::ErrorStatic(msg) => {
-            if is_binary {
-                let err_frame = BinaryFrame::new_full(
-                    frame_types::ASYNC_EVENT,
-                    0,
-                    flags::BUS_FAULT,
-                    0,
-                    0,
-                    0xFFFF_FFFF,
-                );
-                let mut buf = [0u8; BINARY_FRAME_LEN];
-                err_frame.encode(&mut buf);
-                cdc_sender_write_all(sender, &buf).await?;
-            } else {
-                cdc_sender_write_all(sender, msg.as_bytes()).await?;
-            }
-        }
-        CommandExecutionResult::ErrorDynamic(text) => {
-            if is_binary {
-                let err_frame = BinaryFrame::new_full(
-                    frame_types::ASYNC_EVENT,
-                    0,
-                    flags::BUS_FAULT,
-                    0,
-                    0,
-                    0xFFFF_FFFF,
-                );
-                let mut buf = [0u8; BINARY_FRAME_LEN];
-                err_frame.encode(&mut buf);
-                cdc_sender_write_all(sender, &buf).await?;
-            } else {
-                cdc_sender_write_all(sender, text.as_bytes()).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 格式化为可读的 ASCII 遥测文本
-fn format_ascii_frame(frame: &InboundArincFrame, out: &mut String<128>) {
-    let word = frame.word;
-    let speed_str = if frame.high_speed { "100K" } else { "12.5K" };
-    let parity_str = if frame.parity_ok { "OK" } else { "ERR" };
-
-    core::write!(
-        out,
-        "[CH{}] T:{}us {} L:{:03o} SDI:{} DATA:0x{:05X} SSM:{} P:{} (0x{:08X})\r\n",
-        frame.channel_id,
-        frame.timestamp_us,
-        speed_str,
-        word.label().to_octal(),
-        word.sdi(),
-        word.data_field(),
-        word.ssm_raw(),
-        parity_str,
-        word.to_raw()
-    )
-    .ok();
 }

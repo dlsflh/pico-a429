@@ -1,12 +1,12 @@
-//! 上位机通信协议模块 (no_std)
+//! 上位机全二进制通信协议模块 (no_std)
 //!
-//! 支持两种通信形态：
-//! 1. 高速定长 16 字节二进制遥测帧 (BinaryFrame): 完美整除 USB 64 字节端点 ($4 \times 16 = 64$，零填充碎片)；
-//!    包含帧类型、4 位通道号、状态标志、16 位递增包序号、微秒级时间戳、32 位 ARINC 字与 CRC16；
-//! 2. 交互式 ASCII 命令与格式化输出: 适用于终端调试助手 (PuTTY/minicom/串口助手)，支持直接文本交互与配置。
+//! 采用对称、定长 16 字节高性能二进制帧 (BinaryFrame):
+//! - 完美整除 USB 64 字节端点 ($4 \times 16 = 64$)，零填充碎片；
+//! - 统一支持全双工通信：下行遥测 (ARINC_DATA)、下行事件 (ASYNC_EVENT)、下行回执 (CMD_ACK)、上行控制 (CMD_REQ)；
+//! - 严格采用 1 字节增量滑动窗口搜索，保障抗流失步与即时自同步；
+//! - 零动态内存分配，零字符串格式化，保证硬实时确定性。
 
 use crate::label::Label;
-use crate::parity::ParityMode;
 
 pub const BINARY_MAGIC: [u8; 2] = [0x41, 0x29]; // "A)"
 pub const BINARY_FRAME_LEN: usize = 16;
@@ -19,9 +19,11 @@ pub mod frame_types {
     pub const CMD_ACK: u8 = 0x02;
     /// 异步告警与硬件总线故障事件
     pub const ASYNC_EVENT: u8 = 0x03;
+    /// 上位机下发的二进制控制命令请求
+    pub const CMD_REQ: u8 = 0x04;
 }
 
-/// 状态标志位
+/// 状态标志位 (用于 ARINC_DATA 帧的 flags 字节)
 pub mod flags {
     pub const PARITY_ERROR: u8 = 1 << 0;
     pub const SPEED_100K: u8 = 1 << 1; // 1: 100k (高速), 0: 12.5k (低速)
@@ -30,16 +32,56 @@ pub mod flags {
     pub const BUS_FAULT: u8 = 1 << 4; // 双引脚同高或持续高电平故障
 }
 
-/// 定长 16 字节的高性能二进制遥测帧 (完美整除 64 字节 USB CDC 端点)
+/// 控制命令操作码 (用于 CMD_REQ 帧的 flags 字节)
+pub mod opcodes {
+    pub const PING: u8 = 0x01;
+    pub const SET_CHANNEL_CFG: u8 = 0x02;
+    pub const SET_FILTER: u8 = 0x03;
+    pub const TX_RAW_WORD: u8 = 0x04;
+    pub const SET_OPERATING_MODE: u8 = 0x05;
+    pub const PAUSE_RESUME_ALL: u8 = 0x06;
+    pub const CFGBATCH: u8 = 0x07;
+    pub const QUERY_STATUS: u8 = 0x08;
+    pub const PROFILE_OP: u8 = 0x09;
+}
+
+/// 命令执行状态码 (用于 CMD_ACK 帧的 flags 字节)
+pub mod ack_status {
+    pub const OK: u8 = 0x00;
+    pub const ERR_UNKNOWN_CMD: u8 = 0x01;
+    pub const ERR_INVALID_PARAM: u8 = 0x02;
+    pub const ERR_MODE_CONFLICT: u8 = 0x03;
+    pub const ERR_FLASH: u8 = 0x04;
+    pub const ERR_BUFFER_FULL: u8 = 0x05;
+}
+
+/// Profile 操作子动作 (用于 PROFILE_OP 帧 payload_0 的最低字节)
+pub mod profile_sub_ops {
+    pub const LIST: u8 = 0x00;
+    pub const SAVE: u8 = 0x01;
+    pub const LOAD: u8 = 0x02;
+    pub const BOOT: u8 = 0x03;
+    pub const CLEAR_BOOT: u8 = 0x04;
+}
+
+/// 过滤操作动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterAction {
+    Allow(Label),
+    Block(Label),
+    Clear,
+}
+
+/// 定长 16 字节的高性能通用二进制帧 (完美整除 64 字节 USB CDC 端点)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BinaryFrame {
     pub frame_type: u8,
     pub channel: u8,
-    pub flags: u8,
+    pub flags: u8, // Opcode for CMD_REQ; Status for CMD_ACK; Flags for ARINC_DATA
     pub seq_num: u16,
-    pub timestamp_us: u32,
-    pub raw_word: u32,
+    pub payload_0: u32, // ARINC timestamp_us / Param 0
+    pub payload_1: u32, // ARINC raw_word / Param 1
 }
 
 /// 二进制反序列化解码错误枚举
@@ -59,8 +101,8 @@ impl BinaryFrame {
             channel: channel & 0x0F,
             flags,
             seq_num: 0,
-            timestamp_us,
-            raw_word,
+            payload_0: timestamp_us,
+            payload_1: raw_word,
         }
     }
 
@@ -70,17 +112,73 @@ impl BinaryFrame {
         channel: u8,
         flags: u8,
         seq_num: u16,
-        timestamp_us: u32,
-        raw_word: u32,
+        payload_0: u32,
+        payload_1: u32,
     ) -> Self {
         Self {
             frame_type: frame_type & 0x0F,
             channel: channel & 0x0F,
             flags,
             seq_num,
-            timestamp_us,
-            raw_word,
+            payload_0,
+            payload_1,
         }
+    }
+
+    /// 创建控制命令请求帧 (CMD_REQ)
+    pub const fn new_cmd_req(
+        channel: u8,
+        opcode: u8,
+        seq_num: u16,
+        payload_0: u32,
+        payload_1: u32,
+    ) -> Self {
+        Self {
+            frame_type: frame_types::CMD_REQ,
+            channel: channel & 0x0F,
+            flags: opcode,
+            seq_num,
+            payload_0,
+            payload_1,
+        }
+    }
+
+    /// 创建控制命令确认/应答帧 (CMD_ACK)
+    pub const fn new_cmd_ack(
+        channel: u8,
+        status: u8,
+        seq_num: u16,
+        payload_0: u32,
+        payload_1: u32,
+    ) -> Self {
+        Self {
+            frame_type: frame_types::CMD_ACK,
+            channel: channel & 0x0F,
+            flags: status,
+            seq_num,
+            payload_0,
+            payload_1,
+        }
+    }
+
+    /// 获取时间戳别名 (针对 ARINC_DATA)
+    pub fn timestamp_us(&self) -> u32 {
+        self.payload_0
+    }
+
+    /// 获取 ARINC 原始字别名 (针对 ARINC_DATA)
+    pub fn raw_word(&self) -> u32 {
+        self.payload_1
+    }
+
+    /// 获取操作码 (针对 CMD_REQ)
+    pub fn opcode(&self) -> u8 {
+        self.flags
+    }
+
+    /// 获取应答状态码 (针对 CMD_ACK)
+    pub fn ack_status(&self) -> u8 {
+        self.flags
     }
 
     /// 序列化为 16 字节定长数据
@@ -95,13 +193,13 @@ impl BinaryFrame {
         let seq_bytes = self.seq_num.to_le_bytes();
         out[4..6].copy_from_slice(&seq_bytes);
 
-        let ts_bytes = self.timestamp_us.to_le_bytes();
-        out[6..10].copy_from_slice(&ts_bytes);
+        let p0_bytes = self.payload_0.to_le_bytes();
+        out[6..10].copy_from_slice(&p0_bytes);
 
-        let word_bytes = self.raw_word.to_le_bytes();
-        out[10..14].copy_from_slice(&word_bytes);
+        let p1_bytes = self.payload_1.to_le_bytes();
+        out[10..14].copy_from_slice(&p1_bytes);
 
-        // 计算 CRC-16 (覆盖 type_and_channel 到 raw_word 共 12 字节: 索引 2..14)
+        // 计算 CRC-16 (覆盖 type_and_channel 到 payload_1 共 12 字节: 索引 2..14)
         let crc = crc16_ccitt(&out[2..14]);
         let crc_bytes = crc.to_le_bytes();
         out[14..16].copy_from_slice(&crc_bytes);
@@ -130,16 +228,16 @@ impl BinaryFrame {
         let channel = type_and_ch & 0x0F;
         let flags = buf[3];
         let seq_num = u16::from_le_bytes([buf[4], buf[5]]);
-        let timestamp_us = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
-        let raw_word = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
+        let payload_0 = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
+        let payload_1 = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
 
         Ok(Self {
             frame_type,
             channel,
             flags,
             seq_num,
-            timestamp_us,
-            raw_word,
+            payload_0,
+            payload_1,
         })
     }
 }
@@ -160,341 +258,73 @@ pub fn crc16_ccitt(data: &[u8]) -> u16 {
     crc
 }
 
-/// 上位机发给固件的控制命令
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HostCommand {
-    /// 动态配置通道: CHCFG <ch> <ENABLE|DISABLE> [TX|RX] [100K|12K5]
-    ConfigureChannel {
-        channel: u8,
-        enable: bool,
-        is_tx: bool,
-        high_speed: bool,
-    },
-    /// 动态配置通道过滤: CHCFG <ch> FILTER <ALLOW|BLOCK|CLEAR> [octal]
-    ChannelFilter { channel: u8, action: FilterAction },
-    /// 发送构造的 ARINC 字: TX <ch> <octal_label> <sdi> <data_hex> <ssm>
-    SendConstructed {
-        channel: u8,
-        label: Label,
-        sdi: u8,
-        data: u32,
-        ssm: u8,
-        parity: ParityMode,
-    },
-    /// 发送原始 32 位十六进制字: TXRAW <ch> <hex_word>
-    SendRaw { channel: u8, raw_word: u32 },
-    /// 切换波特率: CHCFG <ch> SPEED <HIGH|LOW|100K|12K5>
-    SetSpeed { channel: u8, high_speed: bool },
-    /// 切换推送模式: MODE <BIN|ASCII>
-    SetMode { binary_mode: bool },
-    /// 快速连通性测试心跳: PING
-    Ping,
-    /// 查询状态: STATUS [ch]
-    QueryStatus { channel: Option<u8> },
-    /// 全局暂停所有通道物理收发: PAUSE
-    PauseAll,
-    /// 全局恢复所有使能通道物理收发: RESUME
-    ResumeAll,
-    /// 导出 12 通道当前配置明细: CFGDUMP
-    DumpConfig,
-    /// 保存当前 12 通道配置至 Flash 槽位: PROFILE SAVE <slot> [name]
-    ProfileSave { slot: u8, name: heapless::String<32> },
-    /// 从 Flash 槽位加载并原子应用配置: PROFILE LOAD <slot>
-    ProfileLoad { slot: u8 },
-    /// 设置开机自启动 Flash 槽位: PROFILE BOOT <slot>
-    ProfileBoot { slot: u8 },
-    /// 查询 Flash 槽位配置列表: PROFILE LIST
-    ProfileList,
-    /// 批量原子下发 12 通道配置: CFGBATCH <spec>
-    BatchConfigure { spec: heapless::String<256> },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilterAction {
-    Allow(Label),
-    Block(Label),
-    Clear,
-}
-
-/// 命令解析错误枚举
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum CommandParseError {
-    EmptyCommand,
-    UnknownCommand,
-    MissingArgument(&'static str),
-    InvalidChannel,
-    InvalidSpeed,
-    InvalidHexWord,
-    InvalidOctalLabel,
-    InvalidSdi(u8),
-    InvalidSsm(u8),
-    InvalidDataHex,
-    DataOutOfRange(u32),
-    UnknownSubAction,
-}
-
-fn strip_hex_prefix(s: &str) -> &str {
-    if let Some(stripped) = s.strip_prefix("0x") {
-        stripped
-    } else if let Some(stripped) = s.strip_prefix("0X") {
-        stripped
+/// 将单个通道的配置打包为 4 位 nibble
+///
+/// - bit 0: enable (0=Disable, 1=Enable)
+/// - bit 1: direction (0=Tx, 1=Rx)
+/// - bit 2: speed (0=12.5k, 1=100k)
+/// - bit 3: 保留 0
+pub const fn pack_channel_nibble(enable: bool, is_rx: bool, high_speed: bool) -> u8 {
+    if !enable {
+        0
     } else {
-        s
+        1 | (if is_rx { 2 } else { 0 }) | (if high_speed { 4 } else { 0 })
     }
 }
 
-impl HostCommand {
-    /// 解析单行文本指令 (忽略前后空白，不区分大小写)
-    pub fn parse(line: &str) -> Result<Self, CommandParseError> {
-        let mut parts = line.split_whitespace();
-        let cmd = parts.next().ok_or(CommandParseError::EmptyCommand)?;
+/// 将 4 位 nibble 解包为单个通道配置 (enable, is_rx, high_speed)
+pub const fn unpack_channel_nibble(nibble: u8) -> (bool, bool, bool) {
+    let enable = (nibble & 0x01) != 0;
+    let is_rx = (nibble & 0x02) != 0;
+    let high_speed = (nibble & 0x04) != 0;
+    (enable, is_rx, high_speed)
+}
 
-        if cmd.eq_ignore_ascii_case("PING") {
-            return Ok(Self::Ping);
-        }
-
-        if cmd.eq_ignore_ascii_case("PAUSE") {
-            return Ok(Self::PauseAll);
-        }
-
-        if cmd.eq_ignore_ascii_case("RESUME") {
-            return Ok(Self::ResumeAll);
-        }
-
-        if cmd.eq_ignore_ascii_case("CFGDUMP") {
-            return Ok(Self::DumpConfig);
-        }
-
-        if cmd.eq_ignore_ascii_case("CFGBATCH") {
-            let spec_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("spec"))?;
-            let mut spec = heapless::String::new();
-            let _ = spec.push_str(spec_str);
-            return Ok(Self::BatchConfigure { spec });
-        }
-
-        if cmd.eq_ignore_ascii_case("PROFILE") {
-            let sub = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("SAVE/LOAD/BOOT/LIST"))?;
-            if sub.eq_ignore_ascii_case("LIST") {
-                return Ok(Self::ProfileList);
-            } else if sub.eq_ignore_ascii_case("LOAD") {
-                let slot_str = parts
-                    .next()
-                    .ok_or(CommandParseError::MissingArgument("slot"))?;
-                let slot = slot_str
-                    .parse::<u8>()
-                    .map_err(|_| CommandParseError::InvalidChannel)?;
-                return Ok(Self::ProfileLoad { slot });
-            } else if sub.eq_ignore_ascii_case("BOOT") {
-                let slot_str = parts
-                    .next()
-                    .ok_or(CommandParseError::MissingArgument("slot"))?;
-                let slot = slot_str
-                    .parse::<u8>()
-                    .map_err(|_| CommandParseError::InvalidChannel)?;
-                return Ok(Self::ProfileBoot { slot });
-            } else if sub.eq_ignore_ascii_case("SAVE") {
-                let slot_str = parts
-                    .next()
-                    .ok_or(CommandParseError::MissingArgument("slot"))?;
-                let slot = slot_str
-                    .parse::<u8>()
-                    .map_err(|_| CommandParseError::InvalidChannel)?;
-                let mut name = heapless::String::new();
-                if let Some(n) = parts.next() {
-                    let _ = name.push_str(n);
-                }
-                return Ok(Self::ProfileSave { slot, name });
-            } else {
-                return Err(CommandParseError::UnknownSubAction);
-            }
-        }
-
-        if cmd.eq_ignore_ascii_case("STATUS") {
-            let ch_opt = parts.next().and_then(|s| s.parse::<u8>().ok());
-            return Ok(Self::QueryStatus { channel: ch_opt });
-        }
-
-        if cmd.eq_ignore_ascii_case("CHCFG") {
-            let ch_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("channel"))?;
-            let channel = ch_str
-                .parse::<u8>()
-                .map_err(|_| CommandParseError::InvalidChannel)?;
-            let action = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("action"))?;
-
-            if action.eq_ignore_ascii_case("DISABLE") {
-                return Ok(Self::ConfigureChannel {
-                    channel,
-                    enable: false,
-                    is_tx: false,
-                    high_speed: true,
-                });
-            } else if action.eq_ignore_ascii_case("ENABLE") {
-                let dir_str = parts
-                    .next()
-                    .ok_or(CommandParseError::MissingArgument("direction (TX/RX)"))?;
-                let speed_str = parts
-                    .next()
-                    .ok_or(CommandParseError::MissingArgument("speed (HIGH/LOW/100K/12K5)"))?;
-                let is_tx = dir_str.eq_ignore_ascii_case("TX");
-                let high_speed = if speed_str.eq_ignore_ascii_case("100K")
-                    || speed_str.eq_ignore_ascii_case("HIGH")
-                {
-                    true
-                } else if speed_str.eq_ignore_ascii_case("12K5")
-                    || speed_str.eq_ignore_ascii_case("12.5K")
-                    || speed_str.eq_ignore_ascii_case("LOW")
-                {
-                    false
-                } else {
-                    return Err(CommandParseError::InvalidSpeed);
-                };
-                return Ok(Self::ConfigureChannel {
-                    channel,
-                    enable: true,
-                    is_tx,
-                    high_speed,
-                });
-            } else if action.eq_ignore_ascii_case("SPEED") {
-                let speed_str = parts
-                    .next()
-                    .ok_or(CommandParseError::MissingArgument("speed (HIGH/LOW/100K/12K5)"))?;
-                let high_speed = if speed_str.eq_ignore_ascii_case("100K")
-                    || speed_str.eq_ignore_ascii_case("HIGH")
-                {
-                    true
-                } else if speed_str.eq_ignore_ascii_case("12K5")
-                    || speed_str.eq_ignore_ascii_case("12.5K")
-                    || speed_str.eq_ignore_ascii_case("LOW")
-                {
-                    false
-                } else {
-                    return Err(CommandParseError::InvalidSpeed);
-                };
-                return Ok(Self::SetSpeed {
-                    channel,
-                    high_speed,
-                });
-            } else if action.eq_ignore_ascii_case("FILTER") {
-                let sub = parts
-                    .next()
-                    .ok_or(CommandParseError::MissingArgument("ALLOW/BLOCK/CLEAR"))?;
-                if sub.eq_ignore_ascii_case("CLEAR") {
-                    return Ok(Self::ChannelFilter {
-                        channel,
-                        action: FilterAction::Clear,
-                    });
-                }
-                let lbl_str = parts
-                    .next()
-                    .ok_or(CommandParseError::MissingArgument("octal label"))?;
-                let label =
-                    Label::parse_str(lbl_str).map_err(|_| CommandParseError::InvalidOctalLabel)?;
-                if sub.eq_ignore_ascii_case("ALLOW") {
-                    return Ok(Self::ChannelFilter {
-                        channel,
-                        action: FilterAction::Allow(label),
-                    });
-                } else if sub.eq_ignore_ascii_case("BLOCK") {
-                    return Ok(Self::ChannelFilter {
-                        channel,
-                        action: FilterAction::Block(label),
-                    });
-                } else {
-                    return Err(CommandParseError::UnknownSubAction);
-                }
-            } else {
-                return Err(CommandParseError::UnknownSubAction);
-            }
-        }
-
-        if cmd.eq_ignore_ascii_case("MODE") {
-            let mode_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("BIN/ASCII"))?;
-            let is_bin = mode_str.eq_ignore_ascii_case("BIN");
-            return Ok(Self::SetMode {
-                binary_mode: is_bin,
-            });
-        }
-
-        if cmd.eq_ignore_ascii_case("TXRAW") {
-            let ch_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("channel"))?;
-            let hex_token = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("hex_word"))?;
-            let channel = ch_str
-                .parse::<u8>()
-                .map_err(|_| CommandParseError::InvalidChannel)?;
-            let hex_str = strip_hex_prefix(hex_token);
-            let raw_word =
-                u32::from_str_radix(hex_str, 16).map_err(|_| CommandParseError::InvalidHexWord)?;
-            return Ok(Self::SendRaw { channel, raw_word });
-        }
-
-        if cmd.eq_ignore_ascii_case("TX") {
-            let ch_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("channel"))?;
-            let label_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("octal label"))?;
-            let sdi_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("sdi"))?;
-            let data_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("data_hex"))?;
-            let ssm_str = parts
-                .next()
-                .ok_or(CommandParseError::MissingArgument("ssm"))?;
-
-            let channel = ch_str
-                .parse::<u8>()
-                .map_err(|_| CommandParseError::InvalidChannel)?;
-            let label =
-                Label::parse_str(label_str).map_err(|_| CommandParseError::InvalidOctalLabel)?;
-            let sdi = sdi_str
-                .parse::<u8>()
-                .map_err(|_| CommandParseError::InvalidSdi(0))?;
-            if sdi > 3 {
-                return Err(CommandParseError::InvalidSdi(sdi));
-            }
-            let hex_str = strip_hex_prefix(data_str);
-            let data =
-                u32::from_str_radix(hex_str, 16).map_err(|_| CommandParseError::InvalidDataHex)?;
-            if data > 0x0007_FFFF {
-                return Err(CommandParseError::DataOutOfRange(data));
-            }
-            let ssm = ssm_str
-                .parse::<u8>()
-                .map_err(|_| CommandParseError::InvalidSsm(0))?;
-            if ssm > 3 {
-                return Err(CommandParseError::InvalidSsm(ssm));
-            }
-
-            return Ok(Self::SendConstructed {
-                channel,
-                label,
-                sdi,
-                data,
-                ssm,
-                parity: ParityMode::Odd,
-            });
-        }
-
-        Err(CommandParseError::UnknownCommand)
+/// 将 12 通道配置编码为两个 32 位载荷字 (Payload 0: CH0..7, Payload 1: CH8..11)
+pub fn pack_12_channels(channels: &[(bool, bool, bool); 12]) -> (u32, u32) {
+    let mut p0 = 0u32;
+    let mut p1 = 0u32;
+    for ch in 0..8 {
+        let (en, rx, hs) = channels[ch];
+        p0 |= (pack_channel_nibble(en, rx, hs) as u32) << (ch * 4);
     }
+    for ch in 8..12 {
+        let (en, rx, hs) = channels[ch];
+        p1 |= (pack_channel_nibble(en, rx, hs) as u32) << ((ch - 8) * 4);
+    }
+    (p0, p1)
+}
+
+/// 将两个 32 位载荷字解包为 12 通道配置
+pub fn unpack_12_channels(p0: u32, p1: u32) -> [(bool, bool, bool); 12] {
+    let mut channels = [(false, false, false); 12];
+    for ch in 0..8 {
+        let nibble = ((p0 >> (ch * 4)) & 0x0F) as u8;
+        channels[ch] = unpack_channel_nibble(nibble);
+    }
+    for ch in 8..12 {
+        let nibble = ((p1 >> ((ch - 8) * 4)) & 0x0F) as u8;
+        channels[ch] = unpack_channel_nibble(nibble);
+    }
+    channels
+}
+
+/// 在字节切片中采用 1 字节增量滑动窗口搜索第一个合法的 16 字节帧
+///
+/// 返回 `Some((frame, consumed_bytes))`，其中 `consumed_bytes` 为包含跳过的噪音字节在内的全部消耗长度；
+/// 若切片内无完整有效帧，返回 `None`。
+pub fn find_frame_in_stream(buf: &[u8]) -> Option<(BinaryFrame, usize)> {
+    if buf.len() < BINARY_FRAME_LEN {
+        return None;
+    }
+    for i in 0..=(buf.len() - BINARY_FRAME_LEN) {
+        if buf[i] == BINARY_MAGIC[0] && buf[i + 1] == BINARY_MAGIC[1] {
+            if let Ok(frame) = BinaryFrame::decode(&buf[i..i + BINARY_FRAME_LEN]) {
+                return Some((frame, i + BINARY_FRAME_LEN));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -502,228 +332,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_binary_frame_codec() {
+    fn test_binary_frame_roundtrip() {
         let frame = BinaryFrame::new_full(
-            frame_types::ARINC_DATA,
-            1,
-            flags::SPEED_100K,
+            frame_types::CMD_REQ,
+            3,
+            opcodes::SET_CHANNEL_CFG,
             42,
-            1234567,
-            0x812345C8,
+            0x12345678,
+            0x9ABCDEF0,
         );
+
         let mut buf = [0u8; BINARY_FRAME_LEN];
-        assert_eq!(buf.len(), 16);
         frame.encode(&mut buf);
+
+        assert_eq!(buf[0], 0x41);
+        assert_eq!(buf[1], 0x29);
+        assert_eq!(buf[2], (frame_types::CMD_REQ << 4) | 3);
+        assert_eq!(buf[3], opcodes::SET_CHANNEL_CFG);
 
         let decoded = BinaryFrame::decode(&buf).expect("Decode should succeed");
         assert_eq!(decoded, frame);
-        assert_eq!(decoded.channel, 1);
+        assert_eq!(decoded.opcode(), opcodes::SET_CHANNEL_CFG);
+        assert_eq!(decoded.channel, 3);
         assert_eq!(decoded.seq_num, 42);
-        assert_eq!(decoded.frame_type, frame_types::ARINC_DATA);
+        assert_eq!(decoded.payload_0, 0x12345678);
+        assert_eq!(decoded.payload_1, 0x9ABCDEF0);
     }
 
     #[test]
-    fn test_crc_error() {
-        let frame = BinaryFrame::new(1, 0, 100, 0x12345678);
+    fn test_crc_error_detection() {
+        let frame = BinaryFrame::new_cmd_ack(1, ack_status::OK, 100, 0x11223344, 0x55667788);
         let mut buf = [0u8; BINARY_FRAME_LEN];
         frame.encode(&mut buf);
 
-        // 篡改载荷字节
-        buf[6] ^= 0xFF;
-        assert!(BinaryFrame::decode(&buf).is_err());
+        // 翻转载荷中某个比特
+        buf[8] ^= 0x01;
+
+        match BinaryFrame::decode(&buf) {
+            Err(DecodeError::CrcMismatch { .. }) => {}
+            other => panic!("Expected CrcMismatch, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_parse_commands() {
-        let cmd_ping = HostCommand::parse("PING").unwrap();
-        assert_eq!(cmd_ping, HostCommand::Ping);
+    fn test_nibble_packing_roundtrip() {
+        let mut channels = [(false, false, false); 12];
+        channels[0] = (true, false, true); // CH0: Enable, Tx, 100k
+        channels[1] = (true, true, false); // CH1: Enable, Rx, 12.5k
+        channels[7] = (true, true, true);  // CH7: Enable, Rx, 100k
+        channels[8] = (true, false, false); // CH8: Enable, Tx, 12.5k
+        channels[11] = (true, true, true); // CH11: Enable, Rx, 100k
 
-        let cmd1 = HostCommand::parse("CHCFG 0 SPEED 100K").unwrap();
-        assert_eq!(
-            cmd1,
-            HostCommand::SetSpeed {
-                channel: 0,
-                high_speed: true
-            }
-        );
+        let (p0, p1) = pack_12_channels(&channels);
+        let unpacked = unpack_12_channels(p0, p1);
 
-        let cmd2 = HostCommand::parse("TXRAW 1 0x812345C8").unwrap();
-        assert_eq!(
-            cmd2,
-            HostCommand::SendRaw {
-                channel: 1,
-                raw_word: 0x812345C8
-            }
-        );
-
-        let cmd3 = HostCommand::parse("CHCFG 0 FILTER ALLOW 310").unwrap();
-        assert_eq!(
-            cmd3,
-            HostCommand::ChannelFilter {
-                channel: 0,
-                action: FilterAction::Allow(Label::from_octal(0o310)),
-            }
-        );
-
-        // 测试新增的 CHCFG 命令
-        let cmd5 = HostCommand::parse("CHCFG 2 ENABLE RX 12K5").unwrap();
-        assert_eq!(
-            cmd5,
-            HostCommand::ConfigureChannel {
-                channel: 2,
-                enable: true,
-                is_tx: false,
-                high_speed: false,
-            }
-        );
-
-        let cmd6 = HostCommand::parse("CHCFG 3 DISABLE").unwrap();
-        assert_eq!(
-            cmd6,
-            HostCommand::ConfigureChannel {
-                channel: 3,
-                enable: false,
-                is_tx: false,
-                high_speed: true,
-            }
-        );
-
-        let cmd7 = HostCommand::parse("CHCFG 0 FILTER ALLOW 203").unwrap();
-        assert_eq!(
-            cmd7,
-            HostCommand::ChannelFilter {
-                channel: 0,
-                action: FilterAction::Allow(Label::from_octal(0o203)),
-            }
-        );
-
-        let cmd8 = HostCommand::parse("STATUS 1").unwrap();
-        assert_eq!(cmd8, HostCommand::QueryStatus { channel: Some(1) });
-
-        let cmd9 = HostCommand::parse("MODE BIN").unwrap();
-        assert_eq!(cmd9, HostCommand::SetMode { binary_mode: true });
-
-        let cmd10 = HostCommand::parse("CHCFG 1 FILTER BLOCK 377").unwrap();
-        assert_eq!(
-            cmd10,
-            HostCommand::ChannelFilter {
-                channel: 1,
-                action: FilterAction::Block(Label::from_octal(0o377)),
-            }
-        );
-
-        let cmd11 = HostCommand::parse("CHCFG 1 FILTER CLEAR").unwrap();
-        assert_eq!(
-            cmd11,
-            HostCommand::ChannelFilter {
-                channel: 1,
-                action: FilterAction::Clear,
-            }
-        );
-
-        // 测试新增的 12 通道与配置管理指令
-        assert_eq!(HostCommand::parse("PAUSE").unwrap(), HostCommand::PauseAll);
-        assert_eq!(HostCommand::parse("RESUME").unwrap(), HostCommand::ResumeAll);
-        assert_eq!(HostCommand::parse("CFGDUMP").unwrap(), HostCommand::DumpConfig);
-        assert_eq!(
-            HostCommand::parse("PROFILE LIST").unwrap(),
-            HostCommand::ProfileList
-        );
-        assert_eq!(
-            HostCommand::parse("PROFILE LOAD 2").unwrap(),
-            HostCommand::ProfileLoad { slot: 2 }
-        );
-        assert_eq!(
-            HostCommand::parse("PROFILE BOOT 1").unwrap(),
-            HostCommand::ProfileBoot { slot: 1 }
-        );
-        let mut expected_name = heapless::String::new();
-        let _ = expected_name.push_str("BenchA");
-        assert_eq!(
-            HostCommand::parse("PROFILE SAVE 0 BenchA").unwrap(),
-            HostCommand::ProfileSave {
-                slot: 0,
-                name: expected_name
-            }
-        );
-
-        // 支持 HIGH / LOW 语法
-        assert_eq!(
-            HostCommand::parse("CHCFG 5 ENABLE TX HIGH").unwrap(),
-            HostCommand::ConfigureChannel {
-                channel: 5,
-                enable: true,
-                is_tx: true,
-                high_speed: true,
-            }
-        );
-        assert_eq!(
-            HostCommand::parse("CHCFG 6 ENABLE RX LOW").unwrap(),
-            HostCommand::ConfigureChannel {
-                channel: 6,
-                enable: true,
-                is_tx: false,
-                high_speed: false,
-            }
-        );
+        assert_eq!(channels, unpacked);
     }
 
     #[test]
-    fn test_parse_commands_robustness_and_errors() {
-        assert_eq!(HostCommand::parse(""), Err(CommandParseError::EmptyCommand));
-        assert_eq!(
-            HostCommand::parse("UNKNOWN_CMD"),
-            Err(CommandParseError::UnknownCommand)
-        );
+    fn test_sliding_window_resync() {
+        // 构造带有 3 字节噪声前缀的字节流
+        let frame = BinaryFrame::new_cmd_req(0, opcodes::PING, 1, 0xAABBCCDD, 0);
+        let mut frame_bytes = [0u8; BINARY_FRAME_LEN];
+        frame.encode(&mut frame_bytes);
 
-        // SDI / SSM 越界必须返回对应错误
-        assert_eq!(
-            HostCommand::parse("TX 0 310 4 0x12 2"),
-            Err(CommandParseError::InvalidSdi(4))
-        );
-        assert_eq!(
-            HostCommand::parse("TX 0 310 1 0x12 4"),
-            Err(CommandParseError::InvalidSsm(4))
-        );
-        assert_eq!(
-            HostCommand::parse("TX 0 310 1 0x80000 2"),
-            Err(CommandParseError::DataOutOfRange(0x80000))
-        );
+        let mut stream = [0u8; 3 + BINARY_FRAME_LEN];
+        stream[0] = 0xFF; // Noise
+        stream[1] = 0x41; // Partial false magic
+        stream[2] = 0x00; // Noise
+        stream[3..].copy_from_slice(&frame_bytes);
 
-        // CHCFG 语法错误检测
-        assert_eq!(
-            HostCommand::parse("CHCFG"),
-            Err(CommandParseError::MissingArgument("channel"))
-        );
-        assert_eq!(
-            HostCommand::parse("CHCFG abc"),
-            Err(CommandParseError::InvalidChannel)
-        );
-        assert_eq!(
-            HostCommand::parse("CHCFG 0 UNKNOWN"),
-            Err(CommandParseError::UnknownSubAction)
-        );
-        assert_eq!(
-            HostCommand::parse("CHCFG 0 ENABLE"),
-            Err(CommandParseError::MissingArgument("direction (TX/RX)"))
-        );
-    }
-
-    #[test]
-    fn test_binary_frame_decode_error_types() {
-        // 缓冲区长度不足
-        assert_eq!(
-            BinaryFrame::decode(&[0x41]),
-            Err(DecodeError::BufferTooShort)
-        );
-
-        // Magic 错误
-        let mut invalid_magic = [0u8; BINARY_FRAME_LEN];
-        invalid_magic[0] = 0x00;
-        invalid_magic[1] = 0x00;
-        assert_eq!(
-            BinaryFrame::decode(&invalid_magic),
-            Err(DecodeError::InvalidMagic)
-        );
+        let result = find_frame_in_stream(&stream);
+        assert!(result.is_some());
+        let (found_frame, consumed) = result.unwrap();
+        assert_eq!(found_frame, frame);
+        assert_eq!(consumed, 3 + BINARY_FRAME_LEN);
     }
 }

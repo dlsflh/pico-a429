@@ -23,7 +23,7 @@ use arinc429_core::filter::LabelFilter;
 
 use crate::channel::ChannelDirection;
 use crate::driver::ChannelDevice;
-// use crate::flash_storage::{FlashProfileManager, FLASH_CAPACITY, FLASH_MGR};
+use crate::flash_storage::{FlashProfileManager, FLASH_MGR};
 use crate::usb_service::{usb_cdc_rx_task, usb_cdc_tx_task, usb_task};
 
 bind_interrupts!(struct Irqs {
@@ -63,10 +63,11 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
     let mut config = embassy_usb::Config::new(0x2E8A, 0x000A); // Raspberry Pi Pico CDC
     config.manufacturer = Some("Raspberry Pi / ARINC-429");
-    config.product = Some("Pico2W ARINC-429 12CH Transceiver");
+    config.product = Some("Pico2W ARINC-429 Adapter");
     config.serial_number = Some("429-012");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
+    // config.bcd_usb = UsbVersion::Two; // 恢复为 embassy-usb 0.6.0 默认值 (UsbVersion::TwoOne, USB 2.1)
 
     static CONFIG_DESCRIPTOR: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();
     static BOS_DESCRIPTOR: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();
@@ -91,15 +92,13 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb_cdc_rx_task(receiver).unwrap());
     spawner.spawn(usb_cdc_tx_task(sender).unwrap());
 
-    // 2. [调试隔离] 暂时注释片上非易失 Flash 存储控制器初始化
-    // let flash =
-    //     embassy_rp::flash::Flash::<_, embassy_rp::flash::Blocking, FLASH_CAPACITY>::new_blocking(p.FLASH);
-    // let mut mgr = FlashProfileManager::new(flash);
-    // let boot_slot = mgr.get_boot_slot();
-    // {
-    //     let mut guard = FLASH_MGR.lock().await;
-    //     *guard = Some(mgr);
-    // }
+    // 2. 初始化 Flash 配置管理器与开机自启动 Profile 槽位检测 (零开销内存映射只读)
+    let mgr = FlashProfileManager::new();
+    let boot_slot = mgr.get_boot_slot();
+    {
+        let mut guard = FLASH_MGR.lock().await;
+        *guard = Some(mgr);
+    }
 
     // 3. 初始化 3 个硬件 PIO 模块 (PIO0, PIO1, PIO2 对应 12 个物理通道)
     // 每个 PIO 仅装载一次 TX (11字) 与 RX (20字) 微代码 (31/32字常驻)
@@ -174,36 +173,39 @@ async fn main(spawner: Spawner) {
         };
     }
 
+    // 出厂默认基态：全部 12 通道处于 Disabled 静默状态，PIO 状态机停用，引脚高阻弱下拉
     spawn_channels!(spawner, c0, tx_0, rx_0, [
-        (channel_0_task, 0, sm0_0, p.PIN_0, p.PIN_1, ChannelDirection::Tx),
-        (channel_1_task, 1, sm0_1, p.PIN_2, p.PIN_3, ChannelDirection::Rx),
-        (channel_2_task, 2, sm0_2, p.PIN_4, p.PIN_5, ChannelDirection::Rx),
-        (channel_3_task, 3, sm0_3, p.PIN_6, p.PIN_7, ChannelDirection::Rx),
+        (channel_0_task, 0, sm0_0, p.PIN_0, p.PIN_1, ChannelDirection::Disabled),
+        (channel_1_task, 1, sm0_1, p.PIN_2, p.PIN_3, ChannelDirection::Disabled),
+        (channel_2_task, 2, sm0_2, p.PIN_4, p.PIN_5, ChannelDirection::Disabled),
+        (channel_3_task, 3, sm0_3, p.PIN_6, p.PIN_7, ChannelDirection::Disabled),
     ]);
 
     spawn_channels!(spawner, c1, tx_1, rx_1, [
-        (channel_4_task, 4, sm1_0, p.PIN_8, p.PIN_9, ChannelDirection::Rx),
-        (channel_5_task, 5, sm1_1, p.PIN_10, p.PIN_11, ChannelDirection::Rx),
-        (channel_6_task, 6, sm1_2, p.PIN_12, p.PIN_13, ChannelDirection::Rx),
-        (channel_7_task, 7, sm1_3, p.PIN_14, p.PIN_15, ChannelDirection::Rx),
+        (channel_4_task, 4, sm1_0, p.PIN_8, p.PIN_9, ChannelDirection::Disabled),
+        (channel_5_task, 5, sm1_1, p.PIN_10, p.PIN_11, ChannelDirection::Disabled),
+        (channel_6_task, 6, sm1_2, p.PIN_12, p.PIN_13, ChannelDirection::Disabled),
+        (channel_7_task, 7, sm1_3, p.PIN_14, p.PIN_15, ChannelDirection::Disabled),
     ]);
 
     spawn_channels!(spawner, c2, tx_2, rx_2, [
-        (channel_8_task, 8, sm2_0, p.PIN_16, p.PIN_17, ChannelDirection::Rx),
-        (channel_9_task, 9, sm2_1, p.PIN_18, p.PIN_19, ChannelDirection::Rx),
-        (channel_10_task, 10, sm2_2, p.PIN_20, p.PIN_21, ChannelDirection::Rx),
-        (channel_11_task, 11, sm2_3, p.PIN_22, p.PIN_23, ChannelDirection::Rx),
+        (channel_8_task, 8, sm2_0, p.PIN_16, p.PIN_17, ChannelDirection::Disabled),
+        (channel_9_task, 9, sm2_1, p.PIN_18, p.PIN_19, ChannelDirection::Disabled),
+        (channel_10_task, 10, sm2_2, p.PIN_20, p.PIN_21, ChannelDirection::Disabled),
+        (channel_11_task, 11, sm2_3, p.PIN_26, p.PIN_27, ChannelDirection::Disabled),
     ]);
 
-    // 4. [调试隔离] 暂时注释开机自启动 Profile 加载
-    // if let Some(slot) = boot_slot {
-    //     let mut guard = FLASH_MGR.lock().await;
-    //     if let Some(ref mut m) = *guard {
-    //         if let Ok(record) = m.load_profile(slot) {
-    //             crate::usb_service::apply_all_channels(&record.directions, &record.speeds).await;
-    //         }
-    //     }
-    // }
+    // 4. 若 Flash 中存在指定的开机自启动 Profile，则原子加载并激活为 Operational 模式
+    if let Some(slot) = boot_slot {
+        let mut guard = FLASH_MGR.lock().await;
+        if let Some(ref mut m) = *guard {
+            if let Ok(record) = m.load_profile(slot) {
+                crate::channel::set_operating_mode(crate::channel::OperatingMode::Operational);
+                crate::usb_service::apply_all_channels(&record.directions, &record.speeds).await;
+            }
+        }
+    }
+    // 否则：保持全部 12 通道处于 Disabled 静默基态，固件处于 Config 模式等待上位机配置指令
 
     // 保持 main 任务挂起，防止 common 等硬件资源被析构或释放
     core::future::pending::<()>().await;

@@ -103,27 +103,56 @@ pub const BOARD_CHANNELS: [ChannelHwDescriptor; ACTIVE_CHANNEL_COUNT] = [
     ChannelHwDescriptor {
         channel_id: 11,
         direction: ChannelDirection::Rx,
-        pin_a: 22,
-        pin_b: 23,
+        pin_a: 26,
+        pin_b: 27,
     },
 ];
 
 // 运行时通道方向状态：0: Disabled, 1: Tx, 2: Rx
-// 出厂默认状态：CH0 为 Tx, CH1 为 Rx, CH2..11 为被动监听 Rx (电气绝对安全模式)
+// 出厂默认状态：全部 12 通道默认为 Disabled (电气绝对安全静默基态)
 static RUNTIME_CHANNEL_DIRECTIONS: [AtomicU8; ACTIVE_CHANNEL_COUNT] = [
-    AtomicU8::new(1), // CH0 默认为 Tx
-    AtomicU8::new(2), // CH1 默认为 Rx
-    AtomicU8::new(2), // CH2 默认为 Rx
-    AtomicU8::new(2), // CH3 默认为 Rx
-    AtomicU8::new(2), // CH4 默认为 Rx
-    AtomicU8::new(2), // CH5 默认为 Rx
-    AtomicU8::new(2), // CH6 默认为 Rx
-    AtomicU8::new(2), // CH7 默认为 Rx
-    AtomicU8::new(2), // CH8 默认为 Rx
-    AtomicU8::new(2), // CH9 默认为 Rx
-    AtomicU8::new(2), // CH10 默认为 Rx
-    AtomicU8::new(2), // CH11 默认为 Rx
+    AtomicU8::new(0), // CH0
+    AtomicU8::new(0), // CH1
+    AtomicU8::new(0), // CH2
+    AtomicU8::new(0), // CH3
+    AtomicU8::new(0), // CH4
+    AtomicU8::new(0), // CH5
+    AtomicU8::new(0), // CH6
+    AtomicU8::new(0), // CH7
+    AtomicU8::new(0), // CH8
+    AtomicU8::new(0), // CH9
+    AtomicU8::new(0), // CH10
+    AtomicU8::new(0), // CH11
 ];
+
+/// 设备工作模式：Config (配置模式) 与 Operational (正常运行模式)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatingMode {
+    Config = 0,
+    Operational = 1,
+}
+
+// 运行时工作模式：0: Config, 1: Operational (开机默认处于 Config 维护模式)
+static GLOBAL_OPERATING_MODE: AtomicU8 = AtomicU8::new(0);
+
+#[inline]
+pub fn operating_mode() -> OperatingMode {
+    if GLOBAL_OPERATING_MODE.load(Ordering::Acquire) == 1 {
+        OperatingMode::Operational
+    } else {
+        OperatingMode::Config
+    }
+}
+
+#[inline]
+pub fn set_operating_mode(mode: OperatingMode) {
+    GLOBAL_OPERATING_MODE.store(mode as u8, Ordering::Release);
+}
+
+#[inline]
+pub fn is_config_mode() -> bool {
+    operating_mode() == OperatingMode::Config
+}
 
 // 运行时通道波特率：true 为 HIGH (100 kbps), false 为 LOW (12.5 kbps)
 // 出厂默认状态：全部通道默认为 HIGH (100 kbps)
@@ -189,6 +218,24 @@ pub fn channel_is_high_speed(channel_id: u8) -> bool {
     } else {
         true
     }
+}
+
+/// 获取当前所有 12 通道方向快照
+pub fn current_directions() -> [u8; ACTIVE_CHANNEL_COUNT] {
+    let mut dirs = [0u8; ACTIVE_CHANNEL_COUNT];
+    for i in 0..ACTIVE_CHANNEL_COUNT {
+        dirs[i] = RUNTIME_CHANNEL_DIRECTIONS[i].load(Ordering::Relaxed);
+    }
+    dirs
+}
+
+/// 获取当前所有 12 通道波特率快照 (1: High 100k, 0: Low 12.5k)
+pub fn current_speeds() -> [u8; ACTIVE_CHANNEL_COUNT] {
+    let mut speeds = [0u8; ACTIVE_CHANNEL_COUNT];
+    for i in 0..ACTIVE_CHANNEL_COUNT {
+        speeds[i] = if RUNTIME_CHANNEL_SPEEDS[i].load(Ordering::Relaxed) { 1 } else { 0 };
+    }
+    speeds
 }
 
 /// 通道操作错误枚举
