@@ -22,14 +22,181 @@ try:
         BINARY_MAGIC,
         BinaryFrame,
         FrameType,
+        find_frame_in_stream,
     )
 except ModuleNotFoundError:
-    from arinc429_codec import (  # type: ignore[no-redef]
+    from arinc429_codec import (  # type: ignore[no-redef]  # ty: ignore[unresolved-import]
         BINARY_FRAME_LEN,
         BINARY_MAGIC,
         BinaryFrame,
         FrameType,
+        find_frame_in_stream,
     )
+
+_HOST_SEQ = 0
+
+
+def get_next_seq() -> int:
+    """获取单调自增的主机端 16 位请求序号。"""
+    global _HOST_SEQ
+    _HOST_SEQ = (_HOST_SEQ + 1) & 0xFFFF
+    return _HOST_SEQ
+
+
+def send_binary_cmd(
+    ser: serial.Serial,
+    opcode: int,
+    channel: int = 0,
+    payload_0: int = 0,
+    payload_1: int = 0,
+    timeout: float = 1.0,
+) -> BinaryFrame:
+    """下发二进制控制指令并以滑动窗口流解复用等待匹配的 CMD_ACK。
+
+    当总线上存在高波特率 ARINC 遥测下行流量时，自动跳过 ARINC_DATA 帧并将其解复用，
+    精准依据 seq_num 匹配对应的控制应答，杜绝单 CDC IN 端点读冲突。
+    """
+    seq = get_next_seq()
+    req = BinaryFrame.new_cmd_req(
+        channel=channel,
+        opcode=opcode,
+        seq_num=seq,
+        payload_0=payload_0,
+        payload_1=payload_1,
+    )
+    ser.write(req.encode())
+    ser.flush()
+
+    t0 = time.perf_counter()
+    stream_buf = bytearray()
+
+    while time.perf_counter() - t0 < timeout:
+        n = ser.in_waiting
+        if n > 0:
+            chunk = ser.read(n)
+            stream_buf.extend(chunk)
+
+            while True:
+                res = find_frame_in_stream(stream_buf)
+                if res is None:
+                    break
+                frame, consumed = res
+                del stream_buf[:consumed]
+
+                if frame.frame_type == FrameType.CMD_ACK and frame.seq_num == seq:
+                    return frame
+        else:
+            time.sleep(0.002)
+
+    raise TimeoutError(
+        f"二进制指令 (Opcode 0x{opcode:02X}, Seq {seq}) 等待应答超时 ({timeout}s)"
+    )
+
+
+def send_binary_cmd_multi_ack(
+    ser: serial.Serial,
+    opcode: int,
+    expected_count: int = 4,
+    channel: int = 0,
+    payload_0: int = 0,
+    payload_1: int = 0,
+    timeout: float = 1.0,
+) -> list[BinaryFrame]:
+    """下发二进制控制指令并收集指定数量的 CMD_ACK 序列 (针对 PROFILE LIST)。"""
+    seq = get_next_seq()
+    req = BinaryFrame.new_cmd_req(
+        channel=channel,
+        opcode=opcode,
+        seq_num=seq,
+        payload_0=payload_0,
+        payload_1=payload_1,
+    )
+    ser.write(req.encode())
+    ser.flush()
+
+    t0 = time.perf_counter()
+    stream_buf = bytearray()
+    acks: list[BinaryFrame] = []
+
+    while time.perf_counter() - t0 < timeout:
+        n = ser.in_waiting
+        if n > 0:
+            chunk = ser.read(n)
+            stream_buf.extend(chunk)
+
+            while True:
+                res = find_frame_in_stream(stream_buf)
+                if res is None:
+                    break
+                frame, consumed = res
+                del stream_buf[:consumed]
+
+                if frame.frame_type == FrameType.CMD_ACK and frame.seq_num == seq:
+                    acks.append(frame)
+                    if len(acks) >= expected_count:
+                        return acks
+        else:
+            time.sleep(0.002)
+
+    if not acks:
+        raise TimeoutError(
+            f"二进制指令 (Opcode 0x{opcode:02X}, Seq {seq}) 等待应答序列超时 ({timeout}s)"
+        )
+    return acks
+
+
+def send_word_and_await_loopback(
+    ser: serial.Serial,
+    tx_ch: int,
+    rx_ch: int,
+    raw_word: int,
+    stream_buf: bytearray,
+    timeout: float = 1.0,
+) -> tuple[BinaryFrame | None, BinaryFrame | None]:
+    """向指定 TX 通道发送 32 位 ARINC 字，并在同一条持久流中匹配 CMD_ACK 与 ARINC_DATA 环回帧。
+
+    返回 (ack_frame, rx_frame)。若在超时内未能完全集齐，则缺失项为 None。
+    流缓冲区 stream_buf 跨调用持久保留，杜绝任何未决残字节丢失或截断。
+    """
+    seq = get_next_seq()
+    # Opcode.TX_RAW_WORD = 0x04
+    req = BinaryFrame.new_cmd_req(
+        channel=tx_ch,
+        opcode=0x04,
+        seq_num=seq,
+        payload_0=raw_word,
+    )
+    ser.write(req.encode())
+    ser.flush()
+
+    t0 = time.perf_counter()
+    ack_frame: BinaryFrame | None = None
+    rx_frame: BinaryFrame | None = None
+
+    while time.perf_counter() - t0 < timeout:
+        # 先排空当前 stream_buf 中已接收但未匹配的帧
+        while True:
+            res = find_frame_in_stream(stream_buf)
+            if res is None:
+                break
+            frame, consumed = res
+            del stream_buf[:consumed]
+
+            if frame.frame_type == FrameType.CMD_ACK and frame.seq_num == seq:
+                ack_frame = frame
+            elif frame.frame_type == FrameType.ARINC_DATA and frame.channel == rx_ch:
+                rx_frame = frame
+
+        if ack_frame is not None and rx_frame is not None:
+            break
+
+        n = ser.in_waiting
+        if n > 0:
+            stream_buf.extend(ser.read(n))
+        else:
+            time.sleep(0.001)
+
+    return ack_frame, rx_frame
 
 
 def find_pico_port(preferred: str | None = None) -> str:

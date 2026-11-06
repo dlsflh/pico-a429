@@ -18,6 +18,54 @@ class FrameType:
     ARINC_DATA = 0x01
     CMD_ACK = 0x02
     ASYNC_EVENT = 0x03
+    CMD_REQ = 0x04
+
+
+class Opcode:
+    PING = 0x01
+    SET_CHANNEL_CFG = 0x02
+    SET_FILTER = 0x03
+    TX_RAW_WORD = 0x04
+    SET_OPERATING_MODE = 0x05
+    PAUSE_RESUME_ALL = 0x06
+    CFGBATCH = 0x07
+    QUERY_STATUS = 0x08
+    PROFILE_OP = 0x09
+
+
+class AckStatus:
+    OK = 0x00
+    ERR_UNKNOWN_CMD = 0x01
+    ERR_INVALID_PARAM = 0x02
+    ERR_MODE_CONFLICT = 0x03
+    ERR_FLASH = 0x04
+    ERR_BUFFER_FULL = 0x05
+
+
+class ProfileSubOp:
+    LIST = 0x00
+    SAVE = 0x01
+    LOAD = 0x02
+    BOOT = 0x03
+    CLEAR_BOOT = 0x04
+
+
+ACK_STATUS_DESCRIPTIONS: dict[int, str] = {
+    AckStatus.OK: "成功 (OK)",
+    AckStatus.ERR_UNKNOWN_CMD: "未知指令 (ERR_UNKNOWN_CMD)",
+    AckStatus.ERR_INVALID_PARAM: "无效参数 (ERR_INVALID_PARAM)",
+    AckStatus.ERR_MODE_CONFLICT: "模式冲突/通道未就绪 (ERR_MODE_CONFLICT)",
+    AckStatus.ERR_FLASH: "Flash操作失败/槽位为空 (ERR_FLASH)",
+    AckStatus.ERR_BUFFER_FULL: "硬件缓冲区已满 (ERR_BUFFER_FULL)",
+}
+
+
+def format_ack_status(status: int) -> str:
+    """将应答状态码转换为包含语义说明的人类可读字符串。"""
+    desc = ACK_STATUS_DESCRIPTIONS.get(status)
+    if desc:
+        return f"0x{status:02X} [{desc}]"
+    return f"0x{status:02X} [未知状态码]"
 
 
 class FrameFlags:
@@ -201,3 +249,113 @@ class BinaryFrame:
             timestamp_us=ts_us,
             raw_word=raw_word,
         )
+
+    @classmethod
+    def new_cmd_req(
+        cls,
+        channel: int,
+        opcode: int,
+        seq_num: int,
+        payload_0: int = 0,
+        payload_1: int = 0,
+    ) -> BinaryFrame:
+        """组装控制命令请求帧 (CMD_REQ)。"""
+        return cls(
+            frame_type=FrameType.CMD_REQ,
+            channel=channel & 0x0F,
+            flags=opcode & 0xFF,
+            seq_num=seq_num & 0xFFFF,
+            timestamp_us=payload_0 & 0xFFFFFFFF,
+            raw_word=payload_1 & 0xFFFFFFFF,
+        )
+
+    @classmethod
+    def new_cmd_ack(
+        cls,
+        channel: int,
+        status: int,
+        seq_num: int,
+        payload_0: int = 0,
+        payload_1: int = 0,
+    ) -> BinaryFrame:
+        """组装控制命令应答帧 (CMD_ACK)。"""
+        return cls(
+            frame_type=FrameType.CMD_ACK,
+            channel=channel & 0x0F,
+            flags=status & 0xFF,
+            seq_num=seq_num & 0xFFFF,
+            timestamp_us=payload_0 & 0xFFFFFFFF,
+            raw_word=payload_1 & 0xFFFFFFFF,
+        )
+
+    @property
+    def opcode(self) -> int:
+        """针对 CMD_REQ 获取操作码。"""
+        return self.flags
+
+    @property
+    def ack_status(self) -> int:
+        """针对 CMD_ACK 获取应答状态。"""
+        return self.flags
+
+
+def pack_channel_nibble(enable: bool, is_rx: bool, high_speed: bool) -> int:
+    """单个通道配置打包为 4 位 nibble。"""
+    if not enable:
+        return 0
+    val = 1
+    if is_rx:
+        val |= 2
+    if high_speed:
+        val |= 4
+    return val
+
+
+def unpack_channel_nibble(nibble: int) -> tuple[bool, bool, bool]:
+    """解包单个通道 4 位 nibble 为 (enable, is_rx, high_speed)。"""
+    enable = bool(nibble & 0x01)
+    is_rx = bool(nibble & 0x02)
+    high_speed = bool(nibble & 0x04)
+    return (enable, is_rx, high_speed)
+
+
+def pack_12_channels(channels: list[tuple[bool, bool, bool]]) -> tuple[int, int]:
+    """12 通道配置编码为两个 32 位载荷字 (Payload 0: CH0..7, Payload 1: CH8..11)。"""
+    p0 = 0
+    p1 = 0
+    for ch in range(min(8, len(channels))):
+        en, rx, hs = channels[ch]
+        p0 |= pack_channel_nibble(en, rx, hs) << (ch * 4)
+    for ch in range(8, min(12, len(channels))):
+        en, rx, hs = channels[ch]
+        p1 |= pack_channel_nibble(en, rx, hs) << ((ch - 8) * 4)
+    return p0, p1
+
+
+def unpack_12_channels(p0: int, p1: int) -> list[tuple[bool, bool, bool]]:
+    """解包两个 32 位载荷字为 12 通道配置列表。"""
+    res = []
+    for ch in range(8):
+        nibble = (p0 >> (ch * 4)) & 0x0F
+        res.append(unpack_channel_nibble(nibble))
+    for ch in range(4):
+        nibble = (p1 >> (ch * 4)) & 0x0F
+        res.append(unpack_channel_nibble(nibble))
+    return res
+
+
+def find_frame_in_stream(buf: bytes | bytearray) -> tuple[BinaryFrame, int] | None:
+    """在字节切片中采用 1 字节增量滑动窗口搜索第一个合法的 16 字节帧。
+
+    返回 (frame, consumed_bytes)，未找到完整合法帧时返回 None。
+    """
+    if len(buf) < BINARY_FRAME_LEN:
+        return None
+    for i in range(len(buf) - BINARY_FRAME_LEN + 1):
+        if buf[i : i + 2] == BINARY_MAGIC:
+            try:
+                frame = BinaryFrame.decode(bytes(buf[i : i + BINARY_FRAME_LEN]))
+                return frame, i + BINARY_FRAME_LEN
+            except ValueError:
+                continue
+    return None

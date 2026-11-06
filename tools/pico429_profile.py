@@ -63,16 +63,46 @@ def parse_toml_profile(toml_text: str) -> dict[str, Any]:
         raw_speed = str(ch_data.get("speed", "high"))
         norm_speed = normalize_speed(raw_speed)
 
-        filters = ch_data.get("filter", [])
-        if isinstance(filters, str):
-            filters = [filters]
-        elif not isinstance(filters, list):
-            filters = []
+        if "filter" in ch_data:
+            raise ValueError(
+                f"CH{ch_idx} 包含已废弃的 'filter' 字段。请改用 'filter_mode' ('none' | 'whitelist' | 'blacklist') 与 'labels'。"
+            )
+
+        # 解析过滤模式与 Label 列表
+        raw_filter_mode = str(ch_data.get("filter_mode", "none")).strip().lower()
+        if not raw_filter_mode:
+            raw_filter_mode = "none"
+
+        if raw_filter_mode not in ("none", "whitelist", "blacklist"):
+            raise ValueError(
+                f"CH{ch_idx} 无效过滤模式 '{raw_filter_mode}' (有效值: 'none', 'whitelist', 'blacklist')"
+            )
+
+        raw_labels = ch_data.get("labels", [])
+        if isinstance(raw_labels, (str, int)):
+            raw_labels = [raw_labels]
+        elif not isinstance(raw_labels, list):
+            raw_labels = []
+
+        # 校验 Label 合法性 (八进制 0..0o377)
+        clean_labels: list[str] = []
+        for lbl in raw_labels:
+            lbl_str = str(lbl).strip()
+            try:
+                lbl_val = int(lbl_str, 8)
+                if not (0 <= lbl_val <= 0o377):
+                    raise ValueError
+                clean_labels.append(f"{lbl_val:03o}")
+            except ValueError:
+                raise ValueError(
+                    f"CH{ch_idx} 无效八进制 Label 数值 '{lbl_str}' (有效范围: 000~377)"
+                )
 
         channels[ch_idx] = {
             "direction": raw_dir,
             "speed": norm_speed,
-            "filter": filters,
+            "filter_mode": raw_filter_mode,
+            "labels": clean_labels,
         }
 
     return {
@@ -135,7 +165,8 @@ def generate_toml_from_cfgdump(
         lines.append(f'direction = "{direction}"')
         lines.append(f'speed = "{speed_norm}"')
         if direction == "RX":
-            lines.append("filter = []")
+            lines.append('filter_mode = "none"')
+            lines.append("labels = []")
         lines.append("")
 
     return "\n".join(lines)

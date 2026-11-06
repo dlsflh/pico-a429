@@ -1,0 +1,52 @@
+# Pico-429 硬件闭环自检方案 (BIT Loopback Profile)
+# 硬件连线: 短接 GP0 (CH0 TX_A) -> GP2 (CH1 RX_A), GP1 (CH0 TX_B) -> GP3 (CH1 RX_B)
+
+[profile]
+name = "BIT_Loopback"
+version = "1.0"
+
+[global]
+mode = "BIN"
+
+# CH0: 100 kbps 高速发送端
+[channel.0]
+direction = "TX"
+speed = "high"
+
+# CH1: 100 kbps 高速接收端 (全放行，接收所有回环帧)
+[channel.1]
+direction = "RX"
+speed = "high"
+filter_mode = "none"
+labels = []
+
+# 其余通道保持静默 (高阻弱下拉)
+[channel.2]
+direction = "DISABLED"
+
+[channel.3]
+direction = "DISABLED"
+
+[channel.4]
+direction = "DISABLED"
+
+[channel.5]
+direction = "DISABLED"
+
+[channel.6]
+direction = "DISABLED"
+
+[channel.7]
+direction = "DISABLED"
+
+[channel.8]
+direction = "DISABLED"
+
+[channel.9]
+direction = "DISABLED"
+
+[channel.10]
+direction = "DISABLED"
+
+[channel.11]
+direction = "DISABLED"

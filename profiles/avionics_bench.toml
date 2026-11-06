@@ -1,0 +1,61 @@
+# Pico-429 典型航电多通道综合测试台架方案 (Avionics Bench Profile)
+
+[profile]
+name = "Avionics_Bench"
+version = "1.0"
+
+[global]
+mode = "BIN"
+
+# CH0: 飞控主输出总线 (100 kbps 高速发送)
+[channel.0]
+direction = "TX"
+speed = "high"
+
+# CH1: 导航总线监听 (100 kbps 高速接收，白名单过滤 310, 203, 001)
+[channel.1]
+direction = "RX"
+speed = "high"
+filter_mode = "whitelist"
+labels = ["310", "203", "001"]
+
+# CH2: 发动机参数低速总线 (12.5 kbps 低速接收，黑名单屏蔽测试 Label 377)
+[channel.2]
+direction = "RX"
+speed = "low"
+filter_mode = "blacklist"
+labels = ["377"]
+
+# CH3: 大气数据机 (ADC) 监听总线 (100 kbps 高速接收，全放行)
+[channel.3]
+direction = "RX"
+speed = "high"
+filter_mode = "none"
+labels = []
+
+# CH4: 低速传感器模拟发射端 (12.5 kbps 低速发送)
+[channel.4]
+direction = "TX"
+speed = "low"
+
+# 其余通道保持禁用静默
+[channel.5]
+direction = "DISABLED"
+
+[channel.6]
+direction = "DISABLED"
+
+[channel.7]
+direction = "DISABLED"
+
+[channel.8]
+direction = "DISABLED"
+
+[channel.9]
+direction = "DISABLED"
+
+[channel.10]
+direction = "DISABLED"
+
+[channel.11]
+direction = "DISABLED"

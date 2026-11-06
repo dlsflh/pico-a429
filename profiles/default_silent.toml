@@ -1,0 +1,44 @@
+# Pico-429 默认安全静默基态配置方案 (All 12 Channels Disabled)
+
+[profile]
+name = "Default_Silent"
+version = "1.0"
+
+[global]
+mode = "BIN"
+
+[channel.0]
+direction = "DISABLED"
+
+[channel.1]
+direction = "DISABLED"
+
+[channel.2]
+direction = "DISABLED"
+
+[channel.3]
+direction = "DISABLED"
+
+[channel.4]
+direction = "DISABLED"
+
+[channel.5]
+direction = "DISABLED"
+
+[channel.6]
+direction = "DISABLED"
+
+[channel.7]
+direction = "DISABLED"
+
+[channel.8]
+direction = "DISABLED"
+
+[channel.9]
+direction = "DISABLED"
+
+[channel.10]
+direction = "DISABLED"
+
+[channel.11]
+direction = "DISABLED"
