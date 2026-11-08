@@ -6,10 +6,12 @@
 //! - 严格采用 1 字节增量滑动窗口搜帧，彻底免疫任意相位偏移与流失步；
 //! - 固件内部零字符串格式化、零堆分配，具备确定性的硬实时响应。
 
+use core::cell::RefCell;
 use embassy_futures::select::{select, Either};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::channel::Channel;
 use embassy_usb::class::cdc_acm::{Receiver, Sender};
 
@@ -20,19 +22,17 @@ use arinc429_core::protocol::{
 };
 
 use crate::channel::{
-    channel_direction, channel_is_high_speed, send_to_channel_ctrl, send_to_channel_tx,
+    apply_all_channels_batch, apply_channel_config, apply_profile, channel_direction,
+    pause_all_channels, resume_all_channels, send_to_channel_ctrl, send_to_channel_tx,
     ChannelControlCmd, ChannelDirection, ACTIVE_CHANNEL_COUNT, GLOBAL_RX_PUBSUB,
-};
-use crate::coordinator::{
-    apply_all_channels_batch, apply_channel_config, apply_profile, pause_all_channels,
-    resume_all_channels,
 };
 
 /// 向上位机发送控制命令回执的专用非阻塞队列 (深度 16，防突发指令丢弃)
 pub static USB_CMD_RESP_QUEUE: Channel<CriticalSectionRawMutex, BinaryFrame, 16> = Channel::new();
 
-/// 暂存上位机下发的 32 字节配置方案名称 (分块装载)
-static mut STAGED_PROFILE_NAME: [u8; 32] = [0u8; 32];
+/// 暂存上位机下发的 32 字节配置方案名称 (线程安全临界区保护，消除 unsafe 裸指针)
+static STAGED_PROFILE_NAME: BlockingMutex<CriticalSectionRawMutex, RefCell<[u8; 32]>> =
+    BlockingMutex::new(RefCell::new([0u8; 32]));
 
 #[embassy_executor::task]
 pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, Driver<'static, USB>>) {
@@ -322,22 +322,6 @@ async fn execute_binary_command(req: BinaryFrame) {
             );
             let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
-        opcodes::PAUSE_RESUME_ALL => {
-            let resume = req.payload_0 != 0;
-            if resume {
-                resume_all_channels().await;
-            } else {
-                pause_all_channels().await;
-            }
-            let ack = BinaryFrame::new_cmd_ack(
-                0,
-                ack_status::OK,
-                req.seq_num,
-                req.payload_0,
-                0,
-            );
-            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
-        }
         opcodes::CFGBATCH => {
             let channels = unpack_12_channels(req.payload_0, req.payload_1);
             apply_all_channels_batch(&channels).await;
@@ -351,18 +335,7 @@ async fn execute_binary_command(req: BinaryFrame) {
             let _ = USB_CMD_RESP_QUEUE.try_send(ack);
         }
         opcodes::QUERY_STATUS => {
-            let mut channels = [(false, false, false); 12];
-            for ch in 0..ACTIVE_CHANNEL_COUNT {
-                let dir = channel_direction(ch as u8);
-                let (en, is_rx) = match dir {
-                    Some(ChannelDirection::Tx) => (true, false),
-                    Some(ChannelDirection::Rx) => (true, true),
-                    _ => (false, false),
-                };
-                let hs = channel_is_high_speed(ch as u8);
-                channels[ch] = (en, is_rx, hs);
-            }
-            let (p0, p1) = pack_12_channels(&channels);
+            let (p0, p1) = crate::channel::pack_runtime_channels();
             let mode = if crate::channel::is_config_mode() { 0 } else { 1 };
             let ack = BinaryFrame::new_cmd_ack(mode, ack_status::OK, req.seq_num, p0, p1);
             let _ = USB_CMD_RESP_QUEUE.try_send(ack);
@@ -370,6 +343,29 @@ async fn execute_binary_command(req: BinaryFrame) {
         opcodes::PROFILE_OP => {
             let sub_op = (req.payload_0 & 0xFF) as u8;
             let slot = req.channel;
+
+            // 严格状态互锁：Flash 扇区擦写将关闭全局中断 40~100ms，必须仅在 CONFIG 静默维护模式下允许执行，
+            // 严禁在 OPERATIONAL 运行模式下执行，以物理杜绝 PIO FIFO 溢出与实时总线丢帧
+            let is_mutating_flash_op = matches!(
+                sub_op,
+                profile_sub_ops::SAVE
+                    | profile_sub_ops::BOOT
+                    | profile_sub_ops::CLEAR_BOOT
+                    | profile_sub_ops::CLEAR
+                    | profile_sub_ops::CLEAR_ALL
+            );
+            if is_mutating_flash_op && !crate::channel::is_config_mode() {
+                let ack = BinaryFrame::new_cmd_ack(
+                    slot,
+                    ack_status::ERR_MODE_CONFLICT,
+                    req.seq_num,
+                    0,
+                    0,
+                );
+                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                return;
+            }
+
             let mut flash_guard = crate::flash_storage::FLASH_MGR.lock().await;
             if let Some(ref mut mgr) = *flash_guard {
                 match sub_op {
@@ -406,13 +402,13 @@ async fn execute_binary_command(req: BinaryFrame) {
                         let dirs = crate::channel::current_directions();
                         let speeds = crate::channel::current_speeds();
                         let (filter_modes, filter_bitmaps) = crate::channel::get_channel_filters_snapshot();
-                        let name = unsafe { &*core::ptr::addr_of!(STAGED_PROFILE_NAME) };
-                        let status = match mgr.save_profile(slot, name, &dirs, &speeds, &filter_modes, &filter_bitmaps) {
+                        let mut name = [0u8; 32];
+                        STAGED_PROFILE_NAME.lock(|cell| {
+                            name.copy_from_slice(&*cell.borrow());
+                        });
+                        let status = match mgr.save_profile(slot, &name, &dirs, &speeds, &filter_modes, &filter_bitmaps) {
                             Ok(()) => ack_status::OK,
-                            Err(_) => {
-                                crate::channel::set_hardware_fault(true);
-                                ack_status::ERR_FLASH
-                            }
+                            Err(_) => ack_status::ERR_FLASH,
                         };
                         let ack = BinaryFrame::new_cmd_ack(
                             slot,
@@ -535,8 +531,9 @@ async fn execute_binary_command(req: BinaryFrame) {
                         let chunk_idx = ((req.payload_0 >> 8) & 0x07) as usize;
                         let offset = chunk_idx * 4;
                         let bytes = req.payload_1.to_le_bytes();
-                        let name_buf = unsafe { &mut *core::ptr::addr_of_mut!(STAGED_PROFILE_NAME) };
-                        name_buf[offset..offset + 4].copy_from_slice(&bytes);
+                        STAGED_PROFILE_NAME.lock(|cell| {
+                            cell.borrow_mut()[offset..offset + 4].copy_from_slice(&bytes);
+                        });
                         let ack = BinaryFrame::new_cmd_ack(
                             slot,
                             ack_status::OK,

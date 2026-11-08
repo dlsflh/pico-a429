@@ -18,8 +18,8 @@ use arinc429_core::filter::LabelFilter;
 use arinc429_core::word::ArincWord;
 
 use crate::channel::{
-    set_channel_direction, ChannelControlCmd, ChannelDirection, InboundArincFrame,
-    CHANNEL_CTRL_QUEUES, CHANNEL_TX_QUEUES, GLOBAL_RX_PUBSUB,
+    ChannelControlCmd, ChannelDirection, InboundArincFrame, CHANNEL_CTRL_QUEUES,
+    CHANNEL_TX_QUEUES, GLOBAL_RX_PUBSUB,
 };
 use crate::driver::calculate_pio_clkdiv;
 
@@ -174,9 +174,10 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
         }
     }
 
-    /// 暂停物理收发工作 (切换引脚为高阻输入以确保物理总线静默)
+    /// 暂停物理收发工作 (切换引脚为高阻输入以确保物理总线静默，并清空 PIO 硬件 FIFO 与时钟计数器)
     pub fn pause(&mut self) {
         self.sm.set_enable(false);
+        self.sm.restart();
         if self.direction == ChannelDirection::Tx {
             self.sm
                 .set_pin_dirs(Direction::In, &[&self.pin_a, &self.pin_b]);
@@ -202,19 +203,22 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
     }
 
     /// 处理单条通道控制命令
-    fn handle_cmd(&mut self, channel_id: u8, cmd: ChannelControlCmd) {
+    fn handle_cmd(&mut self, cmd: ChannelControlCmd) {
         match cmd {
             ChannelControlCmd::Configure {
                 direction,
                 high_speed,
+                filter,
             } => {
                 let speed = if high_speed {
                     ArincSpeed::High100k
                 } else {
                     ArincSpeed::Low12k5
                 };
+                if let Some(f) = filter {
+                    self.filter = f;
+                }
                 self.reconfigure(direction, speed);
-                set_channel_direction(channel_id, direction);
             }
             ChannelControlCmd::Filter(action) => match action {
                 arinc429_core::protocol::FilterAction::Allow(label) => {
@@ -224,7 +228,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                     let _ = self.filter.block_label(label);
                 }
                 arinc429_core::protocol::FilterAction::Clear => {
-                    self.filter.clear();
+                    self.filter.reset();
                 }
             },
             ChannelControlCmd::SetFullFilter(filter) => {
@@ -246,7 +250,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
         loop {
             // 尽最大努力先排空滞留的控制命令
             while let Ok(cmd) = CHANNEL_CTRL_QUEUES[channel_id as usize].try_receive() {
-                self.handle_cmd(channel_id, cmd);
+                self.handle_cmd(cmd);
             }
 
             let is_operational =
@@ -255,7 +259,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
             if !is_operational {
                 // 挂起或处于 Config 维护模式或停用状态：休眠等待控制命令激活
                 let cmd = CHANNEL_CTRL_QUEUES[channel_id as usize].receive().await;
-                self.handle_cmd(channel_id, cmd);
+                self.handle_cmd(cmd);
             } else if self.direction == ChannelDirection::Tx {
                 // 发送模式：等待发送字或控制命令
                 match select(
@@ -268,7 +272,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                         self.sm.tx().wait_push(raw_word).await;
                     }
                     Either::Second(cmd) => {
-                        self.handle_cmd(channel_id, cmd);
+                        self.handle_cmd(cmd);
                     }
                 }
             } else {
@@ -297,7 +301,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                         }
                     }
                     Either::Second(cmd) => {
-                        self.handle_cmd(channel_id, cmd);
+                        self.handle_cmd(cmd);
                     }
                 }
             }

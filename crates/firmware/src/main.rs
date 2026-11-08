@@ -5,7 +5,6 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 pub mod channel;
-pub mod coordinator;
 pub mod driver;
 pub mod flash_storage;
 pub mod pio_programs;
@@ -98,7 +97,7 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
     let mut config = embassy_usb::Config::new(0x2E8A, 0x000A); // Raspberry Pi Pico CDC
     config.manufacturer = Some("Raspberry Pi / ARINC-429");
-    config.product = Some("Pico2W ARINC-429 Adapter");
+    config.product = Some("Pico-429 12CH Adapter");
     config.serial_number = Some("429-012");
     config.max_power = 100;
     config.max_packet_size_0 = 64;
@@ -236,7 +235,7 @@ async fn main(spawner: Spawner) {
         if let Some(ref mut m) = *guard {
             if let Ok(record) = m.load_profile(slot) {
                 crate::channel::set_operating_mode(crate::channel::OperatingMode::Operational);
-                crate::coordinator::apply_profile(&record).await;
+                crate::channel::apply_profile(&record).await;
             }
         }
     }

@@ -12,7 +12,7 @@ use embassy_sync::channel::Channel;
 use embassy_sync::pubsub::PubSubChannel;
 
 use arinc429_core::filter::LabelFilter;
-use arinc429_core::protocol::{flags, frame_types, BinaryFrame, FilterAction};
+use arinc429_core::protocol::{flags, frame_types, BinaryFrame, FilterAction, ProfileRecord};
 use arinc429_core::word::ArincWord;
 
 /// 通道工作模式
@@ -26,9 +26,9 @@ pub enum ChannelDirection {
 /// 当前板载物理装配激活的通道数 (Channel 0..11 共 12 路)
 pub const ACTIVE_CHANNEL_COUNT: usize = 12;
 
-// 运行时通道方向状态：0: Disabled, 1: Tx, 2: Rx
-// 出厂默认状态：全部 12 通道默认为 Disabled (电气绝对安全静默基态)
-static RUNTIME_CHANNEL_DIRECTIONS: [AtomicU8; ACTIVE_CHANNEL_COUNT] = [
+// 运行时通道紧凑原子配置状态 (单一真理源，直接复用 4-bit nibble 编码: Enable, IsRx, HighSpeed)
+// 出厂默认状态：全部 12 通道默认为 0 (电气绝对安全静默基态，全停用)
+static RUNTIME_CHANNEL_CONFIG: [AtomicU8; ACTIVE_CHANNEL_COUNT] = [
     AtomicU8::new(0), // CH0
     AtomicU8::new(0), // CH1
     AtomicU8::new(0), // CH2
@@ -85,36 +85,20 @@ pub fn is_hardware_fault() -> bool {
     HARDWARE_FAULT.load(Ordering::Acquire)
 }
 
-// 运行时通道波特率：true 为 HIGH (100 kbps), false 为 LOW (12.5 kbps)
-// 出厂默认状态：全部通道默认为 HIGH (100 kbps)
-static RUNTIME_CHANNEL_SPEEDS: [AtomicBool; ACTIVE_CHANNEL_COUNT] = [
-    AtomicBool::new(true), // CH0
-    AtomicBool::new(true), // CH1
-    AtomicBool::new(true), // CH2
-    AtomicBool::new(true), // CH3
-    AtomicBool::new(true), // CH4
-    AtomicBool::new(true), // CH5
-    AtomicBool::new(true), // CH6
-    AtomicBool::new(true), // CH7
-    AtomicBool::new(true), // CH8
-    AtomicBool::new(true), // CH9
-    AtomicBool::new(true), // CH10
-    AtomicBool::new(true), // CH11
-];
-
 // 全局遥测数据包单调递增包序号 (溢出自动翻转)
 static TELEMETRY_SEQ: AtomicU16 = AtomicU16::new(0);
 
-/// 动态更新通道方向
+/// 动态更新通道原子配置
 #[inline]
-pub fn set_channel_direction(channel_id: u8, dir: ChannelDirection) {
+pub fn set_channel_config(channel_id: u8, dir: ChannelDirection, high_speed: bool) {
     if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
-        let code = match dir {
-            ChannelDirection::Disabled => 0,
-            ChannelDirection::Tx => 1,
-            ChannelDirection::Rx => 2,
+        let (en, is_rx) = match dir {
+            ChannelDirection::Disabled => (false, false),
+            ChannelDirection::Tx => (true, false),
+            ChannelDirection::Rx => (true, true),
         };
-        RUNTIME_CHANNEL_DIRECTIONS[channel_id as usize].store(code, Ordering::Relaxed);
+        let nibble = arinc429_core::protocol::pack_channel_nibble(en, is_rx, high_speed);
+        RUNTIME_CHANNEL_CONFIG[channel_id as usize].store(nibble, Ordering::Relaxed);
     }
 }
 
@@ -122,22 +106,17 @@ pub fn set_channel_direction(channel_id: u8, dir: ChannelDirection) {
 #[inline]
 pub fn channel_direction(channel_id: u8) -> Option<ChannelDirection> {
     if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
-        match RUNTIME_CHANNEL_DIRECTIONS[channel_id as usize].load(Ordering::Relaxed) {
-            0 => Some(ChannelDirection::Disabled),
-            1 => Some(ChannelDirection::Tx),
-            2 => Some(ChannelDirection::Rx),
-            _ => None,
+        let nibble = RUNTIME_CHANNEL_CONFIG[channel_id as usize].load(Ordering::Relaxed);
+        let (en, is_rx, _) = arinc429_core::protocol::unpack_channel_nibble(nibble);
+        if !en {
+            Some(ChannelDirection::Disabled)
+        } else if is_rx {
+            Some(ChannelDirection::Rx)
+        } else {
+            Some(ChannelDirection::Tx)
         }
     } else {
         None
-    }
-}
-
-/// 动态更新通道波特率
-#[inline]
-pub fn set_channel_speed(channel_id: u8, high_speed: bool) {
-    if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
-        RUNTIME_CHANNEL_SPEEDS[channel_id as usize].store(high_speed, Ordering::Relaxed);
     }
 }
 
@@ -145,17 +124,21 @@ pub fn set_channel_speed(channel_id: u8, high_speed: bool) {
 #[inline]
 pub fn channel_is_high_speed(channel_id: u8) -> bool {
     if (channel_id as usize) < ACTIVE_CHANNEL_COUNT {
-        RUNTIME_CHANNEL_SPEEDS[channel_id as usize].load(Ordering::Relaxed)
+        let nibble = RUNTIME_CHANNEL_CONFIG[channel_id as usize].load(Ordering::Relaxed);
+        let (_, _, high_speed) = arinc429_core::protocol::unpack_channel_nibble(nibble);
+        high_speed
     } else {
         true
     }
 }
 
-/// 获取当前所有 12 通道方向快照
+/// 获取当前所有 12 通道方向快照 (0: Disabled, 1: Tx, 2: Rx)
 pub fn current_directions() -> [u8; ACTIVE_CHANNEL_COUNT] {
     let mut dirs = [0u8; ACTIVE_CHANNEL_COUNT];
     for i in 0..ACTIVE_CHANNEL_COUNT {
-        dirs[i] = RUNTIME_CHANNEL_DIRECTIONS[i].load(Ordering::Relaxed);
+        let nibble = RUNTIME_CHANNEL_CONFIG[i].load(Ordering::Relaxed);
+        let (en, is_rx, _) = arinc429_core::protocol::unpack_channel_nibble(nibble);
+        dirs[i] = if !en { 0 } else if is_rx { 2 } else { 1 };
     }
     dirs
 }
@@ -164,9 +147,26 @@ pub fn current_directions() -> [u8; ACTIVE_CHANNEL_COUNT] {
 pub fn current_speeds() -> [u8; ACTIVE_CHANNEL_COUNT] {
     let mut speeds = [0u8; ACTIVE_CHANNEL_COUNT];
     for i in 0..ACTIVE_CHANNEL_COUNT {
-        speeds[i] = if RUNTIME_CHANNEL_SPEEDS[i].load(Ordering::Relaxed) { 1 } else { 0 };
+        let nibble = RUNTIME_CHANNEL_CONFIG[i].load(Ordering::Relaxed);
+        let (_, _, high_speed) = arinc429_core::protocol::unpack_channel_nibble(nibble);
+        speeds[i] = if high_speed { 1 } else { 0 };
     }
     speeds
+}
+
+/// 零开销将 12 通道运行时配置编码为上位机所需的两个 32 位载荷字 (Payload 0: CH0..7, Payload 1: CH8..11)
+pub fn pack_runtime_channels() -> (u32, u32) {
+    let mut p0 = 0u32;
+    let mut p1 = 0u32;
+    for ch in 0..8 {
+        let nibble = (RUNTIME_CHANNEL_CONFIG[ch].load(Ordering::Relaxed) & 0x0F) as u32;
+        p0 |= nibble << (ch * 4);
+    }
+    for ch in 8..12 {
+        let nibble = (RUNTIME_CHANNEL_CONFIG[ch].load(Ordering::Relaxed) & 0x0F) as u32;
+        p1 |= nibble << ((ch - 8) * 4);
+    }
+    (p0, p1)
 }
 
 static RUNTIME_CHANNEL_FILTERS: BlockingMutex<CriticalSectionRawMutex, RefCell<[LabelFilter; ACTIVE_CHANNEL_COUNT]>> =
@@ -264,14 +264,15 @@ impl InboundArincFrame {
 /// 通道动态配置与控制命令
 #[derive(Debug, Clone, Copy)]
 pub enum ChannelControlCmd {
-    /// 动态配置通道使能、方向与波特率
+    /// 动态配置通道使能、方向与波特率 (及可选 Label 过滤器原子装载)
     Configure {
         direction: ChannelDirection,
         high_speed: bool,
+        filter: Option<LabelFilter>,
     },
     /// 过滤规则动作
     Filter(FilterAction),
-    /// 全量重置并配置通道 Label 过滤器 (用于 Profile 恢复)
+    /// 全量重置并配置通道 Label 过滤器 (用于独立设置)
     SetFullFilter(LabelFilter),
     /// 暂停物理收发工作 (停止状态机运行)
     Pause,
@@ -293,15 +294,15 @@ pub static CHANNEL_TX_QUEUES: [Channel<CriticalSectionRawMutex, u32, 16>; ACTIVE
 pub static CHANNEL_CTRL_QUEUES: [Channel<CriticalSectionRawMutex, ChannelControlCmd, 4>;
     ACTIVE_CHANNEL_COUNT] = [CTRL_QUEUE_INIT; ACTIVE_CHANNEL_COUNT];
 
-/// 集中式多路接收遥测广播总线
+/// 集中式多路接收遥测总线 (Single Producer Multi-Publisher, Single USB Subscriber)
 ///
-/// 具备 1024 帧深度的环形缓冲，支持 4 个独立订阅端 (USB 等)，对应当前激活通道发布者。
-/// 满载自动丢弃最旧帧，绝不反向阻塞物理层总线接收。
+/// 具备 1024 帧深度的环形缓冲，支持 1 个专用 USB 订阅端，对应 12 个物理通道发布端。
+/// 满载自动覆盖最旧帧 (publish_immediate)，绝不反向阻塞物理层总线接收。
 pub static GLOBAL_RX_PUBSUB: PubSubChannel<
     CriticalSectionRawMutex,
     InboundArincFrame,
     1024,
-    4,
+    1,
     ACTIVE_CHANNEL_COUNT,
 > = PubSubChannel::new();
 
@@ -330,5 +331,81 @@ pub async fn send_to_channel_ctrl(
         Ok(())
     } else {
         Err(ChannelError::ChannelOutOfRange(channel_id))
+    }
+}
+
+/// 原子暂停全部 12 通道物理收发
+pub async fn pause_all_channels() {
+    for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+        let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
+    }
+}
+
+/// 恢复全部 12 通道物理收发
+pub async fn resume_all_channels() {
+    for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
+        let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
+    }
+}
+
+/// 配置单通道方向与速率
+pub async fn apply_channel_config(channel: u8, dir: ChannelDirection, high_speed: bool) {
+    set_channel_config(channel, dir, high_speed);
+    let _ = send_to_channel_ctrl(
+        channel,
+        ChannelControlCmd::Configure {
+            direction: dir,
+            high_speed,
+            filter: None,
+        },
+    )
+    .await;
+}
+
+/// 批量原子应用 12 通道配置 (单通道 1 次入队，零队列饱和风险)
+pub async fn apply_all_channels_batch(channels: &[(bool, bool, bool); ACTIVE_CHANNEL_COUNT]) {
+    for ch in 0..ACTIVE_CHANNEL_COUNT {
+        let (enable, is_rx, high_speed) = channels[ch];
+        let dir = if !enable {
+            ChannelDirection::Disabled
+        } else if is_rx {
+            ChannelDirection::Rx
+        } else {
+            ChannelDirection::Tx
+        };
+        set_channel_config(ch as u8, dir, high_speed);
+        let _ = send_to_channel_ctrl(
+            ch as u8,
+            ChannelControlCmd::Configure {
+                direction: dir,
+                high_speed,
+                filter: None,
+            },
+        )
+        .await;
+    }
+}
+
+/// 全量原子还原配置方案 (包含方向、速率与全量 12 通道 LabelFilter，单通道单指令原子装载)
+pub async fn apply_profile(record: &ProfileRecord) {
+    for ch in 0..ACTIVE_CHANNEL_COUNT {
+        let dir = match record.directions[ch] {
+            1 => ChannelDirection::Tx,
+            2 => ChannelDirection::Rx,
+            _ => ChannelDirection::Disabled,
+        };
+        let hs = record.speeds[ch] != 0;
+        let filter = record.get_channel_filter(ch);
+        set_channel_config(ch as u8, dir, hs);
+        set_channel_filter_direct(ch as u8, filter);
+        let _ = send_to_channel_ctrl(
+            ch as u8,
+            ChannelControlCmd::Configure {
+                direction: dir,
+                high_speed: hs,
+                filter: Some(filter),
+            },
+        )
+        .await;
     }
 }
