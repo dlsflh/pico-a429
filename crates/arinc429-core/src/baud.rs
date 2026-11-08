@@ -22,22 +22,6 @@ impl ArincSpeed {
     pub const HIGH: Self = Self::High100k;
     pub const LOW: Self = Self::Low12k5;
 
-    /// 从字符串解析波特率模式 (支持 "high"/"low" 及向后兼容别名 "100k"/"12.5k"/"12k5")
-    pub fn parse_str(s: &str) -> Option<Self> {
-        let s = s.trim();
-        if s.eq_ignore_ascii_case("high") || s.eq_ignore_ascii_case("100k") || s == "100000" {
-            Some(Self::High100k)
-        } else if s.eq_ignore_ascii_case("low")
-            || s.eq_ignore_ascii_case("12.5k")
-            || s.eq_ignore_ascii_case("12k5")
-            || s == "12500"
-        {
-            Some(Self::Low12k5)
-        } else {
-            None
-        }
-    }
-
     /// 目标波特率 (bps)
     pub const fn baud_rate(self) -> u32 {
         match self {
@@ -52,14 +36,6 @@ impl ArincSpeed {
         match self {
             Self::High100k => 2_000_000,
             Self::Low12k5 => 250_000,
-        }
-    }
-
-    /// 单个 bit 持续微秒数
-    pub const fn bit_period_us(self) -> u32 {
-        match self {
-            Self::High100k => 10,
-            Self::Low12k5 => 80,
         }
     }
 }

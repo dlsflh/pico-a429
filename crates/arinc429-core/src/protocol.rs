@@ -43,6 +43,7 @@ pub mod opcodes {
     pub const CFGBATCH: u8 = 0x07;
     pub const QUERY_STATUS: u8 = 0x08;
     pub const PROFILE_OP: u8 = 0x09;
+    pub const REBOOT_TO_BOOTSEL: u8 = 0x0A;
 }
 
 /// 命令执行状态码 (用于 CMD_ACK 帧的 flags 字节)
@@ -62,6 +63,11 @@ pub mod profile_sub_ops {
     pub const LOAD: u8 = 0x02;
     pub const BOOT: u8 = 0x03;
     pub const CLEAR_BOOT: u8 = 0x04;
+    pub const CLEAR: u8 = 0x05;
+    pub const CLEAR_ALL: u8 = 0x06;
+    pub const GET_CHANNELS: u8 = 0x07;
+    pub const SET_NAME_CHUNK: u8 = 0x08;
+    pub const GET_NAME_CHUNK: u8 = 0x09;
 }
 
 /// 过滤操作动作
@@ -94,18 +100,6 @@ pub enum DecodeError {
 }
 
 impl BinaryFrame {
-    /// 创建标准 ARINC 数据帧 (序号默认为 0)
-    pub const fn new(channel: u8, flags: u8, timestamp_us: u32, raw_word: u32) -> Self {
-        Self {
-            frame_type: frame_types::ARINC_DATA,
-            channel: channel & 0x0F,
-            flags,
-            seq_num: 0,
-            payload_0: timestamp_us,
-            payload_1: raw_word,
-        }
-    }
-
     /// 创建带包序号与指定帧类型的完整帧
     pub const fn new_full(
         frame_type: u8,
@@ -309,6 +303,126 @@ pub fn unpack_12_channels(p0: u32, p1: u32) -> [(bool, bool, bool); 12] {
     channels
 }
 
+pub const PROFILE_MAGIC: u16 = 0x4239; // "B9"
+pub const PROFILE_RECORD_LEN: usize = 512;
+
+/// 单槽位配置记录 (512 字节确定性紧凑结构，完整支持 12 通道配置与 LabelFilter 持久化)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ProfileRecord {
+    pub magic: u16,
+    pub slot: u8,
+    pub is_valid: u8,
+    pub name: [u8; 32],
+    pub directions: [u8; 12], // 0: Disabled, 1: Tx, 2: Rx
+    pub speeds: [u8; 12],     // 0: Low (12.5k), 1: High (100k)
+    pub filter_modes: [u8; 12], // 0: AcceptAll, 1: Whitelist, 2: Blacklist
+    pub filter_bitmaps: [[u32; 8]; 12], // 12 通道 256 位掩码
+    pub crc16: u16,
+}
+
+impl Default for ProfileRecord {
+    fn default() -> Self {
+        Self {
+            magic: PROFILE_MAGIC,
+            slot: 0,
+            is_valid: 0,
+            name: [0; 32],
+            directions: [0; 12],
+            speeds: [1; 12],
+            filter_modes: [0; 12],
+            filter_bitmaps: [[0; 8]; 12],
+            crc16: 0,
+        }
+    }
+}
+
+impl ProfileRecord {
+    /// 序列化为 512 字节小端序字节数组
+    pub fn to_bytes(&self) -> [u8; PROFILE_RECORD_LEN] {
+        let mut buf = [0u8; PROFILE_RECORD_LEN];
+        buf[0..2].copy_from_slice(&self.magic.to_le_bytes());
+        buf[2] = self.slot;
+        buf[3] = self.is_valid;
+        buf[4..36].copy_from_slice(&self.name);
+        buf[36..48].copy_from_slice(&self.directions);
+        buf[48..60].copy_from_slice(&self.speeds);
+        buf[60..72].copy_from_slice(&self.filter_modes);
+
+        // 72..76 保留对齐
+        let mut offset = 76;
+        for ch in 0..12 {
+            for word in 0..8 {
+                let bytes = self.filter_bitmaps[ch][word].to_le_bytes();
+                buf[offset..offset + 4].copy_from_slice(&bytes);
+                offset += 4;
+            }
+        }
+        // offset: 76 + 12 * 32 = 460. 460..510 为保留字段
+        buf[510..512].copy_from_slice(&self.crc16.to_le_bytes());
+        buf
+    }
+
+    /// 从 512 字节切片反序列化
+    pub fn from_bytes(buf: &[u8; PROFILE_RECORD_LEN]) -> Self {
+        let magic = u16::from_le_bytes([buf[0], buf[1]]);
+        let slot = buf[2];
+        let is_valid = buf[3];
+        let mut name = [0u8; 32];
+        name.copy_from_slice(&buf[4..36]);
+        let mut directions = [0u8; 12];
+        directions.copy_from_slice(&buf[36..48]);
+        let mut speeds = [0u8; 12];
+        speeds.copy_from_slice(&buf[48..60]);
+        let mut filter_modes = [0u8; 12];
+        filter_modes.copy_from_slice(&buf[60..72]);
+
+        let mut filter_bitmaps = [[0u32; 8]; 12];
+        let mut offset = 76;
+        for ch in 0..12 {
+            for word in 0..8 {
+                filter_bitmaps[ch][word] = u32::from_le_bytes([
+                    buf[offset],
+                    buf[offset + 1],
+                    buf[offset + 2],
+                    buf[offset + 3],
+                ]);
+                offset += 4;
+            }
+        }
+        let crc16 = u16::from_le_bytes([buf[510], buf[511]]);
+        Self {
+            magic,
+            slot,
+            is_valid,
+            name,
+            directions,
+            speeds,
+            filter_modes,
+            filter_bitmaps,
+            crc16,
+        }
+    }
+
+    pub fn compute_crc(&self) -> u16 {
+        let bytes = self.to_bytes();
+        crc16_ccitt(&bytes[..PROFILE_RECORD_LEN - 2])
+    }
+
+    pub fn verify(&self) -> bool {
+        self.magic == PROFILE_MAGIC && self.is_valid == 1 && self.compute_crc() == self.crc16
+    }
+
+    /// 获取特定通道的 LabelFilter 实例
+    pub fn get_channel_filter(&self, channel: usize) -> crate::filter::LabelFilter {
+        if channel >= 12 {
+            return crate::filter::LabelFilter::new_accept_all();
+        }
+        let mode = crate::filter::FilterMode::from_u8(self.filter_modes[channel]);
+        crate::filter::LabelFilter::from_raw(mode, self.filter_bitmaps[channel])
+    }
+}
+
 /// 在字节切片中采用 1 字节增量滑动窗口搜索第一个合法的 16 字节帧
 ///
 /// 返回 `Some((frame, consumed_bytes))`，其中 `consumed_bytes` 为包含跳过的噪音字节在内的全部消耗长度；
@@ -407,5 +521,40 @@ mod tests {
         let (found_frame, consumed) = result.unwrap();
         assert_eq!(found_frame, frame);
         assert_eq!(consumed, 3 + BINARY_FRAME_LEN);
+    }
+
+    #[test]
+    fn test_profile_record_roundtrip() {
+        let mut rec = ProfileRecord::default();
+        rec.slot = 1;
+        rec.is_valid = 1;
+        rec.name[..5].copy_from_slice(b"Bench");
+        rec.directions[0] = 1; // Tx
+        rec.directions[1] = 2; // Rx
+        rec.speeds[0] = 1;     // High
+        rec.speeds[1] = 0;     // Low
+
+        // 配置 CH1 为白名单，允许 0o310 和 0o203
+        rec.filter_modes[1] = 1;
+        let mut f1 = crate::filter::LabelFilter::new_whitelist();
+        f1.allow_label(crate::label::Label::from_octal(0o310)).unwrap();
+        f1.allow_label(crate::label::Label::from_octal(0o203)).unwrap();
+        rec.filter_bitmaps[1] = f1.bitmap();
+
+        rec.crc16 = rec.compute_crc();
+        assert!(rec.verify());
+
+        let bytes = rec.to_bytes();
+        let restored = ProfileRecord::from_bytes(&bytes);
+        assert_eq!(restored, rec);
+        assert!(restored.verify());
+
+        // 验证通道过滤器正确还原
+        let restored_f1 = restored.get_channel_filter(1);
+        assert_eq!(restored_f1.mode(), crate::filter::FilterMode::Whitelist);
+        assert_eq!(restored_f1.bitmap(), f1.bitmap());
+        assert!(restored_f1.matches(crate::label::Label::from_octal(0o310), true));
+        assert!(restored_f1.matches(crate::label::Label::from_octal(0o203), true));
+        assert!(!restored_f1.matches(crate::label::Label::from_octal(0o377), true));
     }
 }

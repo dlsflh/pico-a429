@@ -19,7 +19,7 @@ pub use label::Label;
 pub use parity::{apply_parity, check_parity, ParityMode};
 pub use protocol::{
     ack_status, find_frame_in_stream, flags, frame_types, opcodes, pack_12_channels,
-    profile_sub_ops, unpack_12_channels, BinaryFrame, DecodeError, FilterAction, BINARY_FRAME_LEN,
-    BINARY_MAGIC,
+    profile_sub_ops, unpack_12_channels, BinaryFrame, DecodeError, FilterAction, ProfileRecord,
+    BINARY_FRAME_LEN, BINARY_MAGIC, PROFILE_MAGIC, PROFILE_RECORD_LEN,
 };
 pub use word::{ArincWord, WordBuildError};

@@ -40,14 +40,6 @@ impl Label {
     pub const fn to_raw_bus_byte(self) -> u8 {
         self.0.reverse_bits()
     }
-
-    /// 解析八进制字符串（如 "310", "0310", "203"）
-    pub fn parse_str(s: &str) -> Result<Self, &'static str> {
-        let trimmed = s.trim();
-        // 允许带或不带前导 0
-        let val = u8::from_str_radix(trimmed, 8).map_err(|_| "Invalid octal label string")?;
-        Ok(Self(val))
-    }
 }
 
 #[cfg(test)]
@@ -76,14 +68,5 @@ mod tests {
         // 测试全 1: 377_8
         let label_max = Label::from_octal(0o377);
         assert_eq!(label_max.to_raw_bus_byte(), 0xFF);
-    }
-
-    #[test]
-    fn test_label_parse_str() {
-        assert_eq!(Label::parse_str("310").unwrap(), Label::from_octal(0o310));
-        assert_eq!(Label::parse_str("0310").unwrap(), Label::from_octal(0o310));
-        assert_eq!(Label::parse_str("203").unwrap(), Label::from_octal(0o203));
-        assert!(Label::parse_str("400").is_err()); // 超过 377 (8位)
-        assert!(Label::parse_str("888").is_err()); // 包含非八进制数字
     }
 }

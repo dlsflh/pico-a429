@@ -92,27 +92,10 @@ impl ArincWord {
         ((self.0 >> 29) & 0x03) as u8
     }
 
-    /// 提取最高位 Parity (Bit 32)
-    #[inline]
-    pub fn parity_bit(self) -> bool {
-        (self.0 & 0x8000_0000) != 0
-    }
-
     /// 校验当前字的奇校验（ARINC 429 标准奇校验）
     #[inline]
     pub fn is_parity_valid(self) -> bool {
         check_parity(self.0, ParityMode::Odd)
-    }
-
-    /// 校验指定模式的奇偶校验
-    #[inline]
-    pub fn check_parity_mode(self, mode: ParityMode) -> bool {
-        check_parity(self.0, mode)
-    }
-
-    /// 自动计算并填入合法的奇偶校验位
-    pub fn with_computed_parity(self, mode: ParityMode) -> Self {
-        Self(apply_parity(self.0, mode))
     }
 }
 

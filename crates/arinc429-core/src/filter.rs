@@ -18,13 +18,24 @@ pub enum FilterError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
 pub enum FilterMode {
     /// 全放行模式：接收所有到达的有效帧 (位图被忽略)
-    AcceptAll,
+    AcceptAll = 0,
     /// 白名单模式：仅接收位图中允许的 Label
-    Whitelist,
+    Whitelist = 1,
     /// 黑名单模式：丢弃位图中指定的 Label，接收其余全部
-    Blacklist,
+    Blacklist = 2,
+}
+
+impl FilterMode {
+    pub const fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::Whitelist,
+            2 => Self::Blacklist,
+            _ => Self::AcceptAll,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +79,20 @@ impl LabelFilter {
     }
 
     /// 获取当前模式
-    pub fn mode(&self) -> FilterMode {
+    #[inline]
+    pub const fn mode(&self) -> FilterMode {
         self.mode
+    }
+
+    /// 获取底层 256 位掩码
+    #[inline]
+    pub const fn bitmap(&self) -> [u32; 8] {
+        self.bitmap
+    }
+
+    /// 从模式与位图直接构建过滤器
+    pub const fn from_raw(mode: FilterMode, bitmap: [u32; 8]) -> Self {
+        Self { bitmap, mode }
     }
 
     /// 允许指定八进制 Label
@@ -118,14 +141,6 @@ impl LabelFilter {
         let word_idx = (octal / 32) as usize;
         let bit_idx = octal % 32;
         self.bitmap[word_idx] |= 1 << bit_idx;
-    }
-
-    /// 查询特定 Label 是否在当前规则位图中
-    pub fn contains_label_rule(&self, label: Label) -> bool {
-        let octal = label.to_octal();
-        let word_idx = (octal / 32) as usize;
-        let bit_idx = octal % 32;
-        (self.bitmap[word_idx] & (1 << bit_idx)) != 0
     }
 
     /// 完全重置为默认出厂全放行模式 (AcceptAll, 规则清零)
