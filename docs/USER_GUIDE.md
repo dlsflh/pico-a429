@@ -27,75 +27,68 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/pico-429-firmware 
 上位机采用 Python 工具链管理，执行时通过 `uv run` 免编译直接调用：
 
 ```bash
-# 1. 连通性测试 (PING -> PONG，纯二进制 RTT < 0.5ms)
+# 1. 连通性测试 (PING -> PONG，纯二进制 RTT < 0.6ms)
 uv run --with pyserial python tools/pico429.py ping
 
 # 2. 查询固件 12 通道物理状态与当前运行模式 (Config / Operational)
 uv run --with pyserial python tools/pico429.py status
 
-# 3. 硬件自收自发闭环自检 (BIT) (短接 GP0->GP2 与 GP1->GP3，RTT < 1ms)
-uv run --with pyserial python tools/pico429.py bit
+# 3. 运行模式管理 (安全维护静默 / 投入总线运行)
+uv run --with pyserial python tools/pico429.py config mode config       # 进入 Config 模式 (总线收发锁定，引脚高阻静默)
+uv run --with pyserial python tools/pico429.py config mode run          # 进入 Operational 模式 (激活物理总线实时收发)
 
-# 4. 实时交互测试终端 (开启常驻会话，输入测试字即时回显并统计微秒级 RTT)
-uv run --with pyserial python tools/pico429.py interactive
+# 4. 单通道参数配置 (方向、速率、过滤规则，支持单项与联合指定)
+# 缺省规则: --speed 未指定默认为 high; --filter 未指定默认为 none; 白名单无指定 labels 默认全屏蔽，黑名单无指定 labels 默认全放行
+uv run --with pyserial python tools/pico429.py config channel 0 --dir tx --speed high --run
+uv run --with pyserial python tools/pico429.py config channel 1 --dir rx --filter whitelist --labels 310,203
+uv run --with pyserial python tools/pico429.py config channel 2 --disable
 
-# 5. 动态单通道控制 (启停、方向、速率)
-# 提示: 添加 --run 可在配置完成后自动切换为 Operational 运行模式 (总线实时收发)
-uv run --with pyserial python tools/pico429.py config 0 --enable --dir TX --speed high --run
-uv run --with pyserial python tools/pico429.py config 1 --enable --dir RX --speed high
-uv run --with pyserial python tools/pico429.py config 2 --disable
+# 5. 12 通道 TOML 配置文件与片上 Flash 管理 (支持顶层 flash 或 config flash)
+# 应用 TOML 方案并同时持久化到 Flash Slot 0 (包含 32 字节方案名称):
+uv run --with pyserial python tools/pico429.py flash apply profiles/loopback_ch0_ch1.toml --slot 0
 
-# 6. 单独调整通道速率 (high: 100 kbps, low: 12.5 kbps)
-uv run --with pyserial python tools/pico429.py speed 0 low
+# 仅应用到当前运行环境而不写入 Flash:
+uv run --with pyserial python tools/pico429.py flash apply profiles/loopback_ch0_ch1.toml
 
-# 7. 配置 Label 硬件过滤规则 (白名单 / 黑名单 / 清空)
-uv run --with pyserial python tools/pico429.py filter 1 --allow 310
-uv run --with pyserial python tools/pico429.py filter 1 --block 377
-uv run --with pyserial python tools/pico429.py filter 1 --clear
+# 列出片上 Flash 中的所有槽位方案名称、状态与当前开机自启槽位
+uv run --with pyserial python tools/pico429.py flash list
 
-# 8. 运行模式切换 (安全维护静默 / 投入总线运行)
-uv run --with pyserial python tools/pico429.py opmode config       # 进入 Config 模式 (总线收发锁定，引脚高阻静默)
-uv run --with pyserial python tools/pico429.py opmode operational  # 进入 Operational 模式 (激活物理总线收发)
+# 从片上 Flash 槽位加载配置并切换为 Operational 运行模式
+uv run --with pyserial python tools/pico429.py flash load 0
 
-# 9. 发送 ARINC 429 单字 (自动计算奇偶校验)
-# 提示: 添加 --run 可在设备处于 Config 模式时自动激活运行模式后发送
-uv run --with pyserial python tools/pico429.py send -c 0 --label 310 --data 0x1234 --run
+# 设置指定 Flash 槽位为上电开机自启动方案
+uv run --with pyserial python tools/pico429.py flash boot 0
 
-# 10. 12 通道 TOML 配置文件管理与一键批量下发
-# 从硬件当前状态逆向导出 TOML 模板
-uv run --with pyserial python tools/pico429.py profile dump -o my_bench.toml
+# 清空上电开机自启动设置 (恢复默认上电 CONFIG 静默基态)
+uv run --with pyserial python tools/pico429.py flash boot --clear
 
-# 按照 TOML 配置文件一键原子重构所有 12 通道 (默认自动激活 Operational 运行模式)
-uv run --with pyserial python tools/pico429.py profile apply profiles/avionics_bench.toml
-# 若需下发后保持 Config 模式，可添加 --no-run:
-# uv run --with pyserial python tools/pico429.py profile apply profiles/avionics_bench.toml --no-run
+# 读取 Flash 槽位配置并逆向导出为 TOML 配置文件 (支持单个槽位或 --all 全量导出)
+uv run --with pyserial python tools/pico429.py flash dump 0 -o profiles/slot0.toml
+uv run --with pyserial python tools/pico429.py flash dump --all --out profiles/
 
-# 将当前运行配置固化到片上 Flash 槽位 (0..3)
-uv run --with pyserial python tools/pico429.py profile save 0 --name "Bench_Test"
+# 清空 Flash 槽位配置 (支持单个槽位或 --all 全部清空)
+uv run --with pyserial python tools/pico429.py flash clear 0
+uv run --with pyserial python tools/pico429.py flash clear --all
 
-# 列出片上 Flash 中的所有槽位信息与当前开机自启槽位
-uv run --with pyserial python tools/pico429.py profile list
+# 6. 硬件内置闭环自检 (BIT)
+# 提示: 严格校验当前硬件状态，Config 模式下坚决拒绝；支持 --profile 显式预装载测试方案
+uv run --with pyserial python tools/pico429.py bit --profile profiles/loopback_ch0_ch1.toml
+uv run --with pyserial python tools/pico429.py bit --tx 0 --rx 1
 
-# 从片上 Flash 槽位加载配置并生效
-uv run --with pyserial python tools/pico429.py profile load 0
-
-# 设置指定 Flash 槽位为上电开机自启动方案 (必须确保目标槽位非空且通过校验)
-uv run --with pyserial python tools/pico429.py profile boot 0
-
-# 清空上电开机自启动设置 (恢复默认上电静默基态)
-uv run --with pyserial python tools/pico429.py profile boot --clear
-
-# 10. 应用预置的标准配置方案
-uv run --with pyserial python tools/pico429.py profile apply profiles/bit_loopback.toml    # 闭环自检双通道方案
-uv run --with pyserial python tools/pico429.py profile apply profiles/avionics_bench.toml  # 航电多通道综合台架方案
-uv run --with pyserial python tools/pico429.py profile apply profiles/default_silent.toml  # 全通道静默恢复方案
-
-# 11. 发送指定航电数据字 (自动计算奇校验)
+# 7. 发送指定航电数据字 (自动计算奇校验)
 uv run --with pyserial python tools/pico429.py send --channel 0 --label 310 --data 0x1234 --sdi 1 --ssm 3
 
-# 12. 彩色总线数据监听流
+# 8. 专职总线遥测流监听终端 (ARINC 429 Bus Monitor)
+# 监听物理总线接收帧，零线程竞态，微秒级固件捕获时刻高亮呈现 (支持 --count 与 --timeout，按 Ctrl+C 安全退出)
 uv run --with pyserial python tools/pico429.py listen
+uv run --with pyserial python tools/pico429.py listen --channel 1
+uv run --with pyserial python tools/pico429.py listen --channel 1 --count 10 --timeout 5.0
 ```
+
+### 板载 LED 状态指示说明 (Pico 2 GPIO 25)
+* **慢速闪烁 (1 Hz, 500ms 亮 / 500ms 灭)**：`CONFIG` 模式（安全维护静默基态，物理总线锁定，引脚高阻）。
+* **快速闪烁 (5 Hz, 100ms 亮 / 100ms 灭)**：`OPERATIONAL` 模式（正常运行模式，物理总线实时收发）。
+* **持续常亮 (Solid ON)**：`HARDWARE_FAULT`（硬件底层严重故障，如 Flash 物理写入损坏或总线严重异常）。
 
 ---
 
@@ -197,42 +190,38 @@ direction = "DISABLED"
 
 为了实现微秒级延迟并消除 MCU 字符串解析带来的内存开销与安全漏洞，固件与上位机之间**全面使用 16 字节定长二进制帧（`BinaryFrame`）** 进行对称通信。
 
-### 1. 16 字节二进制帧结构定义
+### 1. 16 字节通用对称二进制帧结构定义 (BinaryFrame)
 
-| 偏移 | 字节数 | 字段名称 | 类型 | 说明 |
+| 偏移 (Bytes) | 长度 | 字段名称 | 类型 | 说明 |
 | :---: | :---: | :--- | :--- | :--- |
-| **0..1** | 2 | `magic` | `u16` (小端) | 固定魔数 **`0x29A4`** (大端网络字节序为 `0xA4, 0x29`) |
-| **2** | 1 | `frame_type` | `u8` | 帧类型：`0x01`=ARINC_DATA, `0x02`=CMD_ACK, `0x03`=ASYNC_EVENT, `0x04`=CMD_REQ |
-| **3** | 1 | `flags` | `u8` | 状态标志位：`bit0`=奇偶校验错, `bit1`=溢出错, `bit2`=位反转 |
-| **4** | 1 | `channel` | `u8` | 通道号 (`0` ~ `11`) |
-| **5** | 1 | `opcode_ack` | `u8` | 请求时为 `Opcode`；响应时为 `AckStatus` |
-| **6..7** | 2 | `seq_num` | `u16` (小端) | 请求序号（ACK 帧原样回显，用于请求匹配与 RTT 统计） |
-| **8..11**| 4 | `payload_0` | `u32` (小端) | 数据载荷 0 / 微秒级硬件时间戳 (`timestamp_us`) |
-| **12..15**| 4 | `payload_1` | `u32` (小端) | 数据载荷 1 / 32 位原始 ARINC 429 字 (`raw_word`) |
-| **14..15**| 2 | `crc16` | `u16` (小端) | 前 14 字节的 CRC16-CCITT 校验码（多项式 `0x1021`，初值 `0xFFFF`） |
-
-> 📌 **注**：当 `crc16` 占用第 14~15 字节时，`payload_1` 处于第 10~13 字节（总长严格为 16 字节，具体内存布局详见 [`crates/arinc429-core/src/protocol.rs`](file:///crates/arinc429-core/src/protocol.rs)）。
+| **0..1** | 2 | `magic` | `[u8; 2]` | 固定协议魔数 **`[0x41, 0x29]`** (ASCII `"A)"`，小端整型 `0x2941`) |
+| **2** | 1 | `type_and_ch`| `u8` | 高 4 位为 `frame_type`，低 4 位为 `channel` (0~15)<br>• `0x01`: ARINC_DATA (实时业务遥测)<br>• `0x02`: CMD_ACK (控制命令确认/应答)<br>• `0x03`: ASYNC_EVENT (异步告警事件)<br>• `0x04`: CMD_REQ (上位机控制请求) |
+| **3** | 1 | `flags` | `u8` | 语义依帧类型复用：<br>• `CMD_REQ`: 控制操作码 (`Opcode`)<br>• `CMD_ACK`: 应答状态码 (`AckStatus`)<br>• `ARINC_DATA`: 硬件标志 (`bit0`=奇偶错, `bit1`=100k高速, `bit2`=间隙错, `bit3`=发送回显, `bit4`=总线故障) |
+| **4..5** | 2 | `seq_num` | `u16` (小端) | 16 位请求序号（ACK 帧原样回传，用于匹配与 RTT 统计） |
+| **6..9** | 4 | `payload_0` | `u32` (小端) | 载荷 0：针对 ARINC_DATA 为微秒级硬件时间戳 (`timestamp_us`)；针对控制帧为参数 0 |
+| **10..13**| 4 | `payload_1` | `u32` (小端) | 载荷 1：针对 ARINC_DATA 为 32 位原始 ARINC 429 字 (`raw_word`)；针对控制帧为参数 1 |
+| **14..15**| 2 | `crc16` | `u16` (小端) | 针对字节 2..13 的 CRC16-CCITT 校验码（多项式 `0x1021`，初值 `0xFFFF`） |
 
 ### 2. 操作码 (Opcode) 与应答状态码 (AckStatus)
 
-#### 上位机请求操作码 (Opcode)：
+#### 上位机请求操作码 (Opcode，填入 CMD_REQ 的 flags 字段)：
 * `0x01` (`PING`)：连通性心跳探针。
-* `0x02` (`QUERY_STATUS`)：查询运行模式与 12 通道状态（ACK 中返回 4-bit nibble 打包通道状态）。
-* `0x03` (`SET_CHCFG`)：配置单通道启停、方向与速率。
-* `0x04` (`SET_SPEED`)：配置单通道波特率 (`0`=100k, `1`=12.5k)。
-* `0x05` (`SET_FILTER`)：配置单通道硬件位图过滤 (`0`=清空, `1`=放行Label, `2`=屏蔽Label)。
-* `0x06` (`SET_OPMODE`)：配置运行模式 (`0`=Config 模式, `1`=Operational 模式)。
-* `0x07` (`TX_WORD`)：向下位机发送 32 位 ARINC 字。
-* `0x08` (`PROFILE_OP`)：片上 Flash 配置管理 (`0`=List, `1`=Save, `2`=Load, `3`=Boot)。
-* `0x09` (`CFGBATCH`)：12 通道原子批量重构（载荷携带 4-bit nibble 压缩掩码）。
+* `0x02` (`SET_CHANNEL_CFG`)：配置单通道启停、方向与速率 (payload_0 包含 4-bit nibble)。
+* `0x03` (`SET_FILTER`)：配置指定通道硬件位图过滤 (`0`=清空, `1`=放行Label, `2`=屏蔽Label)。
+* `0x04` (`TX_RAW_WORD`)：向下位机发送 32 位 ARINC 字 (payload_1 为原始数据字)。
+* `0x05` (`SET_OPERATING_MODE`)：配置运行模式 (`0`=Config 维护模式, `1`=Operational 运行模式)。
+* `0x06` (`PAUSE_RESUME_ALL`)：全局紧急暂停/恢复收发 (`0`=Pause, `1`=Resume)。
+* `0x07` (`CFGBATCH`)：12 通道原子批量重构 (payload_0 包含 CH0~7，payload_1 包含 CH8~11)。
+* `0x08` (`QUERY_STATUS`)：查询运行模式与 12 通道状态 (ACK 的 channel 承载模式，payload_0/1 承载通道状态掩码)。
+* `0x09` (`PROFILE_OP`)：片上 Flash 配置方案操作 (`0`=List, `1`=Save, `2`=Load, `3`=Boot, `4`=ClearBoot)。
 
-#### 下位机应答状态码 (AckStatus)：
+#### 下位机应答状态码 (AckStatus，填入 CMD_ACK 的 flags 字段)：
 * `0x00` (`OK`)：操作成功完成。
-* `0x01` (`ERR_INVALID_PARAM`)：参数错误（如通道号超限、非法波特率等）。
-* `0x02` (`ERR_TX_FULL`)：发送硬件队列已满。
-* `0x03` (`ERR_FLASH`)：片上 Flash 读写擦除异常或校验失败。
-* `0x04` (`ERR_CRC`)：上位机下发报文 CRC16 校验不匹配。
-* `0x05` (`ERR_BUSY`)：通道正在执行关键操作，拒绝重配。
+* `0x01` (`ERR_UNKNOWN_CMD`)：未知或不支持的操作码。
+* `0x02` (`ERR_INVALID_PARAM`)：参数错误（如通道号超限、非法模式等）。
+* `0x03` (`ERR_MODE_CONFLICT`)：模式冲突（例如在 Config 模式下尝试发字）。
+* `0x04` (`ERR_FLASH`)：片上 Flash 读写擦除异常、校验失败或槽位为空。
+* `0x05` (`ERR_BUFFER_FULL`)：硬件缓冲区或发送队列已满。
 
 ### 3. 12 通道 4-bit Nibble 压缩编码
 在 `CFGBATCH` 与 `QUERY_STATUS` 中，12 个通道的配置被高效压缩为 4-bit nibble：
