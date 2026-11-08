@@ -5,6 +5,7 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 pub mod channel;
+pub mod coordinator;
 pub mod driver;
 pub mod flash_storage;
 pub mod pio_programs;
@@ -12,6 +13,7 @@ pub mod usb_service;
 
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
+use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, PIO1, PIO2, USB};
 use embassy_rp::pio::{LoadedProgram, Pio};
 use embassy_rp::usb::Driver;
@@ -55,9 +57,42 @@ define_channel_task!(channel_9_task, PIO2, 1);
 define_channel_task!(channel_10_task, PIO2, 2);
 define_channel_task!(channel_11_task, PIO2, 3);
 
+/// 板载工作指示灯任务 (PIN_25)
+/// - 故障模式：常亮
+/// - 配置模式 (Config)：慢闪 (1 Hz)
+/// - 工作模式 (Operational)：快闪 (5 Hz)
+#[embassy_executor::task]
+async fn led_task(mut led: Output<'static>) {
+    loop {
+        if crate::channel::is_hardware_fault() {
+            led.set_high();
+            embassy_time::Timer::after_millis(100).await;
+        } else {
+            match crate::channel::operating_mode() {
+                crate::channel::OperatingMode::Config => {
+                    led.set_high();
+                    embassy_time::Timer::after_millis(500).await;
+                    led.set_low();
+                    embassy_time::Timer::after_millis(500).await;
+                }
+                crate::channel::OperatingMode::Operational => {
+                    led.set_high();
+                    embassy_time::Timer::after_millis(100).await;
+                    led.set_low();
+                    embassy_time::Timer::after_millis(100).await;
+                }
+            }
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    // 0. 初始化板载 LED 并启动指示灯任务
+    let led = Output::new(p.PIN_25, Level::Low);
+    spawner.spawn(led_task(led).unwrap());
 
     // 1. 初始化 USB CDC ACM 虚拟串口
     let driver = Driver::new(p.USB, Irqs);
@@ -201,7 +236,7 @@ async fn main(spawner: Spawner) {
         if let Some(ref mut m) = *guard {
             if let Ok(record) = m.load_profile(slot) {
                 crate::channel::set_operating_mode(crate::channel::OperatingMode::Operational);
-                crate::usb_service::apply_all_channels(&record.directions, &record.speeds).await;
+                crate::coordinator::apply_profile(&record).await;
             }
         }
     }

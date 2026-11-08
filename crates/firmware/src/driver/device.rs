@@ -227,6 +227,9 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                     self.filter.clear();
                 }
             },
+            ChannelControlCmd::SetFullFilter(filter) => {
+                self.filter = filter;
+            }
             ChannelControlCmd::Pause => {
                 self.pause();
             }
@@ -238,7 +241,6 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
 
     /// 通道异步主循环：完全响应驱动，零轮询开销
     pub async fn run(&mut self, channel_id: u8) -> ! {
-        let start_time = Instant::now();
         let publisher = GLOBAL_RX_PUBSUB.immediate_publisher();
 
         loop {
@@ -280,7 +282,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                     Either::First(raw) => {
                         let word = ArincWord::from_raw(raw);
                         let parity_ok = word.is_parity_valid();
-                        let now_us = (Instant::now() - start_time).as_micros() as u32;
+                        let now_us = Instant::now().as_micros() as u32;
 
                         let frame = InboundArincFrame {
                             channel_id,

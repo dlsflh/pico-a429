@@ -4,11 +4,14 @@
 //! 每个通道独立拥有专用下行发送队列与控制队列，杜绝跨任务竞争偷帧。
 //! 生产数据采用广播式 PubSub (GLOBAL_RX_PUBSUB)。
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::pubsub::PubSubChannel;
 
+use arinc429_core::filter::LabelFilter;
 use arinc429_core::protocol::{flags, frame_types, BinaryFrame, FilterAction};
 use arinc429_core::word::ArincWord;
 
@@ -20,93 +23,8 @@ pub enum ChannelDirection {
     Rx,
 }
 
-/// 板载物理通道硬件描述符
-#[derive(Debug, Clone, Copy)]
-pub struct ChannelHwDescriptor {
-    pub channel_id: u8,
-    pub direction: ChannelDirection,
-    pub pin_a: u8,
-    pub pin_b: u8,
-}
-
 /// 当前板载物理装配激活的通道数 (Channel 0..11 共 12 路)
 pub const ACTIVE_CHANNEL_COUNT: usize = 12;
-
-/// 板载通道描述表：12 通道物理引脚映射 (GP0..GP23)
-pub const BOARD_CHANNELS: [ChannelHwDescriptor; ACTIVE_CHANNEL_COUNT] = [
-    ChannelHwDescriptor {
-        channel_id: 0,
-        direction: ChannelDirection::Tx,
-        pin_a: 0,
-        pin_b: 1,
-    },
-    ChannelHwDescriptor {
-        channel_id: 1,
-        direction: ChannelDirection::Rx,
-        pin_a: 2,
-        pin_b: 3,
-    },
-    ChannelHwDescriptor {
-        channel_id: 2,
-        direction: ChannelDirection::Rx,
-        pin_a: 4,
-        pin_b: 5,
-    },
-    ChannelHwDescriptor {
-        channel_id: 3,
-        direction: ChannelDirection::Rx,
-        pin_a: 6,
-        pin_b: 7,
-    },
-    ChannelHwDescriptor {
-        channel_id: 4,
-        direction: ChannelDirection::Rx,
-        pin_a: 8,
-        pin_b: 9,
-    },
-    ChannelHwDescriptor {
-        channel_id: 5,
-        direction: ChannelDirection::Rx,
-        pin_a: 10,
-        pin_b: 11,
-    },
-    ChannelHwDescriptor {
-        channel_id: 6,
-        direction: ChannelDirection::Rx,
-        pin_a: 12,
-        pin_b: 13,
-    },
-    ChannelHwDescriptor {
-        channel_id: 7,
-        direction: ChannelDirection::Rx,
-        pin_a: 14,
-        pin_b: 15,
-    },
-    ChannelHwDescriptor {
-        channel_id: 8,
-        direction: ChannelDirection::Rx,
-        pin_a: 16,
-        pin_b: 17,
-    },
-    ChannelHwDescriptor {
-        channel_id: 9,
-        direction: ChannelDirection::Rx,
-        pin_a: 18,
-        pin_b: 19,
-    },
-    ChannelHwDescriptor {
-        channel_id: 10,
-        direction: ChannelDirection::Rx,
-        pin_a: 20,
-        pin_b: 21,
-    },
-    ChannelHwDescriptor {
-        channel_id: 11,
-        direction: ChannelDirection::Rx,
-        pin_a: 26,
-        pin_b: 27,
-    },
-];
 
 // 运行时通道方向状态：0: Disabled, 1: Tx, 2: Rx
 // 出厂默认状态：全部 12 通道默认为 Disabled (电气绝对安全静默基态)
@@ -152,6 +70,19 @@ pub fn set_operating_mode(mode: OperatingMode) {
 #[inline]
 pub fn is_config_mode() -> bool {
     operating_mode() == OperatingMode::Config
+}
+
+// 运行时硬件/协议故障标志 (置位时 LED 常亮报警)
+static HARDWARE_FAULT: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn set_hardware_fault(fault: bool) {
+    HARDWARE_FAULT.store(fault, Ordering::Release);
+}
+
+#[inline]
+pub fn is_hardware_fault() -> bool {
+    HARDWARE_FAULT.load(Ordering::Acquire)
 }
 
 // 运行时通道波特率：true 为 HIGH (100 kbps), false 为 LOW (12.5 kbps)
@@ -238,6 +169,56 @@ pub fn current_speeds() -> [u8; ACTIVE_CHANNEL_COUNT] {
     speeds
 }
 
+static RUNTIME_CHANNEL_FILTERS: BlockingMutex<CriticalSectionRawMutex, RefCell<[LabelFilter; ACTIVE_CHANNEL_COUNT]>> =
+    BlockingMutex::new(RefCell::new([LabelFilter::new_accept_all(); ACTIVE_CHANNEL_COUNT]));
+
+/// 更新单个通道的 Filter 并返回更新后的副本
+pub fn update_channel_filter(ch: u8, action: FilterAction) -> LabelFilter {
+    let mut updated = LabelFilter::new_accept_all();
+    if (ch as usize) < ACTIVE_CHANNEL_COUNT {
+        RUNTIME_CHANNEL_FILTERS.lock(|cell| {
+            let mut filters = cell.borrow_mut();
+            let f = &mut filters[ch as usize];
+            match action {
+                FilterAction::Allow(label) => {
+                    let _ = f.allow_label(label);
+                }
+                FilterAction::Block(label) => {
+                    let _ = f.block_label(label);
+                }
+                FilterAction::Clear => {
+                    *f = LabelFilter::new_accept_all();
+                }
+            }
+            updated = *f;
+        });
+    }
+    updated
+}
+
+/// 直接设置通道过滤器快照 (用于加载 Profile)
+pub fn set_channel_filter_direct(ch: u8, filter: LabelFilter) {
+    if (ch as usize) < ACTIVE_CHANNEL_COUNT {
+        RUNTIME_CHANNEL_FILTERS.lock(|cell| {
+            cell.borrow_mut()[ch as usize] = filter;
+        });
+    }
+}
+
+/// 获取当前所有 12 通道过滤器快照 (模式数组与 256 位掩码数组)
+pub fn get_channel_filters_snapshot() -> ([u8; ACTIVE_CHANNEL_COUNT], [[u32; 8]; ACTIVE_CHANNEL_COUNT]) {
+    let mut modes = [0u8; ACTIVE_CHANNEL_COUNT];
+    let mut bitmaps = [[0u32; 8]; ACTIVE_CHANNEL_COUNT];
+    RUNTIME_CHANNEL_FILTERS.lock(|cell| {
+        let filters = cell.borrow();
+        for ch in 0..ACTIVE_CHANNEL_COUNT {
+            modes[ch] = filters[ch].mode() as u8;
+            bitmaps[ch] = filters[ch].bitmap();
+        }
+    });
+    (modes, bitmaps)
+}
+
 /// 通道操作错误枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum ChannelError {
@@ -290,6 +271,8 @@ pub enum ChannelControlCmd {
     },
     /// 过滤规则动作
     Filter(FilterAction),
+    /// 全量重置并配置通道 Label 过滤器 (用于 Profile 恢复)
+    SetFullFilter(LabelFilter),
     /// 暂停物理收发工作 (停止状态机运行)
     Pause,
     /// 恢复物理收发工作 (按当前配置重启状态机)
@@ -312,12 +295,12 @@ pub static CHANNEL_CTRL_QUEUES: [Channel<CriticalSectionRawMutex, ChannelControl
 
 /// 集中式多路接收遥测广播总线
 ///
-/// 具备 128 帧深度的环形缓冲，支持 4 个独立订阅端 (USB 等)，对应当前激活通道发布者。
+/// 具备 1024 帧深度的环形缓冲，支持 4 个独立订阅端 (USB 等)，对应当前激活通道发布者。
 /// 满载自动丢弃最旧帧，绝不反向阻塞物理层总线接收。
 pub static GLOBAL_RX_PUBSUB: PubSubChannel<
     CriticalSectionRawMutex,
     InboundArincFrame,
-    128,
+    1024,
     4,
     ACTIVE_CHANNEL_COUNT,
 > = PubSubChannel::new();

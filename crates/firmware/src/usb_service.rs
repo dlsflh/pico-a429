@@ -21,12 +21,18 @@ use arinc429_core::protocol::{
 
 use crate::channel::{
     channel_direction, channel_is_high_speed, send_to_channel_ctrl, send_to_channel_tx,
-    set_channel_direction, set_channel_speed, ChannelControlCmd, ChannelDirection,
-    ACTIVE_CHANNEL_COUNT, GLOBAL_RX_PUBSUB,
+    ChannelControlCmd, ChannelDirection, ACTIVE_CHANNEL_COUNT, GLOBAL_RX_PUBSUB,
+};
+use crate::coordinator::{
+    apply_all_channels_batch, apply_channel_config, apply_profile, pause_all_channels,
+    resume_all_channels,
 };
 
 /// 向上位机发送控制命令回执的专用非阻塞队列 (深度 16，防突发指令丢弃)
 pub static USB_CMD_RESP_QUEUE: Channel<CriticalSectionRawMutex, BinaryFrame, 16> = Channel::new();
+
+/// 暂存上位机下发的 32 字节配置方案名称 (分块装载)
+static mut STAGED_PROFILE_NAME: [u8; 32] = [0u8; 32];
 
 #[embassy_executor::task]
 pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, Driver<'static, USB>>) {
@@ -168,50 +174,6 @@ async fn cdc_sender_write_all(
     Ok(())
 }
 
-/// 原子暂停全部 12 通道物理收发
-pub async fn pause_all_channels() {
-    for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-        let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Pause).await;
-    }
-}
-
-/// 恢复全部 12 通道物理收发
-pub async fn resume_all_channels() {
-    for ch in 0..ACTIVE_CHANNEL_COUNT as u8 {
-        let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Resume).await;
-    }
-}
-
-/// 配置单通道方向与速率
-pub async fn apply_channel_config(channel: u8, dir: ChannelDirection, high_speed: bool) {
-    set_channel_direction(channel, dir);
-    set_channel_speed(channel, high_speed);
-    let _ = send_to_channel_ctrl(
-        channel,
-        ChannelControlCmd::Configure {
-            direction: dir,
-            high_speed,
-        },
-    )
-    .await;
-}
-
-/// 批量原子应用 12 通道配置 (暂停 -> 配置 -> 恢复)
-pub async fn apply_all_channels(dirs: &[u8; 12], speeds: &[u8; 12]) {
-    pause_all_channels().await;
-    for ch in 0..ACTIVE_CHANNEL_COUNT {
-        let dir = match dirs[ch] {
-            1 => ChannelDirection::Tx,
-            2 => ChannelDirection::Rx,
-            _ => ChannelDirection::Disabled,
-        };
-        apply_channel_config(ch as u8, dir, speeds[ch] != 0).await;
-    }
-    if !crate::channel::is_config_mode() {
-        resume_all_channels().await;
-    }
-}
-
 /// 二进制命令执行调度器：纯状态机与消息派发逻辑 (零动态分配)
 async fn execute_binary_command(req: BinaryFrame) {
     let opcode = req.opcode();
@@ -291,7 +253,8 @@ async fn execute_binary_command(req: BinaryFrame) {
                     return;
                 }
             };
-            let _ = send_to_channel_ctrl(ch, ChannelControlCmd::Filter(action)).await;
+            let updated_filter = crate::channel::update_channel_filter(ch, action);
+            let _ = send_to_channel_ctrl(ch, ChannelControlCmd::SetFullFilter(updated_filter)).await;
             let ack = BinaryFrame::new_cmd_ack(
                 ch,
                 ack_status::OK,
@@ -377,21 +340,7 @@ async fn execute_binary_command(req: BinaryFrame) {
         }
         opcodes::CFGBATCH => {
             let channels = unpack_12_channels(req.payload_0, req.payload_1);
-            pause_all_channels().await;
-            for ch in 0..ACTIVE_CHANNEL_COUNT {
-                let (enable, is_rx, high_speed) = channels[ch];
-                let dir = if !enable {
-                    ChannelDirection::Disabled
-                } else if is_rx {
-                    ChannelDirection::Rx
-                } else {
-                    ChannelDirection::Tx
-                };
-                apply_channel_config(ch as u8, dir, high_speed).await;
-            }
-            if !crate::channel::is_config_mode() {
-                resume_all_channels().await;
-            }
+            apply_all_channels_batch(&channels).await;
             let ack = BinaryFrame::new_cmd_ack(
                 0,
                 ack_status::OK,
@@ -454,19 +403,16 @@ async fn execute_binary_command(req: BinaryFrame) {
                         }
                     }
                     profile_sub_ops::SAVE => {
-                        let mut dirs = [0u8; 12];
-                        let mut speeds = [0u8; 12];
-                        for ch in 0..12 {
-                            dirs[ch] = match channel_direction(ch as u8) {
-                                Some(ChannelDirection::Tx) => 1,
-                                Some(ChannelDirection::Rx) => 2,
-                                _ => 0,
-                            };
-                            speeds[ch] = if channel_is_high_speed(ch as u8) { 1 } else { 0 };
-                        }
-                        let status = match mgr.save_profile(slot, "PROFILE", &dirs, &speeds) {
+                        let dirs = crate::channel::current_directions();
+                        let speeds = crate::channel::current_speeds();
+                        let (filter_modes, filter_bitmaps) = crate::channel::get_channel_filters_snapshot();
+                        let name = unsafe { &*core::ptr::addr_of!(STAGED_PROFILE_NAME) };
+                        let status = match mgr.save_profile(slot, name, &dirs, &speeds, &filter_modes, &filter_bitmaps) {
                             Ok(()) => ack_status::OK,
-                            Err(_) => ack_status::ERR_FLASH,
+                            Err(_) => {
+                                crate::channel::set_hardware_fault(true);
+                                ack_status::ERR_FLASH
+                            }
                         };
                         let ack = BinaryFrame::new_cmd_ack(
                             slot,
@@ -483,7 +429,7 @@ async fn execute_binary_command(req: BinaryFrame) {
                                 crate::channel::set_operating_mode(
                                     crate::channel::OperatingMode::Operational,
                                 );
-                                apply_all_channels(&rec.directions, &rec.speeds).await;
+                                apply_profile(&rec).await;
                                 ack_status::OK
                             }
                             Err(_) => ack_status::ERR_FLASH,
@@ -525,6 +471,113 @@ async fn execute_binary_command(req: BinaryFrame) {
                         );
                         let _ = USB_CMD_RESP_QUEUE.try_send(ack);
                     }
+                    profile_sub_ops::CLEAR => {
+                        let status = match mgr.clear_slot(slot) {
+                            Ok(()) => ack_status::OK,
+                            Err(_) => ack_status::ERR_FLASH,
+                        };
+                        let ack = BinaryFrame::new_cmd_ack(
+                            slot,
+                            status,
+                            req.seq_num,
+                            0,
+                            0,
+                        );
+                        let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    }
+                    profile_sub_ops::CLEAR_ALL => {
+                        let status = match mgr.clear_all() {
+                            Ok(()) => ack_status::OK,
+                            Err(_) => ack_status::ERR_FLASH,
+                        };
+                        let ack = BinaryFrame::new_cmd_ack(
+                            0,
+                            status,
+                            req.seq_num,
+                            0,
+                            0,
+                        );
+                        let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    }
+                    profile_sub_ops::GET_CHANNELS => {
+                        match mgr.load_profile(slot) {
+                            Ok(rec) => {
+                                let mut channels = [(false, false, false); 12];
+                                for ch in 0..12 {
+                                    let en = rec.directions[ch] != 0;
+                                    let rx = rec.directions[ch] == 2;
+                                    let hs = rec.speeds[ch] == 1;
+                                    channels[ch] = (en, rx, hs);
+                                }
+                                let (p0, p1) = pack_12_channels(&channels);
+                                let ack = BinaryFrame::new_cmd_ack(
+                                    slot,
+                                    ack_status::OK,
+                                    req.seq_num,
+                                    p0,
+                                    p1,
+                                );
+                                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                            }
+                            Err(_) => {
+                                let ack = BinaryFrame::new_cmd_ack(
+                                    slot,
+                                    ack_status::ERR_FLASH,
+                                    req.seq_num,
+                                    0,
+                                    0,
+                                );
+                                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                            }
+                        }
+                    }
+                    profile_sub_ops::SET_NAME_CHUNK => {
+                        let chunk_idx = ((req.payload_0 >> 8) & 0x07) as usize;
+                        let offset = chunk_idx * 4;
+                        let bytes = req.payload_1.to_le_bytes();
+                        let name_buf = unsafe { &mut *core::ptr::addr_of_mut!(STAGED_PROFILE_NAME) };
+                        name_buf[offset..offset + 4].copy_from_slice(&bytes);
+                        let ack = BinaryFrame::new_cmd_ack(
+                            slot,
+                            ack_status::OK,
+                            req.seq_num,
+                            req.payload_0,
+                            0,
+                        );
+                        let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                    }
+                    profile_sub_ops::GET_NAME_CHUNK => {
+                        let chunk_idx = ((req.payload_0 >> 8) & 0x07) as usize;
+                        match mgr.load_profile(slot) {
+                            Ok(rec) => {
+                                let offset = chunk_idx * 4;
+                                let chunk_val = u32::from_le_bytes([
+                                    rec.name[offset],
+                                    rec.name[offset + 1],
+                                    rec.name[offset + 2],
+                                    rec.name[offset + 3],
+                                ]);
+                                let ack = BinaryFrame::new_cmd_ack(
+                                    slot,
+                                    ack_status::OK,
+                                    req.seq_num,
+                                    req.payload_0,
+                                    chunk_val,
+                                );
+                                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                            }
+                            Err(_) => {
+                                let ack = BinaryFrame::new_cmd_ack(
+                                    slot,
+                                    ack_status::ERR_FLASH,
+                                    req.seq_num,
+                                    0,
+                                    0,
+                                );
+                                let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+                            }
+                        }
+                    }
                     _ => {
                         let ack = BinaryFrame::new_cmd_ack(
                             slot,
@@ -546,6 +599,12 @@ async fn execute_binary_command(req: BinaryFrame) {
                 );
                 let _ = USB_CMD_RESP_QUEUE.try_send(ack);
             }
+        }
+        opcodes::REBOOT_TO_BOOTSEL => {
+            let ack = BinaryFrame::new_cmd_ack(0, ack_status::OK, req.seq_num, 0, 0);
+            let _ = USB_CMD_RESP_QUEUE.try_send(ack);
+            embassy_time::Timer::after_millis(100).await;
+            embassy_rp::rom_data::reset_to_usb_boot(0, 0);
         }
         _ => {
             let ack = BinaryFrame::new_cmd_ack(

@@ -1,5 +1,7 @@
+pub mod afe;
 pub mod device;
 
+pub use afe::{AnalogFrontEnd, DirectGpioAfe};
 pub use arinc429_core::baud::ArincSpeed;
 pub use device::ChannelDevice;
 
