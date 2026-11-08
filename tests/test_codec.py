@@ -14,6 +14,7 @@ from tools.arinc429_codec import (
     ParityMode,
     crc16_ccitt,
     find_frame_in_stream,
+    format_ack_status,
     pack_12_channels,
     pack_channel_nibble,
     reverse_byte_bits,
@@ -171,8 +172,6 @@ class TestArinc429Codec(unittest.TestCase):
 
     def test_format_ack_status(self) -> None:
         """验证应答状态码人类可读格式化函数。"""
-        from tools.arinc429_codec import AckStatus, format_ack_status
-
         self.assertIn("成功", format_ack_status(AckStatus.OK))
         self.assertIn("Flash操作失败/槽位为空", format_ack_status(AckStatus.ERR_FLASH))
         self.assertIn("0x04", format_ack_status(AckStatus.ERR_FLASH))
@@ -180,61 +179,248 @@ class TestArinc429Codec(unittest.TestCase):
 
     def test_send_word_and_await_loopback_stream_demux(self) -> None:
         """验证 send_word_and_await_loopback 能在乱序与粘包流中精准解复用并保留跨帧残余字节。"""
-        from unittest.mock import MagicMock
+        from tools.pico429.client import Pico429Client
+        from tools.pico429.transport import Transport
 
-        from tools.pico429_transport import send_word_and_await_loopback
+        class MockTransport(Transport):
+            def __init__(self) -> None:
+                self.written = bytearray()
+                self.resp = bytearray()
 
-        mock_ser = MagicMock()
-        written_bytes = bytearray()
+            def send(self, data: bytes) -> None:
+                self.written.extend(data)
+                req_frame = BinaryFrame.decode(bytes(self.written[-16:]))
+                seq = req_frame.seq_num
+                ack = BinaryFrame.new_cmd_ack(
+                    channel=0, status=0, seq_num=seq, payload_0=0x12345678
+                )
+                rx = BinaryFrame(
+                    frame_type=FrameType.ARINC_DATA,
+                    channel=1,
+                    flags=0,
+                    seq_num=42,
+                    timestamp_us=1000,
+                    raw_word=0x12345678,
+                )
+                self.resp.extend(rx.encode() + ack.encode() + b"\xa4\x29\x01\x00\x02")
 
-        def fake_write(data: bytes) -> int:
-            written_bytes.extend(data)
-            return len(data)
+            def recv(self, max_bytes: int = 64) -> bytes:
+                chunk = bytes(self.resp[:max_bytes])
+                del self.resp[:max_bytes]
+                return chunk
 
-        mock_ser.write.side_effect = fake_write
+            def in_waiting(self) -> int:
+                return len(self.resp)
 
-        # 模拟设备端回传：同时产生 CMD_ACK 与 ARINC_DATA 帧，并附带下一个帧的前 5 字节
-        def fake_read(_n: int) -> bytes:
-            req_frame = BinaryFrame.decode(bytes(written_bytes[-16:]))
-            seq = req_frame.seq_num
-            ack = BinaryFrame.new_cmd_ack(
-                channel=0, status=0, seq_num=seq, payload_0=0x12345678
-            )
-            rx = BinaryFrame(
-                frame_type=FrameType.ARINC_DATA,
-                channel=1,
-                flags=0,
-                seq_num=42,
-                timestamp_us=1000,
-                raw_word=0x12345678,
-            )
-            # 拼接: ARINC_DATA (16 字节) + CMD_ACK (16 字节) + 下一帧的魔数残字节 (5 字节)
-            chunk = rx.encode() + ack.encode() + b"\xa4\x29\x01\x00\x02"
-            mock_ser.in_waiting = 0
-            return chunk
+            def reset_input_buffer(self) -> None:
+                self.resp.clear()
 
-        mock_ser.in_waiting = 37
-        mock_ser.read.side_effect = fake_read
+            def close(self) -> None:
+                pass
 
-        stream_buf = bytearray()
-        ack_frame, rx_frame = send_word_and_await_loopback(
-            mock_ser,
+        client = Pico429Client(MockTransport())
+        ack_frame, rx_frame = client.send_word_and_await_loopback(
             tx_ch=0,
             rx_ch=1,
             raw_word=0x12345678,
-            stream_buf=stream_buf,
             timeout=1.0,
         )
 
         self.assertIsNotNone(ack_frame)
         self.assertIsNotNone(rx_frame)
         assert ack_frame is not None and rx_frame is not None
-        self.assertEqual(ack_frame.ack_status, 0)
+        self.assertEqual(ack_frame.payload_0, 0x12345678)
         self.assertEqual(rx_frame.raw_word, 0x12345678)
-        self.assertEqual(rx_frame.channel, 1)
+        self.assertEqual(bytes(client.stream_buf), b"\xa4\x29\x01\x00\x02")
 
-        # 验证跨调用残字节保留在 stream_buf 中，完全没有被丢弃
-        self.assertEqual(bytes(stream_buf), b"\xa4\x29\x01\x00\x02")
+    def test_pico429_client_loopback(self) -> None:
+        """验证 Pico429Client 在执行 send_word_and_await_loopback 时必须将 raw_word 写入 payload_0。"""
+        from unittest.mock import MagicMock
+
+        from tools.pico429.client import Pico429Client
+
+        mock_transport = MagicMock()
+        written = []
+
+        def fake_send(data: bytes) -> None:
+            written.append(data)
+
+        # 模拟设备立即回送 ACK + ARINC_DATA
+        ack_frame = BinaryFrame.new_cmd_ack(channel=0, status=0, seq_num=1)
+        rx_frame = BinaryFrame(
+            frame_type=FrameType.ARINC_DATA,
+            channel=1,
+            flags=0,
+            seq_num=1,
+            payload_0=100,
+            payload_1=0xCAFEBABE,
+        )
+        in_stream = ack_frame.encode() + rx_frame.encode()
+
+        mock_transport.send.side_effect = fake_send
+        mock_transport.recv.return_value = in_stream
+
+        client = Pico429Client(mock_transport)
+        _ack, rx = client.send_word_and_await_loopback(
+            tx_ch=0, rx_ch=1, raw_word=0xCAFEBABE
+        )
+
+        self.assertEqual(len(written), 1)
+        sent_frame = BinaryFrame.decode(written[0])
+        # 核心断言：TX_RAW_WORD 的 raw_word 必须在 payload_0 中！
+        self.assertEqual(sent_frame.payload_0, 0xCAFEBABE)
+        self.assertEqual(sent_frame.channel, 0)
+        self.assertEqual(rx.payload_1, 0xCAFEBABE)
+
+    def test_bit_engine_eight_vectors_pass(self) -> None:
+        """验证 BitEngine 能完整闭环运行 8 组基准向量并成功匹配。"""
+        from unittest.mock import MagicMock
+
+        from tools.pico429.bit_engine import BitEngine
+        from tools.pico429.client import Pico429Client
+
+        mock_transport = MagicMock()
+
+        mock_channels = [(False, False, False)] * 12
+        mock_channels[0] = (True, False, True)  # CH0: TX High
+        mock_channels[1] = (True, True, True)  # CH1: RX High
+        p0, p1 = pack_12_channels(mock_channels)
+
+        def fake_send(data: bytes) -> None:
+            f = BinaryFrame.decode(data)
+            if f.opcode == Opcode.QUERY_STATUS:
+                ack = BinaryFrame.new_cmd_ack(
+                    channel=1,
+                    status=AckStatus.OK,
+                    seq_num=f.seq_num,
+                    payload_0=p0,
+                    payload_1=p1,
+                )
+                mock_transport.recv.return_value = ack.encode()
+            elif f.opcode == Opcode.TX_RAW_WORD:
+                ack = BinaryFrame.new_cmd_ack(
+                    channel=f.channel,
+                    status=AckStatus.OK,
+                    seq_num=f.seq_num,
+                    payload_0=f.payload_0,
+                )
+                rx = BinaryFrame(
+                    frame_type=FrameType.ARINC_DATA,
+                    channel=1,
+                    flags=0,
+                    seq_num=f.seq_num,
+                    payload_0=100,
+                    payload_1=f.payload_0,
+                )
+                mock_transport.recv.return_value = ack.encode() + rx.encode()
+            else:
+                ack = BinaryFrame.new_cmd_ack(
+                    channel=f.channel, status=AckStatus.OK, seq_num=f.seq_num
+                )
+                mock_transport.recv.return_value = ack.encode()
+
+        mock_transport.send.side_effect = fake_send
+        mock_transport.recv.return_value = b""
+
+        client = Pico429Client(mock_transport)
+        report = BitEngine.run_bit(client, tx_ch=0, rx_ch=1)
+        self.assertTrue(report.passed)
+        self.assertEqual(len(report.vectors), 8)
+        for v in report.vectors:
+            self.assertTrue(v.matched)
+
+    def test_bit_engine_rejects_in_config_mode(self) -> None:
+        """验证处于 CONFIG 静默模式时，BitEngine 坚决拒绝执行自测试。"""
+        from unittest.mock import MagicMock
+
+        from tools.pico429.bit_engine import BitEngine
+        from tools.pico429.client import Pico429Client
+
+        mock_transport = MagicMock()
+        # channel=0 表示 CONFIG 模式
+        ack = BinaryFrame.new_cmd_ack(
+            channel=0, status=AckStatus.OK, seq_num=1, payload_0=0, payload_1=0
+        )
+        mock_transport.recv.return_value = ack.encode()
+
+        client = Pico429Client(mock_transport)
+        report = BitEngine.run_bit(client, tx_ch=0, rx_ch=1)
+        self.assertFalse(report.passed)
+        self.assertIsNotNone(report.error_message)
+        self.assertIn("CONFIG 静默维护模式", str(report.error_message))
+
+    def test_cli_parser_config_hierarchy(self) -> None:
+        """验证重构后的动词子命令式 CLI 解析器能正确解析 config 及其二级子命令。"""
+        from tools.pico429.cli.parser import create_parser
+
+        parser = create_parser()
+
+        # 1. config channel
+        args = parser.parse_args(
+            [
+                "config",
+                "channel",
+                "0",
+                "--dir",
+                "tx",
+                "--speed",
+                "100k",
+                "--run",
+            ]
+        )
+        self.assertEqual(args.command, "config")
+        self.assertEqual(args.config_subcommand, "channel")
+        self.assertEqual(args.channel, 0)
+        self.assertEqual(args.dir, "tx")
+        self.assertTrue(args.run)
+
+        # 2. config channel with filter
+        args = parser.parse_args(
+            [
+                "config",
+                "channel",
+                "1",
+                "--filter",
+                "whitelist",
+                "--labels",
+                "310,203",
+            ]
+        )
+        self.assertEqual(args.filter, "whitelist")
+        self.assertEqual(args.labels, "310,203")
+
+        # 3. config mode
+        args = parser.parse_args(["config", "mode", "run"])
+        self.assertEqual(args.target_mode, "run")
+
+        # 4. status (顶层独立状态命令)
+        args = parser.parse_args(["status", "--channel", "0"])
+        self.assertEqual(args.command, "status")
+        self.assertEqual(args.channel, 0)
+
+        # 5. listen (专职监听器)
+        args = parser.parse_args(["listen", "-c", "1"])
+        self.assertEqual(args.command, "listen")
+        self.assertEqual(args.channel, 1)
+
+        # 6. flash apply (带 --slot 固化)
+        args = parser.parse_args(
+            ["flash", "apply", "profiles/loopback_ch0_ch1.toml", "--slot", "0"]
+        )
+        self.assertEqual(args.command, "flash")
+        self.assertEqual(args.flash_action, "apply")
+        self.assertEqual(args.file, "profiles/loopback_ch0_ch1.toml")
+        self.assertEqual(args.slot, 0)
+
+        # 7. flash clear --all
+        args = parser.parse_args(["flash", "clear", "--all"])
+        self.assertEqual(args.flash_action, "clear")
+        self.assertTrue(args.all)
+
+        # 8. bit with --profile
+        args = parser.parse_args(["bit", "--profile", "profiles/loopback_ch0_ch1.toml"])
+        self.assertEqual(args.command, "bit")
+        self.assertEqual(args.profile, "profiles/loopback_ch0_ch1.toml")
 
 
 if __name__ == "__main__":

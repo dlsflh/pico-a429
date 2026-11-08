@@ -2,31 +2,40 @@
 
 from __future__ import annotations
 
+import pathlib
 import unittest
 
-from tools.pico429 import (
-    build_batch_spec,
-    generate_toml_from_cfgdump,
-    normalize_speed,
-    parse_profile_list_output,
-    parse_toml_profile,
-)
+from tools.arinc429_codec import pack_12_channels, unpack_12_channels
+from tools.pico429.profile import normalize_speed, parse_toml_profile
 
 
 class TestProfileToml(unittest.TestCase):
     def test_toml_roundtrip_all_channels(self) -> None:
-        """验证 12 通道硬件状态导出为 TOML 后能够无损回环反序列化。"""
-        cfgdump = (
-            "CFGDUMP: 0:TX:HIGH 1:RX:HIGH 2:RX:LOW 3:DISABLED:HIGH 4:TX:LOW "
-            "5:RX:HIGH 6:DISABLED:LOW 7:TX:HIGH 8:RX:LOW 9:DISABLED:HIGH "
-            "10:TX:HIGH 11:RX:HIGH"
-        )
-        toml_text = generate_toml_from_cfgdump(cfgdump, profile_name="Bench_12CH")
-        self.assertIn('name = "Bench_12CH"', toml_text)
+        """验证 12 通道 TOML 方案解析与底层二进制 pack/unpack 12 通道无损回环。"""
+        toml_content = """
+        [profile]
+        name = "Bench_12CH"
+        version = "1.0"
 
-        parsed = parse_toml_profile(toml_text)
+        [channel.0]
+        direction = "TX"
+        speed = "HIGH"
+
+        [channel.1]
+        direction = "RX"
+        speed = "HIGH"
+
+        [channel.2]
+        direction = "RX"
+        speed = "LOW"
+
+        [channel.6]
+        direction = "DISABLED"
+        speed = "LOW"
+        """
+        parsed = parse_toml_profile(toml_content)
         self.assertEqual(parsed["name"], "Bench_12CH")
-        self.assertEqual(len(parsed["channels"]), 12)
+        self.assertEqual(len(parsed["channels"]), 4)
 
         # 抽样验证核心通道的方向与波特率保持一致
         self.assertEqual(
@@ -57,12 +66,24 @@ class TestProfileToml(unittest.TestCase):
             },
         )
 
-        # 验证批量下发指令生成 (未显式指定的通道默认 DISABLED)
-        batch_spec = build_batch_spec(parsed["channels"])
-        parts = batch_spec.split(",")
-        self.assertEqual(len(parts), 12)
-        self.assertEqual(parts[0], "0=TX:HIGH")
-        self.assertEqual(parts[2], "2=RX:LOW")
+        # 验证真实生产链路：TOML 转换为 12 通道元组 -> pack_12_channels -> unpack_12_channels
+        channels_list = []
+        for ch in range(12):
+            cfg = parsed["channels"].get(ch, {"direction": "DISABLED", "speed": "HIGH"})
+            d = cfg.get("direction", "DISABLED").upper()
+            en = d != "DISABLED"
+            is_rx = d == "RX"
+            s = cfg.get("speed", "HIGH").upper()
+            hs = bool(en and ("HIGH" in s or "100" in s))
+            channels_list.append((en, is_rx, hs))
+
+        p0, p1 = pack_12_channels(channels_list)
+        unpacked = unpack_12_channels(p0, p1)
+        self.assertEqual(channels_list, unpacked)
+        self.assertEqual(unpacked[0], (True, False, True))  # CH0: Tx, High
+        self.assertEqual(unpacked[1], (True, True, True))  # CH1: Rx, High
+        self.assertEqual(unpacked[2], (True, True, False))  # CH2: Rx, Low
+        self.assertEqual(unpacked[6], (False, False, False))  # CH6: Disabled
 
     def test_filter_mode_whitelist_and_blacklist(self) -> None:
         """验证新版 filter_mode 与 labels 字段能够正确解析与校验。"""
@@ -148,25 +169,8 @@ class TestProfileToml(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_toml_profile("[unclosed toml")
 
-    def test_profile_list_parser(self) -> None:
-        """验证固件片上 Flash PROFILE LIST 响应解析。"""
-        lines = [
-            "PROFILES: Boot Slot: Some(2)",
-            '[Slot 0] ACTIVE "Bench"',
-            "[Slot 1] EMPTY",
-            '[Slot 2] ACTIVE "Flight"',
-            "[Slot 3] EMPTY",
-        ]
-        boot_slot, slots = parse_profile_list_output(lines)
-        self.assertEqual(boot_slot, 2)
-        self.assertEqual(len(slots), 4)
-        self.assertEqual(slots[0], {"slot": 0, "status": "ACTIVE", "name": "Bench"})
-        self.assertEqual(slots[1]["status"], "EMPTY")
-
     def test_sample_profiles_validity(self) -> None:
         """验证 profiles/ 目录下所有预置的 TOML 配置方案均可成功解析且结构完备。"""
-        import pathlib
-
         profiles_dir = pathlib.Path(__file__).parent.parent / "profiles"
         self.assertTrue(profiles_dir.exists())
 
