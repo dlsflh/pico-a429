@@ -1,26 +1,10 @@
-//! ARINC 429 32位字核心模型与字段提取/打包 (no_std)
+//! ARINC 429 32 位字核心模型 (no_std)
 //!
-//! ARINC 429 规范标准帧结构 (32 Bits):
-//! - Bit 1 ~ 8:   Label (标号，传输时 LSB 先发，八进制显示需位反转)
-//! - Bit 9 ~ 10:  SDI (Source/Destination Identifier，源/目的标识符)
-//! - Bit 11 ~ 29: Data (19位数据负载)
-//! - Bit 30 ~ 31: SSM (Sign/Status Matrix，符号/状态矩阵)
-//! - Bit 32:      Parity (奇偶校验位，通常为奇校验)
+//! 在固件中用于对 PIO 接收 FIFO 中的 32 位原始字进行高效零开销封装，
+//! 并提供零拷贝的 Label 提取与物理奇校验验证。
 
 use crate::label::Label;
-use crate::parity::{apply_parity, check_parity, ParityMode};
-
-/// 字构建与打包校验错误
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum WordBuildError {
-    /// SDI 超出 2 位最大值 3
-    InvalidSdi(u8),
-    /// SSM 超出 2 位最大值 3
-    InvalidSsm(u8),
-    /// Data 载荷超出 19 位有效上限 0x7FFFF
-    DataOverflow(u32),
-}
+use crate::parity::{check_parity, ParityMode};
 
 /// ARINC 429 标准 32 位字模型
 #[repr(transparent)]
@@ -41,55 +25,10 @@ impl ArincWord {
         self.0
     }
 
-    /// 从各逻辑字段直接组装合法 ARINC 字 (执行 Fail-Fast 校验)
-    pub fn from_fields(
-        label: Label,
-        sdi: u8,
-        data: u32,
-        ssm: u8,
-        parity_mode: ParityMode,
-    ) -> Result<Self, WordBuildError> {
-        if sdi > 3 {
-            return Err(WordBuildError::InvalidSdi(sdi));
-        }
-        if ssm > 3 {
-            return Err(WordBuildError::InvalidSsm(ssm));
-        }
-        if data > 0x0007_FFFF {
-            return Err(WordBuildError::DataOverflow(data));
-        }
-
-        let bus_label = label.to_raw_bus_byte() as u32;
-        let sdi_bits = (sdi as u32) << 8;
-        let data_bits = data << 10;
-        let ssm_bits = (ssm as u32) << 29;
-
-        let raw_31 = bus_label | sdi_bits | data_bits | ssm_bits;
-        Ok(Self(apply_parity(raw_31, parity_mode)))
-    }
-
     /// 提取工程八进制 Label
     #[inline]
     pub fn label(self) -> Label {
         Label::from_raw_bus_byte((self.0 & 0xFF) as u8)
-    }
-
-    /// 提取 2 位 SDI (Bits 9~10)
-    #[inline]
-    pub fn sdi(self) -> u8 {
-        ((self.0 >> 8) & 0x03) as u8
-    }
-
-    /// 提取 19 位 Data 负载 (Bits 11~29)
-    #[inline]
-    pub fn data_field(self) -> u32 {
-        (self.0 >> 10) & 0x0007_FFFF
-    }
-
-    /// 提取 2 位原始 SSM (Bits 30~31)
-    #[inline]
-    pub fn ssm_raw(self) -> u8 {
-        ((self.0 >> 29) & 0x03) as u8
     }
 
     /// 校验当前字的奇校验（ARINC 429 标准奇校验）
@@ -104,31 +43,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_word_from_fields_and_extraction() {
-        let word =
-            ArincWord::from_fields(Label::from_octal(0o310), 1, 0x1234, 0b11, ParityMode::Odd)
-                .unwrap();
-
+    fn test_word_raw_and_label_extraction() {
+        // 八进制 310 (0xC8) 倒序后为 0x13
+        let raw = 0xE048D013;
+        let word = ArincWord::from_raw(raw);
+        assert_eq!(word.to_raw(), raw);
         assert_eq!(word.label().to_octal(), 0o310);
-        assert_eq!(word.sdi(), 1);
-        assert_eq!(word.data_field(), 0x1234);
-        assert_eq!(word.ssm_raw(), 0b11);
         assert!(word.is_parity_valid());
-    }
-
-    #[test]
-    fn test_word_fail_fast_validation() {
-        assert_eq!(
-            ArincWord::from_fields(Label(0), 4, 0, 0, ParityMode::Odd),
-            Err(WordBuildError::InvalidSdi(4))
-        );
-        assert_eq!(
-            ArincWord::from_fields(Label(0), 0, 0, 5, ParityMode::Odd),
-            Err(WordBuildError::InvalidSsm(5))
-        );
-        assert_eq!(
-            ArincWord::from_fields(Label(0), 0, 0x0008_0000, 0, ParityMode::Odd),
-            Err(WordBuildError::DataOverflow(0x0008_0000))
-        );
     }
 }

@@ -39,7 +39,6 @@ pub mod opcodes {
     pub const SET_FILTER: u8 = 0x03;
     pub const TX_RAW_WORD: u8 = 0x04;
     pub const SET_OPERATING_MODE: u8 = 0x05;
-    pub const PAUSE_RESUME_ALL: u8 = 0x06;
     pub const CFGBATCH: u8 = 0x07;
     pub const QUERY_STATUS: u8 = 0x08;
     pub const PROFILE_OP: u8 = 0x09;

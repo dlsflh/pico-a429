@@ -19,9 +19,6 @@ pub enum ArincSpeed {
 }
 
 impl ArincSpeed {
-    pub const HIGH: Self = Self::High100k;
-    pub const LOW: Self = Self::Low12k5;
-
     /// 目标波特率 (bps)
     pub const fn baud_rate(self) -> u32 {
         match self {

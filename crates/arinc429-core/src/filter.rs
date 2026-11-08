@@ -149,11 +149,6 @@ impl LabelFilter {
         self.mode = FilterMode::AcceptAll;
     }
 
-    /// 清空配置并重置为 AcceptAll
-    pub fn clear(&mut self) {
-        self.reset();
-    }
-
     /// 高性能判断一个到达的 (label, parity_valid) 帧是否应被接收
     ///
     /// 注意：Label 过滤器专注于八进制标号路由，物理奇偶校验错误字在全放行与白名单命中时均允许透传至上位机分析仪以供监控告警
