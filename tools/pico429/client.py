@@ -178,6 +178,16 @@ class Pico429Client:
         timeout: float = 1.0,
     ) -> tuple[BinaryFrame, BinaryFrame]:
         """发送 32 位原始字并精准捕获本地硬件回环数据帧。"""
+        # 发射前：将当前 stream_buf 中已完整就绪的历史残留帧安全移入 telemetry_queue 暂存，
+        # 避免上一个测试向量的旧帧被误认作本次发射的新回环帧，同时保护并发遥测不丢失
+        while True:
+            res = find_frame_in_stream(self.stream_buf)
+            if res is None:
+                break
+            frame, consumed = res
+            del self.stream_buf[:consumed]
+            self.telemetry_queue.append(frame)
+
         seq = self.get_next_seq()
         req = BinaryFrame.new_cmd_req(
             channel=tx_ch,
@@ -321,10 +331,3 @@ class Pico429Client:
 
     def reboot_to_bootsel(self) -> BinaryFrame:
         return self.send_cmd(Opcode.REBOOT_TO_BOOTSEL)
-
-    def poll_telemetry(self) -> list[BinaryFrame]:
-        """弹出所有已缓冲的接收遥测帧。"""
-        frames: list[BinaryFrame] = []
-        while self.telemetry_queue:
-            frames.append(self.telemetry_queue.popleft())
-        return frames

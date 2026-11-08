@@ -7,11 +7,11 @@ from typing import Any
 
 
 def normalize_speed(speed_str: str) -> str:
-    """标准化波特率名称为 HIGH 或 LOW (兼顾 ARINC 429 规范定义与历史别名)。"""
+    """标准化波特率名称为 HIGH 或 LOW (支持 'high', '100k', 'low', '12.5k')。"""
     s = speed_str.strip().lower()
-    if s in ("high", "100k", "100", "100kbps"):
+    if s in ("high", "100k", "100kbps"):
         return "HIGH"
-    elif s in ("low", "12.5k", "12k5", "12.5", "12.5kbps"):
+    elif s in ("low", "12.5k", "12.5kbps"):
         return "LOW"
     raise ValueError(
         f"未知速率 '{speed_str}'。ARINC 429 仅支持 'high' (100 kbps) 或 'low' (12.5 kbps)。"
@@ -36,11 +36,6 @@ def parse_toml_profile(toml_text: str) -> dict[str, Any]:
                 raise ValueError(f"boot_slot 必须在 0..3 范围内，当前为: {boot_slot}")
         except ValueError as err:
             raise ValueError(f"无效的 boot_slot: {boot_slot}") from err
-
-    global_info = data.get("global", {})
-    mode = str(global_info.get("mode", "ASCII")).upper()
-    if mode not in ("ASCII", "BIN"):
-        mode = "ASCII"
 
     raw_channels = data.get("channel", data.get("channels", {}))
     channels: dict[int, dict[str, Any]] = {}
@@ -109,6 +104,5 @@ def parse_toml_profile(toml_text: str) -> dict[str, Any]:
         "name": name,
         "version": version,
         "boot_slot": boot_slot,
-        "mode": mode,
         "channels": channels,
     }

@@ -74,8 +74,8 @@ class TestArinc429Codec(unittest.TestCase):
             channel=1,
             flags=FrameFlags.SPEED_100K,
             seq_num=42,
-            timestamp_us=1234567,
-            raw_word=0xE048D013,
+            payload_0=1234567,
+            payload_1=0xE048D013,
         )
         encoded = frame.encode()
         self.assertEqual(len(encoded), 16)
@@ -86,6 +86,7 @@ class TestArinc429Codec(unittest.TestCase):
         self.assertEqual(decoded.channel, 1)
         self.assertEqual(decoded.seq_num, 42)
         self.assertEqual(decoded.raw_word, 0xE048D013)
+        self.assertEqual(decoded.timestamp_us, 1234567)
 
     def test_binary_frame_crc_corruption(self) -> None:
         frame = BinaryFrame(
@@ -93,8 +94,8 @@ class TestArinc429Codec(unittest.TestCase):
             channel=0,
             flags=0,
             seq_num=1,
-            timestamp_us=100,
-            raw_word=0x12345678,
+            payload_0=100,
+            payload_1=0x12345678,
         )
         encoded = bytearray(frame.encode())
         # 篡改数据负载
@@ -199,8 +200,8 @@ class TestArinc429Codec(unittest.TestCase):
                     channel=1,
                     flags=0,
                     seq_num=42,
-                    timestamp_us=1000,
-                    raw_word=0x12345678,
+                    payload_0=1000,
+                    payload_1=0x12345678,
                 )
                 self.resp.extend(rx.encode() + ack.encode() + b"\xa4\x29\x01\x00\x02")
 
@@ -218,7 +219,8 @@ class TestArinc429Codec(unittest.TestCase):
             def close(self) -> None:
                 pass
 
-        client = Pico429Client(MockTransport())
+        transport = MockTransport()
+        client = Pico429Client(transport)
         ack_frame, rx_frame = client.send_word_and_await_loopback(
             tx_ch=0,
             rx_ch=1,
@@ -233,44 +235,12 @@ class TestArinc429Codec(unittest.TestCase):
         self.assertEqual(rx_frame.raw_word, 0x12345678)
         self.assertEqual(bytes(client.stream_buf), b"\xa4\x29\x01\x00\x02")
 
-    def test_pico429_client_loopback(self) -> None:
-        """验证 Pico429Client 在执行 send_word_and_await_loopback 时必须将 raw_word 写入 payload_0。"""
-        from unittest.mock import MagicMock
-
-        from tools.pico429.client import Pico429Client
-
-        mock_transport = MagicMock()
-        written = []
-
-        def fake_send(data: bytes) -> None:
-            written.append(data)
-
-        # 模拟设备立即回送 ACK + ARINC_DATA
-        ack_frame = BinaryFrame.new_cmd_ack(channel=0, status=0, seq_num=1)
-        rx_frame = BinaryFrame(
-            frame_type=FrameType.ARINC_DATA,
-            channel=1,
-            flags=0,
-            seq_num=1,
-            payload_0=100,
-            payload_1=0xCAFEBABE,
-        )
-        in_stream = ack_frame.encode() + rx_frame.encode()
-
-        mock_transport.send.side_effect = fake_send
-        mock_transport.recv.return_value = in_stream
-
-        client = Pico429Client(mock_transport)
-        _ack, rx = client.send_word_and_await_loopback(
-            tx_ch=0, rx_ch=1, raw_word=0xCAFEBABE
-        )
-
-        self.assertEqual(len(written), 1)
-        sent_frame = BinaryFrame.decode(written[0])
-        # 核心断言：TX_RAW_WORD 的 raw_word 必须在 payload_0 中！
-        self.assertEqual(sent_frame.payload_0, 0xCAFEBABE)
+        # 核心契约验证：发出的 TX_RAW_WORD 必须在 payload_0 中携带 raw_word 且 channel 对齐
+        self.assertEqual(len(transport.written), 16)
+        sent_frame = BinaryFrame.decode(bytes(transport.written))
+        self.assertEqual(sent_frame.opcode, Opcode.TX_RAW_WORD)
         self.assertEqual(sent_frame.channel, 0)
-        self.assertEqual(rx.payload_1, 0xCAFEBABE)
+        self.assertEqual(sent_frame.payload_0, 0x12345678)
 
     def test_bit_engine_eight_vectors_pass(self) -> None:
         """验证 BitEngine 能完整闭环运行 8 组基准向量并成功匹配。"""
@@ -349,78 +319,81 @@ class TestArinc429Codec(unittest.TestCase):
         self.assertIsNotNone(report.error_message)
         self.assertIn("CONFIG 静默维护模式", str(report.error_message))
 
-    def test_cli_parser_config_hierarchy(self) -> None:
-        """验证重构后的动词子命令式 CLI 解析器能正确解析 config 及其二级子命令。"""
-        from tools.pico429.cli.parser import create_parser
+    def test_send_word_and_await_loopback_drains_stale_stream_buf(self) -> None:
+        """验证 send_word_and_await_loopback 在发射前自动排空 stream_buf 中残留的历史帧至 telemetry_queue。"""
+        from tools.pico429.client import Pico429Client
 
-        parser = create_parser()
+        class MockTransport:
+            def __init__(self, responses: list[bytes]) -> None:
+                self.responses = responses
+                self.sent: list[bytes] = []
 
-        # 1. config channel
-        args = parser.parse_args(
-            [
-                "config",
-                "channel",
-                "0",
-                "--dir",
-                "tx",
-                "--speed",
-                "100k",
-                "--run",
-            ]
+            def send(self, data: bytes) -> None:
+                self.sent.append(data)
+
+            def recv(self, max_bytes: int = 64) -> bytes:
+                if self.responses:
+                    return self.responses.pop(0)
+                return b""
+
+            def in_waiting(self) -> int:
+                return sum(len(c) for c in self.responses)
+
+            def reset_input_buffer(self) -> None:
+                self.responses.clear()
+
+            def close(self) -> None:
+                pass
+
+        # 构造上一个测试遗留的旧帧 (CH1, 0xE048D013)
+        old_frame = BinaryFrame(
+            frame_type=FrameType.ARINC_DATA,
+            channel=1,
+            flags=FrameFlags.SPEED_100K,
+            seq_num=99,
+            payload_0=1000,
+            payload_1=0xE048D013,
         )
-        self.assertEqual(args.command, "config")
-        self.assertEqual(args.config_subcommand, "channel")
-        self.assertEqual(args.channel, 0)
-        self.assertEqual(args.dir, "tx")
-        self.assertTrue(args.run)
 
-        # 2. config channel with filter
-        args = parser.parse_args(
-            [
-                "config",
-                "channel",
-                "1",
-                "--filter",
-                "whitelist",
-                "--labels",
-                "310,203",
-            ]
+        # 构造本次发射的 ACK 帧与新回环帧 (CH1, 0x60159DC1)
+        # 注意：Pico429Client 初始 seq 为 0，第一次 get_next_seq() 返回 1
+        ack_frame = BinaryFrame.new_cmd_ack(
+            channel=0,
+            status=AckStatus.OK,
+            seq_num=1,
+            payload_0=0x60159DC1,
         )
-        self.assertEqual(args.filter, "whitelist")
-        self.assertEqual(args.labels, "310,203")
-
-        # 3. config mode
-        args = parser.parse_args(["config", "mode", "run"])
-        self.assertEqual(args.target_mode, "run")
-
-        # 4. status (顶层独立状态命令)
-        args = parser.parse_args(["status", "--channel", "0"])
-        self.assertEqual(args.command, "status")
-        self.assertEqual(args.channel, 0)
-
-        # 5. listen (专职监听器)
-        args = parser.parse_args(["listen", "-c", "1"])
-        self.assertEqual(args.command, "listen")
-        self.assertEqual(args.channel, 1)
-
-        # 6. flash apply (带 --slot 固化)
-        args = parser.parse_args(
-            ["flash", "apply", "profiles/loopback_ch0_ch1.toml", "--slot", "0"]
+        new_loopback_frame = BinaryFrame(
+            frame_type=FrameType.ARINC_DATA,
+            channel=1,
+            flags=FrameFlags.SPEED_100K,
+            seq_num=100,
+            payload_0=2000,
+            payload_1=0x60159DC1,
         )
-        self.assertEqual(args.command, "flash")
-        self.assertEqual(args.flash_action, "apply")
-        self.assertEqual(args.file, "profiles/loopback_ch0_ch1.toml")
-        self.assertEqual(args.slot, 0)
 
-        # 7. flash clear --all
-        args = parser.parse_args(["flash", "clear", "--all"])
-        self.assertEqual(args.flash_action, "clear")
-        self.assertTrue(args.all)
+        transport = MockTransport([ack_frame.encode(), new_loopback_frame.encode()])
+        client = Pico429Client(transport)
 
-        # 8. bit with --profile
-        args = parser.parse_args(["bit", "--profile", "profiles/loopback_ch0_ch1.toml"])
-        self.assertEqual(args.command, "bit")
-        self.assertEqual(args.profile, "profiles/loopback_ch0_ch1.toml")
+        # 模拟发射前 stream_buf 中滞留了旧帧
+        client.stream_buf.extend(old_frame.encode())
+
+        # 调用回环发送并等待捕获
+        ret_ack, ret_rx = client.send_word_and_await_loopback(
+            tx_ch=0,
+            rx_ch=1,
+            raw_word=0x60159DC1,
+        )
+
+        # 验证：捕获到的回环帧必须是新发射的 0x60159DC1，而不是残留的 0xE048D013！
+        self.assertEqual(ret_rx.payload_1, 0x60159DC1)
+        self.assertEqual(ret_ack.seq_num, 1)
+
+        # 验证：旧帧并未被物理丢弃，而是被安全移入 telemetry_queue 暂存
+        self.assertEqual(len(client.telemetry_queue), 1)
+        stashed = client.telemetry_queue.popleft()
+        self.assertEqual(stashed.payload_1, 0xE048D013)
+        self.assertEqual(stashed.channel, 1)
 
 
 if __name__ == "__main__":

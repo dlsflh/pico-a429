@@ -27,7 +27,6 @@ class Opcode:
     SET_FILTER = 0x03
     TX_RAW_WORD = 0x04
     SET_OPERATING_MODE = 0x05
-    PAUSE_RESUME_ALL = 0x06
     CFGBATCH = 0x07
     QUERY_STATUS = 0x08
     PROFILE_OP = 0x09
@@ -212,24 +211,6 @@ class BinaryFrame:
     seq_num: int
     payload_0: int = 0
     payload_1: int = 0
-
-    def __init__(
-        self,
-        frame_type: int,
-        channel: int,
-        flags: int,
-        seq_num: int,
-        payload_0: int | None = None,
-        payload_1: int | None = None,
-        timestamp_us: int | None = None,
-        raw_word: int | None = None,
-    ) -> None:
-        self.frame_type = frame_type
-        self.channel = channel
-        self.flags = flags
-        self.seq_num = seq_num
-        self.payload_0 = payload_0 if payload_0 is not None else (timestamp_us or 0)
-        self.payload_1 = payload_1 if payload_1 is not None else (raw_word or 0)
 
     @property
     def timestamp_us(self) -> int:

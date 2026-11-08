@@ -8,8 +8,8 @@ import typing
 from typing import Protocol, runtime_checkable
 
 if typing.TYPE_CHECKING:
-    import serial  # type: ignore[import-untyped,unresolved-import]  # ty: ignore[unresolved-import]
-    import serial.tools.list_ports  # type: ignore[import-untyped,unresolved-import]  # ty: ignore[unresolved-import]
+    import serial  # type: ignore[import-untyped,unresolved-import]
+    import serial.tools.list_ports  # type: ignore[import-untyped,unresolved-import]
 else:
     try:
         import serial
