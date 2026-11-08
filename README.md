@@ -1,8 +1,8 @@
-# pico-429: 基于 Pico 2 W (RP2350) 纯 PIO 异步驱动的 ARINC 429 通信系统
+# pico-429: 基于 RP2350 (Pico 2) 纯 PIO 异步驱动的 12 通道 ARINC 429 通信系统
 
-本项目使用 **Rust** 嵌入式生态，充分利用 **Raspberry Pi Pico 2 (RP2350)** 的 **PIO (可编程 I/O 状态机)** 与 **Embassy 异步硬件中断**，实现高精度、工业级鲁棒性的 **ARINC 429** 航空电子总线发送与接收系统。支持最大 12 通道物理扩展与硬件环回自收自发内建自测试 (BIT) 功能。
+本项目使用 **Rust** 嵌入式生态，充分榨干 **Raspberry Pi Pico 2 (RP2350)** 的 **3 块硬件 PIO (全部 12 个可编程状态机)** 与 **Embassy 异步硬件中断**，实现高精度、工业级鲁棒性的 **12 通道 ARINC 429** 航空电子总线发送与接收系统。支持 12 物理通道在线热重构与硬件环回自收自发内建自测试 (BIT) 功能。
 
-> 💡 **注**：Pico 2 W 上的 CYW43439 Wi-Fi 无线遥测能力规划请参阅演进路线图：[plan/todo/WIFI_ROADMAP.md](plan/todo/WIFI_ROADMAP.md)。当前固件聚焦于微秒级 USB CDC-ACM 与零阻塞 PIO 硬件链路。
+> 💡 **架构说明**：系统将 RP2350 全片 12 个 PIO 状态机 100% 独占分配给 12 路物理通道，专注于微秒级 USB CDC-ACM 确定性传输。Wi-Fi 方案因 1-bit gSPI 速度瓶颈与抢占 PIO 状态机冲突已被审查并正式归档（详见 [plan/archive/WIFI_ROADMAP.md](plan/archive/WIFI_ROADMAP.md)）。
 
 ---
 

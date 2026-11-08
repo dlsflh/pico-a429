@@ -210,7 +210,6 @@ direction = "DISABLED"
 * `0x03` (`SET_FILTER`)：配置指定通道硬件位图过滤 (`0`=清空, `1`=放行Label, `2`=屏蔽Label)。
 * `0x04` (`TX_RAW_WORD`)：向下位机发送 32 位 ARINC 字 (payload_1 为原始数据字)。
 * `0x05` (`SET_OPERATING_MODE`)：配置运行模式 (`0`=Config 维护模式, `1`=Operational 运行模式)。
-* `0x06` (`PAUSE_RESUME_ALL`)：全局紧急暂停/恢复收发 (`0`=Pause, `1`=Resume)。
 * `0x07` (`CFGBATCH`)：12 通道原子批量重构 (payload_0 包含 CH0~7，payload_1 包含 CH8~11)。
 * `0x08` (`QUERY_STATUS`)：查询运行模式与 12 通道状态 (ACK 的 channel 承载模式，payload_0/1 承载通道状态掩码)。
 * `0x09` (`PROFILE_OP`)：片上 Flash 配置方案操作 (`0`=List, `1`=Save, `2`=Load, `3`=Boot, `4`=ClearBoot)。
