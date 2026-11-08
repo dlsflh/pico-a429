@@ -1,0 +1,21 @@
+# Pico-429 硬件 CH0 -> CH1 自回环测试配置方案
+# 硬件连线: 短接 GP0 (CH0 TX_A) -> GP2 (CH1 RX_A), GP1 (CH0 TX_B) -> GP3 (CH1 RX_B)
+
+[profile]
+name = "Loopback_CH0_CH1"
+version = "1.0"
+
+[global]
+mode = "BIN"
+
+# CH0: 100 kbps 高速发送端
+[channel.0]
+direction = "TX"
+speed = "high"
+
+# CH1: 100 kbps 高速接收端 (全放行，接收所有回环帧)
+[channel.1]
+direction = "RX"
+speed = "high"
+filter_mode = "none"
+labels = []

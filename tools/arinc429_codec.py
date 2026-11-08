@@ -31,6 +31,7 @@ class Opcode:
     CFGBATCH = 0x07
     QUERY_STATUS = 0x08
     PROFILE_OP = 0x09
+    REBOOT_TO_BOOTSEL = 0x0A
 
 
 class AckStatus:
@@ -48,6 +49,11 @@ class ProfileSubOp:
     LOAD = 0x02
     BOOT = 0x03
     CLEAR_BOOT = 0x04
+    CLEAR = 0x05
+    CLEAR_ALL = 0x06
+    GET_CHANNELS = 0x07
+    SET_NAME_CHUNK = 0x08
+    GET_NAME_CHUNK = 0x09
 
 
 ACK_STATUS_DESCRIPTIONS: dict[int, str] = {
@@ -196,16 +202,52 @@ class ArincWord:
         return check_parity(self.raw, ParityMode.ODD)
 
 
-@dataclass(frozen=True)
+@dataclass
 class BinaryFrame:
-    """16 字节定长二进制遥测帧。"""
+    """16 字节定长二进制通用通信帧 (与固件 BinaryFrame 保持 100% 结构对称)。"""
 
     frame_type: int
     channel: int
     flags: int
     seq_num: int
-    timestamp_us: int
-    raw_word: int
+    payload_0: int = 0
+    payload_1: int = 0
+
+    def __init__(
+        self,
+        frame_type: int,
+        channel: int,
+        flags: int,
+        seq_num: int,
+        payload_0: int | None = None,
+        payload_1: int | None = None,
+        timestamp_us: int | None = None,
+        raw_word: int | None = None,
+    ) -> None:
+        self.frame_type = frame_type
+        self.channel = channel
+        self.flags = flags
+        self.seq_num = seq_num
+        self.payload_0 = payload_0 if payload_0 is not None else (timestamp_us or 0)
+        self.payload_1 = payload_1 if payload_1 is not None else (raw_word or 0)
+
+    @property
+    def timestamp_us(self) -> int:
+        """针对 ARINC_DATA 帧的时间戳别名 (微秒)。"""
+        return self.payload_0
+
+    @timestamp_us.setter
+    def timestamp_us(self, val: int) -> None:
+        self.payload_0 = val
+
+    @property
+    def raw_word(self) -> int:
+        """针对 ARINC_DATA 帧的 32 位原始总线字别名。"""
+        return self.payload_1
+
+    @raw_word.setter
+    def raw_word(self, val: int) -> None:
+        self.payload_1 = val
 
     def encode(self) -> bytes:
         """打包为 16 字节二进制报文。"""
@@ -215,8 +257,8 @@ class BinaryFrame:
             type_and_ch,
             self.flags & 0xFF,
             self.seq_num & 0xFFFF,
-            self.timestamp_us & 0xFFFFFFFF,
-            self.raw_word & 0xFFFFFFFF,
+            self.payload_0 & 0xFFFFFFFF,
+            self.payload_1 & 0xFFFFFFFF,
         )
         crc = crc16_ccitt(payload_12)
         return BINARY_MAGIC + payload_12 + struct.pack("<H", crc)
@@ -238,16 +280,14 @@ class BinaryFrame:
                 f"CRC 校验失败: 期望 0x{expected_crc:04X}, 实际 0x{actual_crc:04X}"
             )
 
-        type_and_ch, flags, seq_num, ts_us, raw_word = struct.unpack(
-            "<BBHII", data[2:14]
-        )
+        type_and_ch, flags, seq_num, p0, p1 = struct.unpack("<BBHII", data[2:14])
         return cls(
             frame_type=(type_and_ch >> 4) & 0x0F,
             channel=type_and_ch & 0x0F,
             flags=flags,
             seq_num=seq_num,
-            timestamp_us=ts_us,
-            raw_word=raw_word,
+            payload_0=p0,
+            payload_1=p1,
         )
 
     @classmethod
@@ -265,8 +305,8 @@ class BinaryFrame:
             channel=channel & 0x0F,
             flags=opcode & 0xFF,
             seq_num=seq_num & 0xFFFF,
-            timestamp_us=payload_0 & 0xFFFFFFFF,
-            raw_word=payload_1 & 0xFFFFFFFF,
+            payload_0=payload_0 & 0xFFFFFFFF,
+            payload_1=payload_1 & 0xFFFFFFFF,
         )
 
     @classmethod
@@ -284,8 +324,8 @@ class BinaryFrame:
             channel=channel & 0x0F,
             flags=status & 0xFF,
             seq_num=seq_num & 0xFFFF,
-            timestamp_us=payload_0 & 0xFFFFFFFF,
-            raw_word=payload_1 & 0xFFFFFFFF,
+            payload_0=payload_0 & 0xFFFFFFFF,
+            payload_1=payload_1 & 0xFFFFFFFF,
         )
 
     @property
