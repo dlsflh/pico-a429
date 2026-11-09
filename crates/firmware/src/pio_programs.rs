@@ -4,6 +4,23 @@
 //! - 发送驱动 (TX: 11 指令): 统一运行于 20 周期/bit (2 MHz / 250 kHz)，严格满足 50% BPRZ 占空比与 4.0-bit 间隙；
 //! - 接收驱动 (RX: 20 指令): 统一运行于 20 周期/bit (2 MHz / 250 kHz)，具备 3.4-bit 自愈间隙检测与脉冲中段二次采样。
 //! - 单块 PIO 内存总计 11 + 20 = 31 / 32 指令，完美常驻！
+//!
+//! 注：微代码已固化为常量机器码（Bitwise Identical），彻底消除编译期宏展开与语法解析器开销。
+
+/// ARINC 429 TX 机器码 (严格占用 11 条指令，运行于 1 bit = 20 PIO 周期)
+pub const ARINC429_TX_INSTRUCTIONS: [u16; 11] = [
+    0x80a0, // [0]  get_word:   pull block
+    0xe03f, // [1]              set x, 31
+    0x6041, // [2]  bit_loop:   out y, 1
+    0x0066, // [3]              jmp !y, send_zero
+    0xe801, // [4]  send_one:   set pins, 0b01 [8]
+    0x0007, // [5]              jmp emit_null
+    0xe902, // [6]  send_zero:  set pins, 0b10 [9]
+    0xe600, // [7]  emit_null:  set pins, 0b00 [6]
+    0x0042, // [8]              jmp x--, bit_loop
+    0xe04f, // [9]  send_gap:   set y, 15
+    0x048a, // [10] gap_loop:   jmp y--, gap_loop [4]
+];
 
 /// ARINC 429 差分 BPRZ 发送状态机程序 (严格占用 11 条指令，运行于 1 bit = 20 PIO 周期)
 ///
@@ -13,30 +30,42 @@
 /// - 严格保证 50.0% 双极性归零码占空比
 /// - 字间隙: 发送完毕后自动延时 80 周期 (严格等于 4.0 个 bit 周期的标准 ARINC 429 Inter-word Gap)
 pub fn arinc429_tx_program() -> pio::Program<32> {
-    pio::pio_asm!(
-        ".wrap_target",
-        "get_word:",
-        "    pull block",
-        "    set x, 31",
-        "bit_loop:",
-        "    out y, 1",
-        "    jmp !y, send_zero",
-        "send_one:",
-        "    set pins, 0b01 [8]", // 1 cycle + 8 delay = 9 cycles
-        "    jmp emit_null",      // 1 cycle (pins 0b01 持续共 10 周期)
-        "send_zero:",
-        "    set pins, 0b10 [9]", // 1 cycle + 9 delay = 10 cycles (pins 0b10 持续共 10 周期)
-        "emit_null:",
-        "    set pins, 0b00 [6]", // 1 cycle + 6 delay = 7 cycles
-        "    jmp x--, bit_loop", // 1 cycle (加上 bit_loop 的 out y [1] 与 jmp [1]，Null 恰好持续 10 周期)
-        "send_gap:",
-        "    set y, 15",
-        "gap_loop:",
-        "    jmp y--, gap_loop [4]", // 16 轮循环 * (1 + 4 delay) = 80 周期 (严格等于 4.0 bit 间隙)
-        ".wrap"
-    )
-    .program
+    let mut code = pio::ArrayVec::new();
+    for &insn in &ARINC429_TX_INSTRUCTIONS {
+        code.push(insn);
+    }
+    pio::Program {
+        code,
+        origin: None,
+        wrap: pio::Wrap { source: 10, target: 0 },
+        side_set: pio::SideSet::default(),
+        version: pio::PioVersion::V0,
+    }
 }
+
+/// ARINC 429 RX 机器码 (占用 20 条指令，运行于 1 bit = 20 PIO 周期)
+pub const ARINC429_RX_INSTRUCTIONS: [u16; 20] = [
+    0xe030, // [0]  reset_gap:        set x, 16
+    0xa0e0, // [1]  gap_or_next_bit:  mov osr, pins
+    0x6042, // [2]                    out y, 2
+    0x0065, // [3]                    jmp !y, count_null
+    0x000a, // [4]                    jmp verify_pulse
+    0x0041, // [5]  count_null:       jmp x--, gap_or_next_bit
+    0xa0c3, // [6]  sync_ready:       mov isr, null
+    0xa0e0, // [7]  wait_first_bit:   mov osr, pins
+    0x6042, // [8]                    out y, 2
+    0x0067, // [9]                    jmp !y, wait_first_bit
+    0xa0e0, // [10] verify_pulse:     mov osr, pins
+    0x6042, // [11]                   out y, 2
+    0x0060, // [12]                   jmp !y, reset_gap
+    0x4041, // [13]                   in y, 1
+    0xe030, // [14]                   set x, 16
+    0xa0e0, // [15] wait_null:        mov osr, pins  <- wrap target
+    0x6042, // [16]                   out y, 2
+    0x0060, // [17]                   jmp !y, reset_gap
+    0x004f, // [18]                   jmp x--, wait_null
+    0xa0c3, // [19]                   mov isr, null  <- wrap source
+];
 
 /// ARINC 429 差分双引脚极性采样与自愈间隙接收状态机程序 (占用 20 条指令，运行于 1 bit = 20 PIO 周期)
 ///
@@ -46,37 +75,15 @@ pub fn arinc429_tx_program() -> pio::Program<32> {
 /// 3. 支持严苛 4.0-bit 背靠背传输: 在下降沿后 3.6-bit (72 周期) 提前就位，零吞帧风险；
 /// 4. 常高故障 (Line Fault) 闭环抑制: 利用 `.wrap_target` 原地清空 ISR 并挂起等待故障解除，杜绝垃圾帧雪崩。
 pub fn arinc429_rx_program() -> pio::Program<32> {
-    pio::pio_asm!(
-        "reset_gap:",
-        "    set x, 16", // [0] 17 轮 * 4 周期 = 68 周期 (3.4 bits 低电平计时)
-        "gap_or_next_bit:",
-        "    mov osr, pins",      // [1] (1) T0: 首次采样
-        "    out y, 2",           // [2] (1) T0+1
-        "    jmp !y, count_null", // [3] (1) T0+2: 仍为 00，继续累计低电平时间
-        "    jmp verify_pulse",   // [4] (1) T0+3: <3.4 bits 内出现边沿 -> 当前帧的下一位！
-        "count_null:",
-        "    jmp x--, gap_or_next_bit", // [5] (1) 4 周期轮询环
-        // --- 低电平已持续 ~3.7 bits，帧间 Gap 验证通过！---
-        "sync_ready:",
-        "    mov isr, null", // [6] 清空任何未满 32 位的残帧/杂波，复位硬件移位计数器
-        "wait_first_bit:",
-        "    mov osr, pins",          // [7] (1) T0: 帧首位采样
-        "    out y, 2",               // [8] (1) T0+1
-        "    jmp !y, wait_first_bit", // [9] (1) 无限死等新帧 Bit 1 (空闲期 0% 漏帧！)
-        "verify_pulse:",
-        "    mov osr, pins", // [10] (1) 二次采样 (4.1~8.0 周期处)，处于 10 周期脉冲中段
-        "    out y, 2",      // [11] (1)
-        "    jmp !y, reset_gap", // [12] (1) 若已掉回 00 则为窄毛刺，跳回 reset_gap
-        "    in y, 1",       // [13] (1) 移入有效位 (满 32 位由硬件 Autopush 推入 FIFO)
-        "    set x, 16",     // [14] (1) 归零看门狗 (68 周期上限)
-        ".wrap_target",
-        "wait_null:",
-        "    mov osr, pins",      // [15] (1)
-        "    out y, 2",           // [16] (1)
-        "    jmp !y, reset_gap",  // [17] (1) 成功归零，跳去测量低电平持续时间
-        "    jmp x--, wait_null", // [18] (1) 等待归零
-        "    mov isr, null",      // [19] (1) 常高故障超时：清空残帧，由 .wrap 跳回 wait_null 挂起
-        ".wrap"
-    )
-    .program
+    let mut code = pio::ArrayVec::new();
+    for &insn in &ARINC429_RX_INSTRUCTIONS {
+        code.push(insn);
+    }
+    pio::Program {
+        code,
+        origin: None,
+        wrap: pio::Wrap { source: 19, target: 15 },
+        side_set: pio::SideSet::default(),
+        version: pio::PioVersion::V0,
+    }
 }

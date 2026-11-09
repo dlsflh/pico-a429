@@ -65,12 +65,14 @@ unsafe fn write_flash_inner_rom(
     data: *const u8,
     data_len: usize,
 ) {
-    (ptrs.connect_internal_flash)();
-    (ptrs.flash_exit_xip)();
-    (ptrs.flash_range_erase)(offset, SECTOR_SIZE, 1 << 31, 0);
-    (ptrs.flash_range_program)(offset, data, data_len);
-    (ptrs.flash_flush_cache)();
-    (ptrs.flash_enter_cmd_xip)();
+    unsafe {
+        (ptrs.connect_internal_flash)();
+        (ptrs.flash_exit_xip)();
+        (ptrs.flash_range_erase)(offset, SECTOR_SIZE, 1 << 31, 0);
+        (ptrs.flash_range_program)(offset, data, data_len);
+        (ptrs.flash_flush_cache)();
+        (ptrs.flash_enter_cmd_xip)();
+    }
 }
 
 pub struct FlashProfileManager;

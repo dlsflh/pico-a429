@@ -174,8 +174,13 @@ impl BinaryFrame {
         self.flags
     }
 
-    /// 序列化为 16 字节定长数据
-    pub fn encode(&self, out: &mut [u8; BINARY_FRAME_LEN]) {
+    /// 直接原位序列化至目标切片中 (零额外内存分配与中间拷贝，返回实际写入长度 16)
+    #[inline]
+    pub fn encode_to_slice(&self, out: &mut [u8]) -> usize {
+        assert!(
+            out.len() >= BINARY_FRAME_LEN,
+            "Slice buffer too short for BinaryFrame"
+        );
         out[0] = BINARY_MAGIC[0];
         out[1] = BINARY_MAGIC[1];
 
@@ -183,19 +188,20 @@ impl BinaryFrame {
         out[2] = ((self.frame_type & 0x0F) << 4) | (self.channel & 0x0F);
         out[3] = self.flags;
 
-        let seq_bytes = self.seq_num.to_le_bytes();
-        out[4..6].copy_from_slice(&seq_bytes);
-
-        let p0_bytes = self.payload_0.to_le_bytes();
-        out[6..10].copy_from_slice(&p0_bytes);
-
-        let p1_bytes = self.payload_1.to_le_bytes();
-        out[10..14].copy_from_slice(&p1_bytes);
+        out[4..6].copy_from_slice(&self.seq_num.to_le_bytes());
+        out[6..10].copy_from_slice(&self.payload_0.to_le_bytes());
+        out[10..14].copy_from_slice(&self.payload_1.to_le_bytes());
 
         // 计算 CRC-16 (覆盖 type_and_channel 到 payload_1 共 12 字节: 索引 2..14)
         let crc = crc16_ccitt(&out[2..14]);
-        let crc_bytes = crc.to_le_bytes();
-        out[14..16].copy_from_slice(&crc_bytes);
+        out[14..16].copy_from_slice(&crc.to_le_bytes());
+        BINARY_FRAME_LEN
+    }
+
+    /// 序列化为 16 字节定长数据 (委托至 encode_to_slice 原位直写)
+    #[inline]
+    pub fn encode(&self, out: &mut [u8; BINARY_FRAME_LEN]) {
+        self.encode_to_slice(out);
     }
 
     /// 从切片反序列化
@@ -470,6 +476,25 @@ mod tests {
         assert_eq!(decoded.seq_num, 42);
         assert_eq!(decoded.payload_0, 0x12345678);
         assert_eq!(decoded.payload_1, 0x9ABCDEF0);
+    }
+
+    #[test]
+    fn test_binary_frame_encode_to_slice() {
+        let frame = BinaryFrame::new_full(
+            frame_types::CMD_REQ,
+            5,
+            opcodes::PING,
+            99,
+            0xAABBCCDD,
+            0x11223344,
+        );
+
+        let mut large_buffer = [0u8; 64];
+        let written = frame.encode_to_slice(&mut large_buffer[16..32]);
+        assert_eq!(written, BINARY_FRAME_LEN);
+
+        let decoded = BinaryFrame::decode(&large_buffer[16..32]).expect("Decode should succeed");
+        assert_eq!(decoded, frame);
     }
 
     #[test]

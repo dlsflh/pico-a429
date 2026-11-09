@@ -44,40 +44,52 @@ pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, Driver<'st
 /// 架构隔离：绝不受下行发送阻塞影响，USB OUT 端点始终处于就绪武装状态，彻底杜绝上位机写入超时 (Win32 Error 121)。
 #[embassy_executor::task]
 pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB>>) {
-    let mut rx_packet = [0u8; 64];
-    let mut stream_buf = [0u8; 128];
+    #[repr(align(4))]
+    struct AlignedRxPacket([u8; 64]);
+    #[repr(align(4))]
+    struct AlignedStreamBuf([u8; 128]);
+
+    let mut rx_packet = AlignedRxPacket([0u8; 64]);
+    let mut stream_buf = AlignedStreamBuf([0u8; 128]);
     let mut stream_len = 0usize;
 
     receiver.wait_connection().await;
 
     loop {
-        match receiver.read_packet(&mut rx_packet).await {
+        match receiver.read_packet(&mut rx_packet.0).await {
             Ok(0) => {} // 忽略零长包
             Ok(n) => {
-                if stream_len + n > stream_buf.len() {
+                if stream_len + n > stream_buf.0.len() {
                     // 防溢出保护：清空滑动缓冲并重新同步
                     stream_len = 0;
                 }
-                stream_buf[stream_len..stream_len + n].copy_from_slice(&rx_packet[..n]);
+                stream_buf.0[stream_len..stream_len + n].copy_from_slice(&rx_packet.0[..n]);
                 stream_len += n;
 
-                // 采用 1 字节增量滑动窗口持续搜索合法帧
+                // 游标推进式解析：单批数据内部无需频繁 copy_within，彻底消除多重内存拷贝
+                let mut cursor = 0usize;
                 while let Some((frame, consumed)) =
-                    find_frame_in_stream(&stream_buf[..stream_len])
+                    find_frame_in_stream(&stream_buf.0[cursor..stream_len])
                 {
                     if frame.frame_type == frame_types::CMD_REQ {
                         execute_binary_command(frame).await;
                     }
-                    // 滑动移出已消耗字节 (包含噪声与完整帧)
-                    stream_buf.copy_within(consumed..stream_len, 0);
-                    stream_len -= consumed;
+                    cursor += consumed;
+                }
+
+                // 批量移出已消费的全部数据 (整批仅需至多一次 copy_within 或直接清零)
+                if cursor == stream_len {
+                    stream_len = 0;
+                } else if cursor > 0 {
+                    stream_buf.0.copy_within(cursor..stream_len, 0);
+                    stream_len -= cursor;
                 }
 
                 // 缓冲区即将耗尽且仍未匹配到帧头时，丢弃无效头部，仅保留最后不足一帧的数据
                 if stream_len > BINARY_FRAME_LEN * 2 {
                     let keep = BINARY_FRAME_LEN - 1;
                     let start = stream_len - keep;
-                    stream_buf.copy_within(start..stream_len, 0);
+                    stream_buf.0.copy_within(start..stream_len, 0);
                     stream_len = keep;
                 }
             }
@@ -94,7 +106,10 @@ pub async fn usb_cdc_rx_task(mut receiver: Receiver<'static, Driver<'static, USB
 /// 优先保障上位机命令 ACK 即时输出，在 host 未连接/未读时自动丢弃滞留总线遥测，消灭死锁。
 #[embassy_executor::task]
 pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) {
-    let mut bin_batch_buf = [0u8; 64];
+    #[repr(align(4))]
+    struct AlignedBatchBuffer([u8; 64]);
+
+    let mut bin_batch_buf = AlignedBatchBuffer([0u8; 64]);
 
     let mut subscriber = GLOBAL_RX_PUBSUB
         .subscriber()
@@ -107,7 +122,7 @@ pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) 
             // 分支 1：命令回执 (最高调度优先级，始终以 16 字节 CMD_ACK 二进制帧即刻响应)
             Either::First(ack_frame) => {
                 let mut single_buf = [0u8; BINARY_FRAME_LEN];
-                ack_frame.encode(&mut single_buf);
+                ack_frame.encode_to_slice(&mut single_buf);
                 if cdc_sender_write_all(&mut sender, &single_buf).await.is_err() {
                     sender.wait_connection().await;
                 }
@@ -120,27 +135,25 @@ pub async fn usb_cdc_tx_task(mut sender: Sender<'static, Driver<'static, USB>>) 
                 }
 
                 let mut offset = 0;
-                let mut single_buf = [0u8; BINARY_FRAME_LEN];
-
                 let bin = first_frame.to_binary_frame();
-                bin.encode(&mut single_buf);
-                bin_batch_buf[offset..offset + BINARY_FRAME_LEN].copy_from_slice(&single_buf);
+                // 零拷贝优化：直接原位直写至 4 字节自然对齐的端点批量缓冲区
+                bin.encode_to_slice(&mut bin_batch_buf.0[offset..offset + BINARY_FRAME_LEN]);
                 offset += BINARY_FRAME_LEN;
 
-                // 批量拉取当前队列中滞留的后续帧 (最多凑 4 帧 64 字节填满单包端点)
-                while offset + BINARY_FRAME_LEN <= bin_batch_buf.len() {
+                // 批量拉取当前队列中滞留的后续帧 (最多凑 4 帧 64 字节填满单包端点，原位直写消除多重拷贝)
+                while offset + BINARY_FRAME_LEN <= bin_batch_buf.0.len() {
                     if let Some(next_frame) = subscriber.try_next_message_pure() {
                         let next_bin = next_frame.to_binary_frame();
-                        next_bin.encode(&mut single_buf);
-                        bin_batch_buf[offset..offset + BINARY_FRAME_LEN]
-                            .copy_from_slice(&single_buf);
+                        next_bin.encode_to_slice(
+                            &mut bin_batch_buf.0[offset..offset + BINARY_FRAME_LEN],
+                        );
                         offset += BINARY_FRAME_LEN;
                     } else {
                         break;
                     }
                 }
 
-                if cdc_sender_write_all(&mut sender, &bin_batch_buf[..offset])
+                if cdc_sender_write_all(&mut sender, &bin_batch_buf.0[..offset])
                     .await
                     .is_err()
                 {

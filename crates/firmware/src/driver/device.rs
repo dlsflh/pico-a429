@@ -7,7 +7,7 @@ use embassy_futures::select::{select, Either};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{
-    Common, Direction, Instance, LoadedProgram, Pin, PioPin, ShiftConfig, ShiftDirection,
+    Common, Direction, FifoJoin, Instance, LoadedProgram, Pin, PioPin, ShiftConfig, ShiftDirection,
     StateMachine,
 };
 use embassy_rp::Peri;
@@ -91,8 +91,9 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
 
     /// 动态原子重构通道方向与速率 (Stop -> Clear -> Configure -> Start)
     pub fn reconfigure(&mut self, dir: ChannelDirection, speed: ArincSpeed) {
-        // 1. 停用状态机并清退 FIFO
+        // 1. 停用状态机并显式清退硬件 FIFO (重构前排空残留字，杜绝指针与生命周期错位)
         self.sm.set_enable(false);
+        self.sm.clear_fifos();
         self.direction = dir;
         self.speed = speed;
 
@@ -117,6 +118,8 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                     threshold: 32,
                 };
                 cfg.clock_divider = clkdiv;
+                // 启用 8 深度 TX FIFO 扩展 (将闲置的 RX FIFO 物理级联到 TX 端)
+                cfg.fifo_join = FifoJoin::TxOnly;
 
                 self.sm.set_config(&cfg);
 
@@ -154,6 +157,8 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                     threshold: 32,
                 };
                 cfg.clock_divider = clkdiv;
+                // 启用 8 深度 RX FIFO 扩展 (将闲置的 TX FIFO 物理级联到 RX 端)
+                cfg.fifo_join = FifoJoin::RxOnly;
 
                 self.sm.set_config(&cfg);
 
@@ -169,6 +174,11 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                 self.pin_b.set_pull(Pull::None);
                 self.sm
                     .set_pin_dirs(Direction::In, &[&self.pin_a, &self.pin_b]);
+
+                let mut cfg = embassy_rp::pio::Config::default();
+                cfg.fifo_join = FifoJoin::Duplex;
+                self.sm.set_config(&cfg);
+
                 self.sm.set_enable(false);
             }
         }
@@ -177,6 +187,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
     /// 暂停物理收发工作 (切换引脚为高阻输入以确保物理总线静默，并清空 PIO 硬件 FIFO 与时钟计数器)
     pub fn pause(&mut self) {
         self.sm.set_enable(false);
+        self.sm.clear_fifos();
         self.sm.restart();
         if self.direction == ChannelDirection::Tx {
             self.sm

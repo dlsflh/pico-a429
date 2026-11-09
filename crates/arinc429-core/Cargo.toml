@@ -1,10 +1,10 @@
 [package]
 name = "arinc429-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["ARINC 429 pico-429 developers"]
 description = "Core ARINC 429 protocol, data models, parity, label filtering, and telemetry codecs"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 defmt = { version = "1.2", optional = true }
