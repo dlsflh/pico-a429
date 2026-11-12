@@ -37,7 +37,10 @@ pub fn arinc429_tx_program() -> pio::Program<32> {
     pio::Program {
         code,
         origin: None,
-        wrap: pio::Wrap { source: 10, target: 0 },
+        wrap: pio::Wrap {
+            source: 10,
+            target: 0,
+        },
         side_set: pio::SideSet::default(),
         version: pio::PioVersion::V0,
     }
@@ -82,7 +85,10 @@ pub fn arinc429_rx_program() -> pio::Program<32> {
     pio::Program {
         code,
         origin: None,
-        wrap: pio::Wrap { source: 19, target: 15 },
+        wrap: pio::Wrap {
+            source: 19,
+            target: 15,
+        },
         side_set: pio::SideSet::default(),
         version: pio::PioVersion::V0,
     }

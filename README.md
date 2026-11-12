@@ -1,6 +1,6 @@
 # pico-429: 基于 RP2350 (Pico 2) 纯 PIO 异步驱动的 12 通道 ARINC 429 通信系统
 
-本项目使用 **Rust** 嵌入式生态，充分榨干 **Raspberry Pi Pico 2 (RP2350)** 的 **3 块硬件 PIO (全部 12 个可编程状态机)** 与 **Embassy 异步硬件中断**，实现高精度、工业级鲁棒性的 **12 通道 ARINC 429** 航空电子总线发送与接收系统。支持 12 物理通道在线热重构与硬件环回自收自发内建自测试 (BIT) 功能。
+本项目使用 **纯 Rust** 生态，充分榨干 **Raspberry Pi Pico 2 (RP2350)** 的 **3 块硬件 PIO (全部 12 个可编程状态机)** 与 **Embassy 异步硬件中断**，实现高精度、工业级鲁棒性的 **12 通道 ARINC 429** 航空电子总线发送与接收系统。配套提供高性能纯 Rust 上位机引擎与原生 Model Context Protocol (MCP) 服务，支持 AI 编程助手直接驱动硬件自检与流式收发。
 
 > 💡 **架构说明**：系统将 RP2350 全片 12 个 PIO 状态机 100% 独占分配给 12 路物理通道，专注于微秒级 USB CDC-ACM 确定性传输。Wi-Fi 方案因 1-bit gSPI 速度瓶颈与抢占 PIO 状态机冲突已被审查并正式归档（详见 [plan/archive/WIFI_ROADMAP.md](plan/archive/WIFI_ROADMAP.md)）。
 
@@ -11,7 +11,7 @@
 1. **纳秒级时序与硬件级字间隙**：
    - 采用 PIO 状态机微代码实现差分双极性归零制（BPRZ）波形生成与采样，CPU 零开销；
    - 4-bit 物理字间隙由 PIO 微代码硬件固化（80 周期），零软件抖动；
-   - 支持 **100 kbps (高速)** 与 **12.5 kbps (低速)** 模式，通过动态调整 PIO 时钟分频比寄存器（`clkdiv`）实现秒级重配；
+   - 支持 **100 kbps (高速)** 与 **12.5 kbps (低速)** 模式，通过动态调整 PIO 时钟分频比寄存器（`clkdiv`）实现微秒级重配；
 2. **零 DMA 纯硬件 FIFO 异步驱动**：
    - 彻底移除非必要 DMA 通道依赖，杜绝 128 字节硬对齐陷阱与 Errata RP2350-E5 竞态；
    - 依靠 PIO 4 字深硬件 FIFO（提供 1.44 ms 硬件防抖）与中断唤醒 `.await`，12 通道满载仅消耗 < 1.5% CPU；
@@ -22,7 +22,11 @@
 5. **全对称 16 字节纯二进制协议与单核确定性执行**：
    - 全面淘汰 ASCII 文本指令，采用 16 字节定长二进制帧（`BinaryFrame`）及硬件 CRC16 校验；
    - 固件消除所有动态字符串格式化与堆内存分配，Flash 空间大幅缩减 42 KB，彻底避免 USB 阻塞与内存碎裂；
-   - 提供**免编译 Python 极速工具链 (`tools/pico429.py`)**，支持 12 通道一键 TOML 载入、状态导出、片上 Flash 配置持久化与交互自检。
+6. **纯 Rust 高吞吐上位机与原生 MCP 智能体服务 (`crates/pico429`)**：
+   - 基于信用额度的闭环动态流控，支持高达 2,777 words/s（100 kbps 物理总线饱和速率）无丢包持续发流；
+   - 12 通道 $\times$ 256 Label 零锁原子当前值表（CVT）支持 $O(1)$ 瞬时遥测索引；
+   - 深度 32,768 环形历史缓冲与无缝覆盖；
+   - 原生内置 Model Context Protocol (MCP) 服务器，支持 AI 编程助手（Claude Desktop、Cursor、VS Code MCP、Antigravity）一键无缝接入。
 
 ---
 
@@ -53,88 +57,100 @@
 
 ```
 pico-429/
-├── Cargo.toml                 # 工作空间根配置 (含 Dev/Release Profile 优化与 LTO)
+├── Cargo.toml                 # 工作空间根配置 (多 Crate Monorepo 管理)
 ├── .cargo/config.toml         # 目标 target: thumbv8m.main-none-eabihf 与链接脚本配置
-├── tools/
-│   ├── pico429.py             # 免编译 Python 极速工具 (支持 profile, interactive, bit, config, speed, filter 等)
-│   └── arinc429_codec.py      # 纯算法协议编解码库 (支持字打包、奇偶校验、CRC16-CCITT)
-├── tests/
-│   ├── test_codec.py          # Python 协议与基准 BIT 向量单元测试
-│   └── test_profile_toml.py   # Python 12 通道配置方案与 TOML 编解码行为测试
 ├── docs/
 │   ├── HARDWARE_MANUAL.md     # 硬件连线详细手册 (芯片引脚、分立电路、环回自测)
-│   └── USER_GUIDE.md          # 软件使用手册 (固件烧录、串口命令、TOML 配置、排错)
-└── crates/
-    ├── arinc429-core/         # 纯 no_std 核心协议库 (32位字格式、奇偶校验、位图过滤、控制命令解析)
-    └── firmware/              # Pico 2 固件 (Embassy 异步协程、PIO 微代码、片上 Flash、USB CDC)
+│   ├── USER_GUIDE.md          # 软件使用手册 (固件烧录、串口命令、TOML 配置、MCP 集成)
+│   ├── designs/               # 核心系统架构设计文档
+│   └── reviews/               # 历史审查与质量审计归档
+├── crates/
+│   ├── arinc429-core/         # 纯 no_std 核心协议库 (32位字格式、奇偶校验、位图过滤、流传输协议)
+│   ├── firmware/              # Pico 2 嵌入式固件 (Embassy 异步协程、PIO 微码、Flash、USB CDC)
+│   └── pico429/               # 纯 Rust 上位机引擎、CLI 终端与原生 MCP 服务器
+└── profiles/                  # 12 通道 TOML 声明式配置示例
 ```
 
 ---
 
 ## 四、 快速上手指南
 
-### 1. 运行核心单元测试
+### 1. 运行工作空间测试套件
 ```bash
-# 1. 运行 Rust 协议核心测试
-cargo test -p arinc429-core --no-default-features
+# 运行核心协议库与流协议测试
+cargo test --package arinc429-core
 
-# 2. 运行 Python 上位机协议与 TOML 配置测试
-uv run python -m unittest discover tests
+# 运行上位机调度器、CVT 与流控集成测试
+cargo test --package pico429
 ```
 
 ### 2. 编译与生成 UF2 固件
 ```bash
+# 1. 交叉编译 Release 固件
 cargo build --package pico-429-firmware --target thumbv8m.main-none-eabihf --release
-# 注意：Cargo 产物无扩展名，picotool 需显式通过 -t elf 指定文件类型
+
+# 2. 转换为 Pico 2 识别的 UF2 格式
 picotool uf2 convert target/thumbv8m.main-none-eabihf/release/pico-429-firmware -t elf pico429.uf2
 ```
 按住 Pico 2 W 上的 **BOOTSEL** 按钮插入 USB，将 `pico429.uf2` 拖入弹出的 U 盘盘符完成烧录。
 
-### 3. Python 极速工具使用指南 (推荐，免编译，自动识别串口)
+### 3. 安装与使用纯 Rust 上位机 (`pico429`)
+
+推荐将 `pico429` 一键安装到全局环境：
 ```bash
-# 1. 握手连通性测试 (PING -> PONG，RTT < 0.5ms)
-uv run --with pyserial python tools/pico429.py ping
-
-# 2. 查询 12 通道在线状态
-uv run --with pyserial python tools/pico429.py status
-
-# 3. 硬件自收自发 BIT 闭环自测试 (GP0->GP2, GP1->GP3，RTT < 1ms)
-uv run --with pyserial python tools/pico429.py bit
-
-# 4. 用户自驱动实时回环终端 (开启常驻会话，输入载荷即时回显)
-uv run --with pyserial python tools/pico429.py interactive
-
-# 5. 动态单通道启停与速率切换 (速率支持 high / low)
-uv run --with pyserial python tools/pico429.py config 0 --enable --dir TX --speed high
-uv run --with pyserial python tools/pico429.py speed 0 low
-uv run --with pyserial python tools/pico429.py filter 1 --allow 310
-
-# 6. 切换工作模式 (Config 物理静默重配 / Operational 总线运行)
-uv run --with pyserial python tools/pico429.py opmode config
-uv run --with pyserial python tools/pico429.py opmode operational
-
-# 7. 12 通道 TOML 配置文件管理与一键加载
-# 导出当前固件 12 通道配置为 TOML 模板
-uv run --with pyserial python tools/pico429.py profile dump -o my_bench.toml
-
-# 按照 TOML 配置文件一键原子重构所有 12 通道 (下发 CFGBATCH)
-uv run --with pyserial python tools/pico429.py profile apply my_bench.toml
-
-# 将当前配置持久化保存至片上 Flash 存储槽位 (0..3)
-uv run --with pyserial python tools/pico429.py profile save 0 --name "Avionics_Bench"
-
-# 列出片上 Flash 中的所有配置方案与开机自启动槽位
-uv run --with pyserial python tools/pico429.py profile list
-
-# 切换激活指定的片上 Flash 槽位
-uv run --with pyserial python tools/pico429.py profile load 0
-
-# 设置指定槽位为上电默认自启动
-uv run --with pyserial python tools/pico429.py profile boot 0
-
-# 8. 发送单个构造字 (Label 310, 数据 0x1234, 自动奇校验)
-uv run --with pyserial python tools/pico429.py send --channel 0 --label 310 --data 0x1234
-
-# 9. 彩色监听总线数据流
-uv run --with pyserial python tools/pico429.py listen
+# 安装至 ~/.cargo/bin (需确保在 PATH 中)
+cargo install --path crates/pico429
 ```
+安装后即可在任何终端免编译秒级调用；亦可使用 `cargo run --release --package pico429 -- <command>` 直接运行。
+
+#### 常用交互命令：
+```bash
+# 1. 探测串口并查询 12 通道状态
+pico429 status
+
+# 2. 模式切换 (run 物理运行模式 / config 高阻维护模式)
+pico429 config mode run
+pico429 config mode config
+
+# 3. 通道参数配置与 Flash Profile 固化
+pico429 config channel 0 --dir tx --speed high
+pico429 config channel 1 --dir rx --speed high
+
+# 加载并固化 TOML 方案至 Flash 槽位 0
+pico429 config profile apply profiles/loopback_ch0_ch1.toml --slot 0
+# 查看 4 个 Flash 存储槽位清单
+pico429 config profile list
+# 设定开机默认自启动槽位
+pico429 config profile boot 0
+
+# 4. 硬件自收自发 BIT 闭环自测试 (CH0 TX -> CH1 RX)
+pico429 bit --tx 0 --rx 1 --count 20
+
+# 5. 单字发送 (自动计算物理奇偶校验位)
+pico429 send --channel 0 --label 310 --data 0x1234 --sdi 1 --ssm 3 --parity odd
+
+# 6. 高吞吐流式批量注入 (支持指定 32 位原始字与线速速率 high/low)
+pico429 stream --channel 0 -n 10000 --speed high --data 0xE048D013
+
+# 7. 实时总线遥测监听终端 (支持通道过滤与帧数限制)
+pico429 listen --channel 1 -n 100
+```
+
+### 4. 启动原生 MCP 智能体服务器
+
+```bash
+pico429 mcp serve
+```
+
+在 Claude Desktop 或 Cursor 的 `mcpServers` 中配置：
+```json
+{
+  "mcpServers": {
+    "pico429": {
+      "command": "pico429",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
+配置完成后，AI 助手将直接具备 9 项硬件级操作工具，可自主完成固件状态检测、参数配置、流式发流以及环回测试。

@@ -9,12 +9,12 @@ pub mod parity;
 pub mod protocol;
 pub mod word;
 
-pub use baud::{calculate_clkdiv_fixed, ArincSpeed};
+pub use baud::{ArincSpeed, calculate_clkdiv_fixed};
 pub use filter::{FilterError, FilterMode, LabelFilter};
 pub use label::Label;
-pub use parity::{check_parity, ParityMode};
+pub use parity::{ParityMode, check_parity};
 pub use protocol::{
-    ack_status, flags, frame_types, opcodes, profile_sub_ops, BinaryFrame, DecodeError,
-    FilterAction, ProfileRecord, BINARY_FRAME_LEN, BINARY_MAGIC, PROFILE_MAGIC, PROFILE_RECORD_LEN,
+    BINARY_FRAME_LEN, BINARY_MAGIC, BinaryFrame, DecodeError, FilterAction, PROFILE_MAGIC,
+    PROFILE_RECORD_LEN, ProfileRecord, ack_status, flags, frame_types, opcodes, profile_sub_ops,
 };
 pub use word::ArincWord;

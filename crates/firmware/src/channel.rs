@@ -5,14 +5,14 @@
 //! 生产数据采用广播式 PubSub (GLOBAL_RX_PUBSUB)。
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::pubsub::PubSubChannel;
 
 use arinc429_core::filter::LabelFilter;
-use arinc429_core::protocol::{flags, frame_types, BinaryFrame, FilterAction, ProfileRecord};
+use arinc429_core::protocol::{BinaryFrame, FilterAction, ProfileRecord, flags, frame_types};
 use arinc429_core::word::ArincWord;
 
 /// 通道工作模式
@@ -138,7 +138,13 @@ pub fn current_directions() -> [u8; ACTIVE_CHANNEL_COUNT] {
     for i in 0..ACTIVE_CHANNEL_COUNT {
         let nibble = RUNTIME_CHANNEL_CONFIG[i].load(Ordering::Relaxed);
         let (en, is_rx, _) = arinc429_core::protocol::unpack_channel_nibble(nibble);
-        dirs[i] = if !en { 0 } else if is_rx { 2 } else { 1 };
+        dirs[i] = if !en {
+            0
+        } else if is_rx {
+            2
+        } else {
+            1
+        };
     }
     dirs
 }
@@ -158,19 +164,23 @@ pub fn current_speeds() -> [u8; ACTIVE_CHANNEL_COUNT] {
 pub fn pack_runtime_channels() -> (u32, u32) {
     let mut p0 = 0u32;
     let mut p1 = 0u32;
-    for ch in 0..8 {
-        let nibble = (RUNTIME_CHANNEL_CONFIG[ch].load(Ordering::Relaxed) & 0x0F) as u32;
+    for (ch, item) in RUNTIME_CHANNEL_CONFIG.iter().enumerate().take(8) {
+        let nibble = (item.load(Ordering::Relaxed) & 0x0F) as u32;
         p0 |= nibble << (ch * 4);
     }
-    for ch in 8..12 {
-        let nibble = (RUNTIME_CHANNEL_CONFIG[ch].load(Ordering::Relaxed) & 0x0F) as u32;
+    for (ch, item) in RUNTIME_CHANNEL_CONFIG.iter().enumerate().skip(8) {
+        let nibble = (item.load(Ordering::Relaxed) & 0x0F) as u32;
         p1 |= nibble << ((ch - 8) * 4);
     }
     (p0, p1)
 }
 
-static RUNTIME_CHANNEL_FILTERS: BlockingMutex<CriticalSectionRawMutex, RefCell<[LabelFilter; ACTIVE_CHANNEL_COUNT]>> =
-    BlockingMutex::new(RefCell::new([LabelFilter::new_accept_all(); ACTIVE_CHANNEL_COUNT]));
+static RUNTIME_CHANNEL_FILTERS: BlockingMutex<
+    CriticalSectionRawMutex,
+    RefCell<[LabelFilter; ACTIVE_CHANNEL_COUNT]>,
+> = BlockingMutex::new(RefCell::new(
+    [LabelFilter::new_accept_all(); ACTIVE_CHANNEL_COUNT],
+));
 
 /// 更新单个通道的 Filter 并返回更新后的副本
 pub fn update_channel_filter(ch: u8, action: FilterAction) -> LabelFilter {
@@ -206,7 +216,8 @@ pub fn set_channel_filter_direct(ch: u8, filter: LabelFilter) {
 }
 
 /// 获取当前所有 12 通道过滤器快照 (模式数组与 256 位掩码数组)
-pub fn get_channel_filters_snapshot() -> ([u8; ACTIVE_CHANNEL_COUNT], [[u32; 8]; ACTIVE_CHANNEL_COUNT]) {
+pub fn get_channel_filters_snapshot()
+-> ([u8; ACTIVE_CHANNEL_COUNT], [[u32; 8]; ACTIVE_CHANNEL_COUNT]) {
     let mut modes = [0u8; ACTIVE_CHANNEL_COUNT];
     let mut bitmaps = [[0u32; 8]; ACTIVE_CHANNEL_COUNT];
     RUNTIME_CHANNEL_FILTERS.lock(|cell| {
@@ -278,16 +289,18 @@ pub enum ChannelControlCmd {
     Pause,
     /// 恢复物理收发工作 (按当前配置重启状态机)
     Resume,
+    /// 立即清空通道发送队列与硬件 FIFO (用于中止发送)
+    PurgeTx,
 }
 
-// 静态队列构造原型
+// 静态队列构造原型 (扩容为 128 深度，确保 34.56 ms 防断流跑道)
 #[allow(clippy::declare_interior_mutable_const)]
-const TX_QUEUE_INIT: Channel<CriticalSectionRawMutex, u32, 16> = Channel::new();
+const TX_QUEUE_INIT: Channel<CriticalSectionRawMutex, u32, 128> = Channel::new();
 #[allow(clippy::declare_interior_mutable_const)]
 const CTRL_QUEUE_INIT: Channel<CriticalSectionRawMutex, ChannelControlCmd, 4> = Channel::new();
 
-/// 激活通道的下行发送数据队列数组 (每个通道 16 帧缓冲)
-pub static CHANNEL_TX_QUEUES: [Channel<CriticalSectionRawMutex, u32, 16>; ACTIVE_CHANNEL_COUNT] =
+/// 激活通道的下行发送数据队列数组 (每个通道 128 帧缓冲)
+pub static CHANNEL_TX_QUEUES: [Channel<CriticalSectionRawMutex, u32, 128>; ACTIVE_CHANNEL_COUNT] =
     [TX_QUEUE_INIT; ACTIVE_CHANNEL_COUNT];
 
 /// 激活通道的控制与配置命令队列数组 (每个通道独立独享 1 个，零竞态偷帧)
@@ -296,29 +309,115 @@ pub static CHANNEL_CTRL_QUEUES: [Channel<CriticalSectionRawMutex, ChannelControl
 
 /// 集中式多路接收遥测总线 (Single Producer Multi-Publisher, Single USB Subscriber)
 ///
-/// 具备 1024 帧深度的环形缓冲，支持 1 个专用 USB 订阅端，对应 12 个物理通道发布端。
-/// 满载自动覆盖最旧帧 (publish_immediate)，绝不反向阻塞物理层总线接收。
+/// 具备 4096 帧深度的环形缓冲，支持 1 个专用 USB 订阅端，对应 12 个物理通道发布端。
+/// 吸收 245.7 ms 全负荷遥测，消除上位机中断抖动丢帧。
 pub static GLOBAL_RX_PUBSUB: PubSubChannel<
     CriticalSectionRawMutex,
     InboundArincFrame,
-    1024,
+    4096,
     1,
     ACTIVE_CHANNEL_COUNT,
 > = PubSubChannel::new();
 
-/// 向指定通道投递发送数据帧 (非阻塞 Fail-Fast，彻底消除 USB 接收端死锁)
+/// 物理硬件已消费字数统计 (由 PIO 发送工作任务递增)
+pub static CUMULATIVE_CONSUMED_COUNTER: [AtomicU32; ACTIVE_CHANNEL_COUNT] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// 固件丢弃未进入硬件的字数统计 (队列满、通道未就绪或中止清空)
+pub static DROPPED_TX_WORDS: [AtomicU32; ACTIVE_CHANNEL_COUNT] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// 记录上次发送信用更新时的累积处理计数
+pub static LAST_REPORTED_HANDLED: [AtomicU32; ACTIVE_CHANNEL_COUNT] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// 流量控制信用更新脏位掩码 (bit 0..11 代表 channel 0..11 有信用变动待发送)
+pub static CREDIT_DIRTY_MASK: AtomicU16 = AtomicU16::new(0);
+
+/// 触发通道流量控制检查并按需标记脏位
+pub fn check_and_mark_credit_dirty(channel_id: u8) {
+    if (channel_id as usize) >= ACTIVE_CHANNEL_COUNT {
+        return;
+    }
+    let ch = channel_id as usize;
+    let consumed = CUMULATIVE_CONSUMED_COUNTER[ch].load(Ordering::Relaxed);
+    let dropped = DROPPED_TX_WORDS[ch].load(Ordering::Relaxed);
+    let total_handled = consumed.wrapping_add(dropped);
+    let last = LAST_REPORTED_HANDLED[ch].load(Ordering::Relaxed);
+    let delta = total_handled.wrapping_sub(last);
+
+    let is_high_speed = channel_is_high_speed(channel_id);
+    let threshold = if is_high_speed { 32 } else { 8 };
+
+    if delta >= threshold || CHANNEL_TX_QUEUES[ch].is_empty() {
+        CREDIT_DIRTY_MASK.fetch_or(1 << channel_id, Ordering::Release);
+    }
+}
+
+/// 向指定通道投递发送数据帧 (非阻塞 Fail-Fast，零信用泄漏)
 pub fn send_to_channel_tx(channel_id: u8, raw_word: u32) -> Result<(), ChannelError> {
     if (channel_id as usize) >= ACTIVE_CHANNEL_COUNT {
         return Err(ChannelError::ChannelOutOfRange(channel_id));
     }
     match channel_direction(channel_id) {
         Some(ChannelDirection::Tx) => {}
-        Some(ChannelDirection::Disabled) => return Err(ChannelError::ChannelDisabled(channel_id)),
-        _ => return Err(ChannelError::NotTxChannel(channel_id)),
+        Some(ChannelDirection::Disabled) => {
+            DROPPED_TX_WORDS[channel_id as usize].fetch_add(1, Ordering::Relaxed);
+            check_and_mark_credit_dirty(channel_id);
+            return Err(ChannelError::ChannelDisabled(channel_id));
+        }
+        _ => {
+            DROPPED_TX_WORDS[channel_id as usize].fetch_add(1, Ordering::Relaxed);
+            check_and_mark_credit_dirty(channel_id);
+            return Err(ChannelError::NotTxChannel(channel_id));
+        }
     }
-    CHANNEL_TX_QUEUES[channel_id as usize]
+    if CHANNEL_TX_QUEUES[channel_id as usize]
         .try_send(raw_word)
-        .map_err(|_| ChannelError::QueueFull(channel_id))
+        .is_err()
+    {
+        DROPPED_TX_WORDS[channel_id as usize].fetch_add(1, Ordering::Relaxed);
+        check_and_mark_credit_dirty(channel_id);
+        Err(ChannelError::QueueFull(channel_id))
+    } else {
+        Ok(())
+    }
 }
 
 /// 向指定通道投递控制/过滤命令 (Fail-Fast 参数校验)
@@ -364,8 +463,8 @@ pub async fn apply_channel_config(channel: u8, dir: ChannelDirection, high_speed
 
 /// 批量原子应用 12 通道配置 (单通道 1 次入队，零队列饱和风险)
 pub async fn apply_all_channels_batch(channels: &[(bool, bool, bool); ACTIVE_CHANNEL_COUNT]) {
-    for ch in 0..ACTIVE_CHANNEL_COUNT {
-        let (enable, is_rx, high_speed) = channels[ch];
+    for (ch, &(enable, is_rx, high_speed)) in channels.iter().enumerate().take(ACTIVE_CHANNEL_COUNT)
+    {
         let dir = if !enable {
             ChannelDirection::Disabled
         } else if is_rx {

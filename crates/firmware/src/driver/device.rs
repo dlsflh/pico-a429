@@ -3,14 +3,14 @@
 //! 支持每个通道在 TX (发送)、RX (接收) 与 Disabled (停用/低功耗) 之间动态原子切换，
 //! 严格遵循“先停机 -> 清空 FIFO -> 重绑引脚与微码 -> 重启”的安全生命周期，彻底消灭硬件竞态与总线毛刺。
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
+use embassy_rp::Peri;
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{
     Common, Direction, FifoJoin, Instance, LoadedProgram, Pin, PioPin, ShiftConfig, ShiftDirection,
     StateMachine,
 };
-use embassy_rp::Peri;
 use embassy_time::Instant;
 
 use arinc429_core::baud::ArincSpeed;
@@ -18,8 +18,8 @@ use arinc429_core::filter::LabelFilter;
 use arinc429_core::word::ArincWord;
 
 use crate::channel::{
-    ChannelControlCmd, ChannelDirection, InboundArincFrame, CHANNEL_CTRL_QUEUES,
-    CHANNEL_TX_QUEUES, GLOBAL_RX_PUBSUB,
+    CHANNEL_CTRL_QUEUES, CHANNEL_TX_QUEUES, ChannelControlCmd, ChannelDirection, GLOBAL_RX_PUBSUB,
+    InboundArincFrame,
 };
 use crate::driver::calculate_pio_clkdiv;
 
@@ -36,6 +36,7 @@ pub struct ChannelDevice<'d, T: Instance, const SM: usize> {
 
 impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
     /// 构造通道通用硬件设备并完成引脚分配与初始模式装载
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         common: &mut Common<'d, T>,
         sm: StateMachine<'d, T, SM>,
@@ -214,7 +215,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
     }
 
     /// 处理单条通道控制命令
-    fn handle_cmd(&mut self, cmd: ChannelControlCmd) {
+    fn handle_cmd(&mut self, cmd: ChannelControlCmd, channel_id: u8) {
         match cmd {
             ChannelControlCmd::Configure {
                 direction,
@@ -251,6 +252,19 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
             ChannelControlCmd::Resume => {
                 self.resume();
             }
+            ChannelControlCmd::PurgeTx => {
+                // 排空软件发送队列并统计丢弃数
+                let mut drained = 0u32;
+                while CHANNEL_TX_QUEUES[channel_id as usize].try_receive().is_ok() {
+                    drained += 1;
+                }
+                if drained > 0 {
+                    crate::channel::DROPPED_TX_WORDS[channel_id as usize]
+                        .fetch_add(drained, core::sync::atomic::Ordering::Relaxed);
+                }
+                self.sm.clear_fifos();
+                crate::channel::check_and_mark_credit_dirty(channel_id);
+            }
         }
     }
 
@@ -261,7 +275,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
         loop {
             // 尽最大努力先排空滞留的控制命令
             while let Ok(cmd) = CHANNEL_CTRL_QUEUES[channel_id as usize].try_receive() {
-                self.handle_cmd(cmd);
+                self.handle_cmd(cmd, channel_id);
             }
 
             let is_operational =
@@ -270,7 +284,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
             if !is_operational {
                 // 挂起或处于 Config 维护模式或停用状态：休眠等待控制命令激活
                 let cmd = CHANNEL_CTRL_QUEUES[channel_id as usize].receive().await;
-                self.handle_cmd(cmd);
+                self.handle_cmd(cmd, channel_id);
             } else if self.direction == ChannelDirection::Tx {
                 // 发送模式：等待发送字或控制命令
                 match select(
@@ -281,9 +295,12 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                 {
                     Either::First(raw_word) => {
                         self.sm.tx().wait_push(raw_word).await;
+                        crate::channel::CUMULATIVE_CONSUMED_COUNTER[channel_id as usize]
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        crate::channel::check_and_mark_credit_dirty(channel_id);
                     }
                     Either::Second(cmd) => {
-                        self.handle_cmd(cmd);
+                        self.handle_cmd(cmd, channel_id);
                     }
                 }
             } else {
@@ -312,7 +329,7 @@ impl<'d, T: Instance, const SM: usize> ChannelDevice<'d, T, SM> {
                         }
                     }
                     Either::Second(cmd) => {
-                        self.handle_cmd(cmd);
+                        self.handle_cmd(cmd, channel_id);
                     }
                 }
             }

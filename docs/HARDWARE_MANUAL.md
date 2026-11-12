@@ -57,6 +57,7 @@ Pico 2 W 共有 40 个物理排针引脚（标准 DIP-40 封装，间距 2.54mm�
 | **Pin 21, 22** | **GP16, GP17** | **CH8** | `CH8_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH8 差分信号对 (可配为 TX 或 RX) |
 | **Pin 24, 25** | **GP18, GP19** | **CH9** | `CH9_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH9 差分信号对 (可配为 TX 或 RX) |
 | **Pin 26, 27** | **GP20, GP21** | **CH10** | `CH10_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | CH10 差分信号对 (可配为 TX 或 RX) |
+| **Pin 29** | **GP22** | **未占用备用** | `SPARE / AFE_CTRL` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | **空闲备用引脚 (规划用于 AFE 继电器扩展总线 SCL/CLK)** |
 | **Pin 31, 32** | **GP26, GP27** | **CH11** | `CH11_A, B` | 可配 (IN/OUT) | 初始弱下拉 | 3.3V CMOS | **CH11 差分信号对 (排针引出，可配为 TX/RX)** |
 | **Pin 36**| **3V3** | 电源输出 | 3.3V 逻辑电源 | 输出 (3.3V) | - | 3.3V 最大300mA | 外部电平转换或光耦隔离供电 |
 | **Pin 38**| **GND** | 全部 | 地线 | - | - | 0V 电位 | 屏蔽双绞线屏蔽层与电源返回地 |
@@ -197,4 +198,4 @@ RP2350 具备 3 个 PIO 块（PIO0, PIO1, PIO2）共 12 个独立状态机。本
 | **Channel 11**| **GP26 / GP27** | Pin 31 / Pin 32 | **PIO2 / SM3** | PIO FIFO 异步中断 | 大气数据机总线采集 |
 
 > ⚠️ **BIT 环回测试注意事项**：
-> 当指定 Channel A 与 Channel B 进行对插自测试（如 `uv run python tools/pico429.py bit --tx 0 --rx 1`）时，务必在回路中串接 $100\,\Omega \sim 330\,\Omega$ 限流电阻，并在执行前确保两通道地线共地。
+> 当指定 Channel A 与 Channel B 进行对插自测试（如 `cargo run --release --package pico429 -- bit --tx 0 --rx 1` 或 `pico429 bit --tx 0 --rx 1`）时，务必在回路中串接 $100\,\Omega \sim 330\,\Omega$ 限流电阻，并在执行前确保两通道地线共地。

@@ -30,6 +30,12 @@ impl Label {
     pub const fn to_octal(self) -> u8 {
         self.0
     }
+
+    /// 转换为物理总线寄存器字节 (按位翻转)
+    #[inline]
+    pub const fn to_raw_bus_byte(self) -> u8 {
+        self.0.reverse_bits()
+    }
 }
 
 #[cfg(test)]

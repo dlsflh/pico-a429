@@ -16,15 +16,15 @@ use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, PIO1, PIO2, USB};
 use embassy_rp::pio::{LoadedProgram, Pio};
 use embassy_rp::usb::Driver;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::Builder;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 
 use arinc429_core::baud::ArincSpeed;
 use arinc429_core::filter::LabelFilter;
 
 use crate::channel::ChannelDirection;
 use crate::driver::ChannelDevice;
-use crate::flash_storage::{FlashProfileManager, FLASH_MGR};
+use crate::flash_storage::{FLASH_MGR, FlashProfileManager};
 use crate::usb_service::{usb_cdc_rx_task, usb_cdc_tx_task, usb_task};
 
 bind_interrupts!(struct Irqs {
@@ -56,42 +56,14 @@ define_channel_task!(channel_9_task, PIO2, 1);
 define_channel_task!(channel_10_task, PIO2, 2);
 define_channel_task!(channel_11_task, PIO2, 3);
 
-/// 板载工作指示灯任务 (PIN_25)
-/// - 故障模式：常亮
-/// - 配置模式 (Config)：慢闪 (1 Hz)
-/// - 工作模式 (Operational)：快闪 (5 Hz)
-#[embassy_executor::task]
-async fn led_task(mut led: Output<'static>) {
-    loop {
-        if crate::channel::is_hardware_fault() {
-            led.set_high();
-            embassy_time::Timer::after_millis(100).await;
-        } else {
-            match crate::channel::operating_mode() {
-                crate::channel::OperatingMode::Config => {
-                    led.set_high();
-                    embassy_time::Timer::after_millis(500).await;
-                    led.set_low();
-                    embassy_time::Timer::after_millis(500).await;
-                }
-                crate::channel::OperatingMode::Operational => {
-                    led.set_high();
-                    embassy_time::Timer::after_millis(100).await;
-                    led.set_low();
-                    embassy_time::Timer::after_millis(100).await;
-                }
-            }
-        }
-    }
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
-    // 0. 初始化板载 LED 并启动指示灯任务
-    let led = Output::new(p.PIN_25, Level::Low);
-    spawner.spawn(led_task(led).unwrap());
+    // 0. 硬件安全隔离保护
+    // 保护 Pico 2 W 内部总线：PIN_25 为 CYW43439 SPI_CS (低电平有效)，强制置为 High 消除未预期片选与寄生漏电
+    let _cs = Output::new(p.PIN_25, Level::High);
+    core::mem::forget(_cs); // 永久维持 High 电平，防止局部析构重置引脚状态
 
     // 1. 初始化 USB CDC ACM 虚拟串口
     let driver = Driver::new(p.USB, Irqs);
@@ -208,30 +180,133 @@ async fn main(spawner: Spawner) {
     }
 
     // 出厂默认基态：全部 12 通道处于 Disabled 静默状态，PIO 状态机停用，引脚高阻弱下拉
-    spawn_channels!(spawner, c0, tx_0, rx_0, [
-        (channel_0_task, 0, sm0_0, p.PIN_0, p.PIN_1, ChannelDirection::Disabled),
-        (channel_1_task, 1, sm0_1, p.PIN_2, p.PIN_3, ChannelDirection::Disabled),
-        (channel_2_task, 2, sm0_2, p.PIN_4, p.PIN_5, ChannelDirection::Disabled),
-        (channel_3_task, 3, sm0_3, p.PIN_6, p.PIN_7, ChannelDirection::Disabled),
-    ]);
+    spawn_channels!(
+        spawner,
+        c0,
+        tx_0,
+        rx_0,
+        [
+            (
+                channel_0_task,
+                0,
+                sm0_0,
+                p.PIN_0,
+                p.PIN_1,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_1_task,
+                1,
+                sm0_1,
+                p.PIN_2,
+                p.PIN_3,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_2_task,
+                2,
+                sm0_2,
+                p.PIN_4,
+                p.PIN_5,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_3_task,
+                3,
+                sm0_3,
+                p.PIN_6,
+                p.PIN_7,
+                ChannelDirection::Disabled
+            ),
+        ]
+    );
 
-    spawn_channels!(spawner, c1, tx_1, rx_1, [
-        (channel_4_task, 4, sm1_0, p.PIN_8, p.PIN_9, ChannelDirection::Disabled),
-        (channel_5_task, 5, sm1_1, p.PIN_10, p.PIN_11, ChannelDirection::Disabled),
-        (channel_6_task, 6, sm1_2, p.PIN_12, p.PIN_13, ChannelDirection::Disabled),
-        (channel_7_task, 7, sm1_3, p.PIN_14, p.PIN_15, ChannelDirection::Disabled),
-    ]);
+    spawn_channels!(
+        spawner,
+        c1,
+        tx_1,
+        rx_1,
+        [
+            (
+                channel_4_task,
+                4,
+                sm1_0,
+                p.PIN_8,
+                p.PIN_9,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_5_task,
+                5,
+                sm1_1,
+                p.PIN_10,
+                p.PIN_11,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_6_task,
+                6,
+                sm1_2,
+                p.PIN_12,
+                p.PIN_13,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_7_task,
+                7,
+                sm1_3,
+                p.PIN_14,
+                p.PIN_15,
+                ChannelDirection::Disabled
+            ),
+        ]
+    );
 
-    spawn_channels!(spawner, c2, tx_2, rx_2, [
-        (channel_8_task, 8, sm2_0, p.PIN_16, p.PIN_17, ChannelDirection::Disabled),
-        (channel_9_task, 9, sm2_1, p.PIN_18, p.PIN_19, ChannelDirection::Disabled),
-        (channel_10_task, 10, sm2_2, p.PIN_20, p.PIN_21, ChannelDirection::Disabled),
-        (channel_11_task, 11, sm2_3, p.PIN_26, p.PIN_27, ChannelDirection::Disabled),
-    ]);
+    spawn_channels!(
+        spawner,
+        c2,
+        tx_2,
+        rx_2,
+        [
+            (
+                channel_8_task,
+                8,
+                sm2_0,
+                p.PIN_16,
+                p.PIN_17,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_9_task,
+                9,
+                sm2_1,
+                p.PIN_18,
+                p.PIN_19,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_10_task,
+                10,
+                sm2_2,
+                p.PIN_20,
+                p.PIN_21,
+                ChannelDirection::Disabled
+            ),
+            (
+                channel_11_task,
+                11,
+                sm2_3,
+                p.PIN_26,
+                p.PIN_27,
+                ChannelDirection::Disabled
+            ),
+        ]
+    );
 
     // 4. 若 Flash 中存在指定的开机自启动 Profile，则原子加载并激活为 Operational 模式
     if let Some(slot) = boot_slot {
         let mut guard = FLASH_MGR.lock().await;
+        #[allow(clippy::collapsible_if)]
         if let Some(ref mut m) = *guard {
             if let Ok(record) = m.load_profile(slot) {
                 crate::channel::set_operating_mode(crate::channel::OperatingMode::Operational);

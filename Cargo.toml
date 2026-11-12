@@ -2,7 +2,9 @@
 members = [
     "crates/arinc429-core",
     "crates/firmware",
+    "crates/pico429",
 ]
+default-members = ["crates/pico429"]
 resolver = "2"
 
 # -----------------------------------------------------------------------------
@@ -40,3 +42,7 @@ codegen-units = 1           # 聚合为单一代码生成单元，为 LLVM 跨�
 panic = "abort"             # 禁用栈展开 (Unwind)，移除冗余的 landing pad 代码与异常表
 debug = 2                   # 关键：保留 ELF 调试信息供 defmt 提取日志字典与上位机堆栈回溯（不烧入 Flash）
 strip = false               # 不剥离符号表，确保 probe-rs / defmt-print 能够正常还原日志
+
+# 上位机 Rust 宿主执行端：启用最高速度优化以支撑 533 KB/s 全载荷吞吐
+[profile.release.package.pico429]
+opt-level = 3

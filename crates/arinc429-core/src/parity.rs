@@ -25,6 +25,30 @@ pub fn check_parity(word: u32, mode: ParityMode) -> bool {
     }
 }
 
+/// 根据指定的奇偶校验模式为低 31 位字设置第 32 位校验位 (bit 31)
+#[inline]
+pub fn apply_parity(word31: u32, mode: ParityMode) -> u32 {
+    let base = word31 & 0x7FFF_FFFF;
+    let ones = base.count_ones();
+    match mode {
+        ParityMode::Odd => {
+            if (ones & 1) == 0 {
+                base | 0x8000_0000
+            } else {
+                base
+            }
+        }
+        ParityMode::Even => {
+            if (ones & 1) == 1 {
+                base | 0x8000_0000
+            } else {
+                base
+            }
+        }
+        ParityMode::None => word31,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

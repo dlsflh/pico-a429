@@ -21,6 +21,10 @@ pub mod frame_types {
     pub const ASYNC_EVENT: u8 = 0x03;
     /// 上位机下发的二进制控制命令请求
     pub const CMD_REQ: u8 = 0x04;
+    /// 批量流式发送 ARINC 字 (无逐字 ACK，受流量控制信用门控)
+    pub const STREAM_TX_DATA: u8 = 0x05;
+    /// 固件反馈给上位机的累积流量控制信用额度
+    pub const STREAM_CREDIT: u8 = 0x06;
 }
 
 /// 状态标志位 (用于 ARINC_DATA 帧的 flags 字节)
@@ -43,6 +47,8 @@ pub mod opcodes {
     pub const QUERY_STATUS: u8 = 0x08;
     pub const PROFILE_OP: u8 = 0x09;
     pub const REBOOT_TO_BOOTSEL: u8 = 0x0A;
+    /// 中止指定通道发送并立即清空硬件 FIFO
+    pub const ABORT_TX: u8 = 0x0B;
 }
 
 /// 命令执行状态码 (用于 CMD_ACK 帧的 flags 字节)
@@ -154,6 +160,46 @@ impl BinaryFrame {
         }
     }
 
+    /// 创建流式发送帧 (STREAM_TX_DATA)
+    pub const fn new_stream_tx(
+        channel: u8,
+        seq_num: u16,
+        word: u32,
+        timestamp_or_tag: u32,
+        odd_parity: bool,
+    ) -> Self {
+        Self {
+            frame_type: frame_types::STREAM_TX_DATA,
+            channel: channel & 0x0F,
+            flags: if odd_parity { 0x01 } else { 0x00 },
+            seq_num,
+            payload_0: word,
+            payload_1: timestamp_or_tag,
+        }
+    }
+
+    /// 创建流量控制信用更新帧 (STREAM_CREDIT)
+    pub const fn new_stream_credit(
+        channel: u8,
+        seq_num: u16,
+        available_slots: u32,
+        cumulative_handled: u32,
+    ) -> Self {
+        Self {
+            frame_type: frame_types::STREAM_CREDIT,
+            channel: channel & 0x0F,
+            flags: 0x00,
+            seq_num,
+            payload_0: available_slots,
+            payload_1: cumulative_handled,
+        }
+    }
+
+    /// 创建中止通道发送命令 (CMD_REQ: ABORT_TX)
+    pub const fn new_cmd_abort_tx(channel: u8, seq_num: u16) -> Self {
+        Self::new_cmd_req(channel, opcodes::ABORT_TX, seq_num, 0, 0)
+    }
+
     /// 获取时间戳别名 (针对 ARINC_DATA)
     pub fn timestamp_us(&self) -> u32 {
         self.payload_0
@@ -161,6 +207,21 @@ impl BinaryFrame {
 
     /// 获取 ARINC 原始字别名 (针对 ARINC_DATA)
     pub fn raw_word(&self) -> u32 {
+        self.payload_1
+    }
+
+    /// 获取流式发送字 (针对 STREAM_TX_DATA)
+    pub fn stream_word(&self) -> u32 {
+        self.payload_0
+    }
+
+    /// 获取可用 FIFO 槽位数 (针对 STREAM_CREDIT)
+    pub fn credit_available_slots(&self) -> u32 {
+        self.payload_0
+    }
+
+    /// 获取累积已处理字数 (针对 STREAM_CREDIT)
+    pub fn credit_cumulative_handled(&self) -> u32 {
         self.payload_1
     }
 
@@ -283,12 +344,10 @@ pub const fn unpack_channel_nibble(nibble: u8) -> (bool, bool, bool) {
 pub fn pack_12_channels(channels: &[(bool, bool, bool); 12]) -> (u32, u32) {
     let mut p0 = 0u32;
     let mut p1 = 0u32;
-    for ch in 0..8 {
-        let (en, rx, hs) = channels[ch];
+    for (ch, &(en, rx, hs)) in channels.iter().enumerate().take(8) {
         p0 |= (pack_channel_nibble(en, rx, hs) as u32) << (ch * 4);
     }
-    for ch in 8..12 {
-        let (en, rx, hs) = channels[ch];
+    for (ch, &(en, rx, hs)) in channels.iter().enumerate().skip(8) {
         p1 |= (pack_channel_nibble(en, rx, hs) as u32) << ((ch - 8) * 4);
     }
     (p0, p1)
@@ -297,13 +356,13 @@ pub fn pack_12_channels(channels: &[(bool, bool, bool); 12]) -> (u32, u32) {
 /// 将两个 32 位载荷字解包为 12 通道配置
 pub fn unpack_12_channels(p0: u32, p1: u32) -> [(bool, bool, bool); 12] {
     let mut channels = [(false, false, false); 12];
-    for ch in 0..8 {
+    for (ch, item) in channels.iter_mut().enumerate().take(8) {
         let nibble = ((p0 >> (ch * 4)) & 0x0F) as u8;
-        channels[ch] = unpack_channel_nibble(nibble);
+        *item = unpack_channel_nibble(nibble);
     }
-    for ch in 8..12 {
+    for (ch, item) in channels.iter_mut().enumerate().skip(8) {
         let nibble = ((p1 >> ((ch - 8) * 4)) & 0x0F) as u8;
-        channels[ch] = unpack_channel_nibble(nibble);
+        *item = unpack_channel_nibble(nibble);
     }
     channels
 }
@@ -319,9 +378,9 @@ pub struct ProfileRecord {
     pub slot: u8,
     pub is_valid: u8,
     pub name: [u8; 32],
-    pub directions: [u8; 12], // 0: Disabled, 1: Tx, 2: Rx
-    pub speeds: [u8; 12],     // 0: Low (12.5k), 1: High (100k)
-    pub filter_modes: [u8; 12], // 0: AcceptAll, 1: Whitelist, 2: Blacklist
+    pub directions: [u8; 12],           // 0: Disabled, 1: Tx, 2: Rx
+    pub speeds: [u8; 12],               // 0: Low (12.5k), 1: High (100k)
+    pub filter_modes: [u8; 12],         // 0: AcceptAll, 1: Whitelist, 2: Blacklist
     pub filter_bitmaps: [[u32; 8]; 12], // 12 通道 256 位掩码
     pub crc16: u16,
 }
@@ -384,9 +443,9 @@ impl ProfileRecord {
 
         let mut filter_bitmaps = [[0u32; 8]; 12];
         let mut offset = 76;
-        for ch in 0..12 {
-            for word in 0..8 {
-                filter_bitmaps[ch][word] = u32::from_le_bytes([
+        for ch_bitmaps in &mut filter_bitmaps {
+            for word in ch_bitmaps {
+                *word = u32::from_le_bytes([
                     buf[offset],
                     buf[offset + 1],
                     buf[offset + 2],
@@ -432,6 +491,7 @@ impl ProfileRecord {
 ///
 /// 返回 `Some((frame, consumed_bytes))`，其中 `consumed_bytes` 为包含跳过的噪音字节在内的全部消耗长度；
 /// 若切片内无完整有效帧，返回 `None`。
+#[allow(clippy::collapsible_if)]
 pub fn find_frame_in_stream(buf: &[u8]) -> Option<(BinaryFrame, usize)> {
     if buf.len() < BINARY_FRAME_LEN {
         return None;
@@ -517,7 +577,7 @@ mod tests {
         let mut channels = [(false, false, false); 12];
         channels[0] = (true, false, true); // CH0: Enable, Tx, 100k
         channels[1] = (true, true, false); // CH1: Enable, Rx, 12.5k
-        channels[7] = (true, true, true);  // CH7: Enable, Rx, 100k
+        channels[7] = (true, true, true); // CH7: Enable, Rx, 100k
         channels[8] = (true, false, false); // CH8: Enable, Tx, 12.5k
         channels[11] = (true, true, true); // CH11: Enable, Rx, 100k
 
@@ -549,20 +609,24 @@ mod tests {
 
     #[test]
     fn test_profile_record_roundtrip() {
-        let mut rec = ProfileRecord::default();
-        rec.slot = 1;
-        rec.is_valid = 1;
+        let mut rec = ProfileRecord {
+            slot: 1,
+            is_valid: 1,
+            ..Default::default()
+        };
         rec.name[..5].copy_from_slice(b"Bench");
         rec.directions[0] = 1; // Tx
         rec.directions[1] = 2; // Rx
-        rec.speeds[0] = 1;     // High
-        rec.speeds[1] = 0;     // Low
+        rec.speeds[0] = 1; // High
+        rec.speeds[1] = 0; // Low
 
         // 配置 CH1 为白名单，允许 0o310 和 0o203
         rec.filter_modes[1] = 1;
         let mut f1 = crate::filter::LabelFilter::new_whitelist();
-        f1.allow_label(crate::label::Label::from_octal(0o310)).unwrap();
-        f1.allow_label(crate::label::Label::from_octal(0o203)).unwrap();
+        f1.allow_label(crate::label::Label::from_octal(0o310))
+            .unwrap();
+        f1.allow_label(crate::label::Label::from_octal(0o203))
+            .unwrap();
         rec.filter_bitmaps[1] = f1.bitmap();
 
         rec.crc16 = rec.compute_crc();

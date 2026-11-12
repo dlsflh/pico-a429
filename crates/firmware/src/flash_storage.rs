@@ -8,7 +8,7 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 
-use arinc429_core::protocol::{ProfileRecord, PROFILE_MAGIC, PROFILE_RECORD_LEN};
+use arinc429_core::protocol::{PROFILE_MAGIC, PROFILE_RECORD_LEN, ProfileRecord};
 
 pub static FLASH_MGR: Mutex<CriticalSectionRawMutex, Option<FlashProfileManager>> =
     Mutex::new(None);
@@ -35,7 +35,8 @@ pub enum FlashError {
 struct BootRomPointers {
     connect_internal_flash: unsafe extern "C" fn() -> (),
     flash_exit_xip: unsafe extern "C" fn() -> (),
-    flash_range_erase: unsafe extern "C" fn(addr: u32, count: usize, block_size: u32, block_cmd: u8) -> (),
+    flash_range_erase:
+        unsafe extern "C" fn(addr: u32, count: usize, block_size: u32, block_cmd: u8) -> (),
     flash_range_program: unsafe extern "C" fn(addr: u32, data: *const u8, count: usize) -> (),
     flash_flush_cache: unsafe extern "C" fn() -> (),
     flash_enter_cmd_xip: unsafe extern "C" fn() -> (),
@@ -77,6 +78,12 @@ unsafe fn write_flash_inner_rom(
 
 pub struct FlashProfileManager;
 
+impl Default for FlashProfileManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FlashProfileManager {
     pub const fn new() -> Self {
         Self
@@ -93,10 +100,13 @@ impl FlashProfileManager {
     /// 关全局中断并在 SRAM 中安全执行 4KB 扇区擦除与多页写入
     pub fn write_storage(&mut self, buf: &[u8; SECTOR_STORAGE_LEN]) -> Result<(), FlashError> {
         let ptrs = BootRomPointers::get();
-        cortex_m::interrupt::free(|_| {
-            unsafe {
-                write_flash_inner_rom(&ptrs, PROFILE_SECTOR_OFFSET, buf.as_ptr(), SECTOR_STORAGE_LEN);
-            }
+        cortex_m::interrupt::free(|_| unsafe {
+            write_flash_inner_rom(
+                &ptrs,
+                PROFILE_SECTOR_OFFSET,
+                buf.as_ptr(),
+                SECTOR_STORAGE_LEN,
+            );
         });
         Ok(())
     }

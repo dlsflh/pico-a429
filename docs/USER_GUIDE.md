@@ -1,6 +1,6 @@
 # ARINC 429 Pico 2 W 软件使用与上位机通信手册
 
-本手册详细说明如何编译与烧录 Pico 2 W 固件，通过 Python 极速工具链进行 12 通道全量配置与数据交互，以及纯二进制 USB CDC 通信协议规范。
+本手册详细说明如何编译与烧录 Pico 2 W 固件，通过纯 Rust 高吞吐上位机与 MCP 智能体服务进行 12 通道全量配置与数据交互，以及纯二进制 USB CDC 通信协议规范。
 
 ---
 
@@ -22,73 +22,108 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/pico-429-firmware 
 
 ---
 
-## 二、 上位机极速工具使用指南 (`tools/pico429.py`)
+## 二、 纯 Rust 高吞吐上位机引擎与 MCP 智能体服务 (`crates/pico429`)
 
-上位机采用 Python 工具链管理，执行时通过 `uv run` 免编译直接调用：
+Pico-429 上位机现已全面转向原生 Rust 架构，提供高吞吐发送引擎（支持 100 kbps 满载流传输）、双通道双工并发、当前值表（CVT）快速索引、环形历史缓冲以及原生 Model Context Protocol (MCP) 服务。
 
+### 1. 编译与安装
+
+直接通过 Cargo 运行或安装到系统 PATH：
 ```bash
-# 1. 连通性测试 (PING -> PONG，纯二进制 RTT < 0.6ms)
-uv run --with pyserial python tools/pico429.py ping
+# 直接运行开发版
+cargo run --package pico429 -- --help
 
-# 2. 查询固件 12 通道物理状态与当前运行模式 (Config / Operational)
-uv run --with pyserial python tools/pico429.py status
+# 编译并运行 Release 高性能优化版 (默认启动 Windows 1ms 硬件定时器增强)
+cargo run --release --package pico429 -- status
 
-# 3. 运行模式管理 (安全维护静默 / 投入总线运行)
-uv run --with pyserial python tools/pico429.py config mode config       # 进入 Config 模式 (总线收发锁定，引脚高阻静默)
-uv run --with pyserial python tools/pico429.py config mode run          # 进入 Operational 模式 (激活物理总线实时收发)
-
-# 4. 单通道参数配置 (方向、速率、过滤规则，支持单项与联合指定)
-# 缺省规则: --speed 未指定默认为 high; --filter 未指定默认为 none; 白名单无指定 labels 默认全屏蔽，黑名单无指定 labels 默认全放行
-uv run --with pyserial python tools/pico429.py config channel 0 --dir tx --speed high --run
-uv run --with pyserial python tools/pico429.py config channel 1 --dir rx --filter whitelist --labels 310,203
-uv run --with pyserial python tools/pico429.py config channel 2 --disable
-
-# 5. 12 通道 TOML 配置文件与片上 Flash 管理 (支持顶层 flash 或 config flash)
-# 应用 TOML 方案并同时持久化到 Flash Slot 0 (包含 32 字节方案名称):
-uv run --with pyserial python tools/pico429.py flash apply profiles/loopback_ch0_ch1.toml --slot 0
-
-# 仅应用到当前运行环境而不写入 Flash:
-uv run --with pyserial python tools/pico429.py flash apply profiles/loopback_ch0_ch1.toml
-
-# 列出片上 Flash 中的所有槽位方案名称、状态与当前开机自启槽位
-uv run --with pyserial python tools/pico429.py flash list
-
-# 从片上 Flash 槽位加载配置并切换为 Operational 运行模式
-uv run --with pyserial python tools/pico429.py flash load 0
-
-# 设置指定 Flash 槽位为上电开机自启动方案
-uv run --with pyserial python tools/pico429.py flash boot 0
-
-# 清空上电开机自启动设置 (恢复默认上电 CONFIG 静默基态)
-uv run --with pyserial python tools/pico429.py flash boot --clear
-
-# 读取 Flash 槽位配置并逆向导出为 TOML 配置文件 (支持单个槽位或 --all 全量导出)
-uv run --with pyserial python tools/pico429.py flash dump 0 -o profiles/slot0.toml
-uv run --with pyserial python tools/pico429.py flash dump --all --out profiles/
-
-# 清空 Flash 槽位配置 (支持单个槽位或 --all 全部清空)
-uv run --with pyserial python tools/pico429.py flash clear 0
-uv run --with pyserial python tools/pico429.py flash clear --all
-
-# 6. 硬件内置闭环自检 (BIT)
-# 提示: 严格校验当前硬件状态，Config 模式下坚决拒绝；支持 --profile 显式预装载测试方案
-uv run --with pyserial python tools/pico429.py bit --profile profiles/loopback_ch0_ch1.toml
-uv run --with pyserial python tools/pico429.py bit --tx 0 --rx 1
-
-# 7. 发送指定航电数据字 (自动计算奇校验)
-uv run --with pyserial python tools/pico429.py send --channel 0 --label 310 --data 0x1234 --sdi 1 --ssm 3
-
-# 8. 专职总线遥测流监听终端 (ARINC 429 Bus Monitor)
-# 监听物理总线接收帧，零线程竞态，微秒级固件捕获时刻高亮呈现 (支持 --count 与 --timeout，按 Ctrl+C 安全退出)
-uv run --with pyserial python tools/pico429.py listen
-uv run --with pyserial python tools/pico429.py listen --channel 1
-uv run --with pyserial python tools/pico429.py listen --channel 1 --count 10 --timeout 5.0
+# 安装为全局命令行工具
+cargo install --path crates/pico429
 ```
 
-### 板载 LED 状态指示说明 (Pico 2 GPIO 25)
-* **慢速闪烁 (1 Hz, 500ms 亮 / 500ms 灭)**：`CONFIG` 模式（安全维护静默基态，物理总线锁定，引脚高阻）。
-* **快速闪烁 (5 Hz, 100ms 亮 / 100ms 灭)**：`OPERATIONAL` 模式（正常运行模式，物理总线实时收发）。
-* **持续常亮 (Solid ON)**：`HARDWARE_FAULT`（硬件底层严重故障，如 Flash 物理写入损坏或总线严重异常）。
+### 2. 命令行核心子命令速查
+
+```bash
+# 1. 连通性与通道状态查询 (自动探测 Pico-429 串口)
+cargo run --release --package pico429 -- status
+# 亦可显式指定端口：
+cargo run --release --package pico429 -- --port COM3 status
+
+# 2. 模式切换 (run 物理运行模式 / config 高阻维护模式)
+cargo run --release --package pico429 -- config mode run
+cargo run --release --package pico429 -- config mode config
+
+# 3. 单通道物理配置与过滤规则设定
+# 将 Channel 0 配置为 TX、高速 100k
+cargo run --release --package pico429 -- config channel 0 --dir tx --speed high
+# 将 Channel 1 配置为 RX、低速 12.5k
+cargo run --release --package pico429 -- config channel 1 --dir rx --speed low
+
+# 4. 固件 Profile 固化与 TOML 加载 (片上 4 槽位 Flash 持久化)
+# 将本地 TOML 文件批量下发至硬件并持久化至 Flash 槽位 0
+cargo run --release --package pico429 -- config profile apply profiles/loopback_ch0_ch1.toml --slot 0
+# 查询片上 4 个 Flash 槽位状态、校验和与自启动标记
+cargo run --release --package pico429 -- config profile list
+# 从 Flash 槽位 0 恢复配置并立即激活物理总线
+cargo run --release --package pico429 -- config profile load 0
+# 将 Flash 槽位 0 设定为默认开机自启动 Profile (断电不丢失)
+cargo run --release --package pico429 -- config profile boot 0
+# 清除开机自启动标记 (恢复出厂静默基态)
+cargo run --release --package pico429 -- config profile clear-boot
+# 擦除指定 Flash 槽位
+cargo run --release --package pico429 -- config profile clear 0
+
+# 5. 单字发送 (自动计算物理奇偶校验位)
+cargo run --release --package pico429 -- send --channel 0 --label 310 --data 0x1234 --sdi 1 --ssm 3 --parity odd
+
+# 6. 高吞吐连续流传输 (支持指定 32 位原始字与线速速率 high/low)
+cargo run --release --package pico429 -- stream --channel 0 -n 10000 --speed high --data 0xE048D013
+
+# 7. 实时总线遥测监听 (分析仪模式，实时格式化显示 Label、Data、Parity)
+cargo run --release --package pico429 -- listen --channel 1 -n 100
+
+# 8. 物理闭环自检 (BIT, 校验 8 组基准航电向量与回环完整性)
+cargo run --release --package pico429 -- bit --tx 0 --rx 1 --count 20
+```
+
+### 3. 原生 MCP 服务器模式 (Model Context Protocol)
+
+`pico429` 原生内置 MCP 服务器，为 AI 编程助手（如 Claude Desktop、Cursor、VS Code MCP、Antigravity）提供对 ARINC 429 硬件的完整控制与监测能力：
+
+```bash
+# 启动标准输入/输出 (stdio) MCP 服务
+cargo run --release --package pico429 -- mcp serve
+```
+
+#### MCP 客户端配置示例
+
+在 Claude Desktop 或 Cursor 的 `mcpServers` 配置段中添加：
+```json
+{
+  "mcpServers": {
+    "pico429": {
+      "command": "cargo",
+      "args": ["run", "--release", "--manifest-path", "C:/Users/lihan/Work/pico-429/Cargo.toml", "--package", "pico429", "--", "mcp", "serve"]
+    }
+  }
+}
+```
+
+#### MCP 工具集 (9 项原子工具)
+1. `pico429_get_status`：查询固件连接、运行模式与 12 通道物理状态。
+2. `pico429_configure_channels`：批量原子配置通道方向、速率与运行模式。
+3. `pico429_send_word`：发送单帧 ARINC 429 航电字。
+4. `pico429_stream_send`：在后台异步执行指定速率与数量的流式发送任务。
+5. `pico429_stream_status`：查询后台流式发送任务的实时进展（已发字数、状态）。
+6. `pico429_abort_stream`：紧急终止发送任务，排空固件 FIFO 并回收额度。
+7. `pico429_fetch_telemetry`：从 32,768 深度历史环形缓冲区分页提取接收数据。
+8. `pico429_get_latest_labels`：从当前值表 (CVT) 中无锁瞬时读取最新航电物理值。
+9. `pico429_run_bit`：执行硬件通道闭环自检并输出统计分析。
+
+### 4. 运行状态与指示灯说明
+> ⚠️ **当前状态说明**：
+> 当前阶段固件专注于 USB 12 通道物理全双工硬实时收发与确定性时序。因 Pico 2 W 板载 LED 挂接于外部 CYW43439 协处理器芯片，直接驱动需要消耗 1 个 PIO 状态机，与 12 通道满载约束冲突，因此当前固件已完全精简移除 LED 闪烁任务。
+> 运行模式与通道健康状态统一通过上位机 CLI 极速查询：`cargo run --release --package pico429 -- status` 或 `pico429 status`。
+> 物理 LED 指示功能已列入后续技术方案规划（详见 `plan/todo/PICO2_MIGRATION_AND_STATUS_LED.md`），待后续迁移至标准版 Pico 2（直接原生直驱片内 GPIO 25）或 RP2350B 硬件时重新使能。
 
 ---
 
@@ -195,7 +230,7 @@ direction = "DISABLED"
 | 偏移 (Bytes) | 长度 | 字段名称 | 类型 | 说明 |
 | :---: | :---: | :--- | :--- | :--- |
 | **0..1** | 2 | `magic` | `[u8; 2]` | 固定协议魔数 **`[0x41, 0x29]`** (ASCII `"A)"`，小端整型 `0x2941`) |
-| **2** | 1 | `type_and_ch`| `u8` | 高 4 位为 `frame_type`，低 4 位为 `channel` (0~15)<br>• `0x01`: ARINC_DATA (实时业务遥测)<br>• `0x02`: CMD_ACK (控制命令确认/应答)<br>• `0x03`: ASYNC_EVENT (异步告警事件)<br>• `0x04`: CMD_REQ (上位机控制请求) |
+| **2** | 1 | `type_and_ch`| `u8` | 高 4 位为 `frame_type`，低 4 位为 `channel` (0~15)<br>• `0x01`: ARINC_DATA (实时业务遥测)<br>• `0x02`: CMD_ACK (控制命令确认/应答)<br>• `0x03`: ASYNC_EVENT (异步告警事件)<br>• `0x04`: CMD_REQ (上位机控制请求)<br>• `0x05`: STREAM_TX_DATA (高吞吐连续发送流，免逐帧 ACK)<br>• `0x06`: STREAM_CREDIT (固件信用额度回传，带空闲槽位与累计消费计数) |
 | **3** | 1 | `flags` | `u8` | 语义依帧类型复用：<br>• `CMD_REQ`: 控制操作码 (`Opcode`)<br>• `CMD_ACK`: 应答状态码 (`AckStatus`)<br>• `ARINC_DATA`: 硬件标志 (`bit0`=奇偶错, `bit1`=100k高速, `bit2`=间隙错, `bit3`=发送回显, `bit4`=总线故障) |
 | **4..5** | 2 | `seq_num` | `u16` (小端) | 16 位请求序号（ACK 帧原样回传，用于匹配与 RTT 统计） |
 | **6..9** | 4 | `payload_0` | `u32` (小端) | 载荷 0：针对 ARINC_DATA 为微秒级硬件时间戳 (`timestamp_us`)；针对控制帧为参数 0 |
@@ -213,6 +248,7 @@ direction = "DISABLED"
 * `0x07` (`CFGBATCH`)：12 通道原子批量重构 (payload_0 包含 CH0~7，payload_1 包含 CH8~11)。
 * `0x08` (`QUERY_STATUS`)：查询运行模式与 12 通道状态 (ACK 的 channel 承载模式，payload_0/1 承载通道状态掩码)。
 * `0x09` (`PROFILE_OP`)：片上 Flash 配置方案操作 (`0`=List, `1`=Save, `2`=Load, `3`=Boot, `4`=ClearBoot)。
+* `0x0B` (`ABORT_TX`)：紧急终止指定通道发送流，固件原子排空发送队列与 PIO FIFO，并在 ACK 帧载荷中返回丢弃字统计 (`payload_0`)。
 
 #### 下位机应答状态码 (AckStatus，填入 CMD_ACK 的 flags 字段)：
 * `0x00` (`OK`)：操作成功完成。
@@ -245,6 +281,8 @@ Bit 3: 保留 (0)
 * **免收发芯片自测环回**：
   使用杜邦线短接 `GP0 -> GP2` 与 `GP1 -> GP3`（建议串接 220Ω 电阻），运行：
   ```bash
-  uv run --with pyserial python tools/pico429.py bit
+  cargo run --release --package pico429 -- bit --tx 0 --rx 1
+  # 或直接运行全局命令：
+  pico429 bit --tx 0 --rx 1
   ```
   即可完成微秒级纯二进制闭环自检。
