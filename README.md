@@ -75,6 +75,18 @@ pico-429/
 
 ## 四、 快速上手指南
 
+### 0. 预编译固件与上位机下载 (免环境配置)
+
+无需配置复杂的嵌入式交叉编译或多平台 Rust 环境，可直接前往 [GitHub Releases](https://github.com/dlsflh/pico-a429/releases) 获取开箱即用的官方构件：
+- **RP2350 (Pico 2) 固件**：`pico429-v*-rp2350.uf2`（按住板载 BOOTSEL 按钮插入 USB，将该文件拖入弹出的 U 盘盘符即可完成烧录）
+- **上位机 CLI 与原生 MCP 服务**：
+  - **Windows 11 / 10 (`x86_64`)**：`pico429-v*-windows-x64.zip`（原生 MSVC 构建，零第三方 DLL 依赖）
+  - **Linux (`x86_64`)**：`pico429-v*-linux-x64.tar.gz`
+  - **macOS (`aarch64` Apple Silicon)**：`pico429-v*-macos-arm64.tar.gz`
+  - **macOS (`x86_64` Intel)**：`pico429-v*-macos-x64.tar.gz`
+
+---
+
 ### 1. 运行工作空间测试套件
 ```bash
 # 运行核心协议库与流协议测试

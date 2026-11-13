@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-host:
+    name: Build Host - ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: pico429.exe
+            archive: pico429-${{ github.ref_name }}-windows-x64.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: pico429
+            archive: pico429-${{ github.ref_name }}-linux-x64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: pico429
+            archive: pico429-${{ github.ref_name }}-macos-arm64.tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bin: pico429
+            archive: pico429-${{ github.ref_name }}-macos-x64.tar.gz
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+      - name: Build Host Binary
+        run: cargo build --release --target ${{ matrix.target }} -p pico429
+
+      - name: Package Windows Binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path ${{ matrix.bin }} -DestinationPath ../../../${{ matrix.archive }}
+
+      - name: Package Unix Binary
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../${{ matrix.archive }} ${{ matrix.bin }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  build-firmware:
+    name: Build RP2350 Firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Setup Embedded Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+
+      - name: Setup Picotool
+        run: |
+          git clone --depth 1 https://github.com/raspberrypi/pico-sdk.git /tmp/pico-sdk
+          git clone --depth 1 https://github.com/raspberrypi/picotool.git /tmp/picotool
+          mkdir /tmp/picotool/build && cd /tmp/picotool/build
+          cmake .. -DPICOTOOL_NO_LIBUSB=1 -DPICO_SDK_PATH=/tmp/pico-sdk
+          make -j$(nproc)
+          sudo cp picotool /usr/local/bin/
+
+      - name: Build Firmware ELF
+        run: cargo build --target thumbv8m.main-none-eabihf --release -p pico-429-firmware
+
+      - name: Convert ELF to UF2
+        run: |
+          picotool uf2 convert target/thumbv8m.main-none-eabihf/release/pico-429-firmware -t elf pico429-${{ github.ref_name }}-rp2350.uf2
+
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico429-${{ github.ref_name }}-rp2350.uf2
+          path: pico429-${{ github.ref_name }}-rp2350.uf2
+
+  publish-release:
+    name: Publish Release Assets
+    needs: [build-host, build-firmware]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Built Packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
